@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from typing import IO, BinaryIO, Sequence
 
@@ -234,6 +235,9 @@ class SystemClock:
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
+
+    def wait(self, event: threading.Event, timeout: float) -> bool:
+        return event.wait(timeout)
 
 
 def installed_pw_version() -> tuple[int, int, int]:

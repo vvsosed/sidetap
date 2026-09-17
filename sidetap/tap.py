@@ -124,4 +124,10 @@ class AppTap:
                     )
                 else:
                     log.debug("tap watcher: %s", exc)
-            self._clock.sleep(self._interval)
+            # The tap spends nearly all its time right here, since poll_once()
+            # is near-instant. An uninterruptible sleep would mean shutdown
+            # has to wait out a full poll interval - almost this thread's
+            # entire time budget - before router.restore() can hand the
+            # user's call audio back. Waiting on `stop` instead wakes us the
+            # moment shutdown fires.
+            self._clock.wait(stop, self._interval)

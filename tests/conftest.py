@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import threading
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -246,6 +247,7 @@ class FakeClock:
     def __init__(self, start: float = 0.0):
         self.now = start
         self.slept: list[float] = []
+        self.waited: list[float] = []
 
     def monotonic(self) -> float:
         return self.now
@@ -253,6 +255,21 @@ class FakeClock:
     def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
         self.now += seconds
+
+    def wait(self, event: threading.Event, timeout: float) -> bool:
+        """Fake `Clock.wait`.
+
+        If `event` is already set, return True at once without advancing the
+        fake clock or recording a wait - mirroring the real Clock's prompt
+        wakeup. Otherwise behaves like `sleep`: advances the fake clock by
+        `timeout` and returns False, as if the interval elapsed with `event`
+        still unset.
+        """
+        if event.is_set():
+            return True
+        self.waited.append(timeout)
+        self.now += timeout
+        return False
 
     def advance(self, seconds: float) -> None:
         self.now += seconds

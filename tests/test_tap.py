@@ -1,6 +1,7 @@
 import threading
 from dataclasses import replace
 
+from sidetap.adapters import SystemClock
 from sidetap.graph import PwGraph, PwNode, PwPort
 from sidetap.ports import LinkResult
 from sidetap.tap import GRAPH_ERROR_WARN_AFTER, POLL_INTERVAL_S, AppTap
@@ -160,17 +161,18 @@ def test_run_polls_on_the_interval_until_stopped(zoom_graph):
         clock=clock,
     )
 
-    original_sleep = clock.sleep
+    original_wait = clock.wait
 
-    def sleep_and_maybe_stop(seconds):
-        original_sleep(seconds)
-        if len(clock.slept) >= 3:
+    def wait_and_maybe_stop(event, timeout):
+        result = original_wait(event, timeout)
+        if len(clock.waited) >= 3:
             stop.set()
+        return result
 
-    clock.sleep = sleep_and_maybe_stop  # type: ignore[method-assign]
+    clock.wait = wait_and_maybe_stop  # type: ignore[method-assign]
     tap.run(stop)
 
-    assert clock.slept == [POLL_INTERVAL_S] * 3
+    assert clock.waited == [POLL_INTERVAL_S] * 3
     assert graph.calls == 3
 
 
@@ -188,14 +190,15 @@ def test_repeated_graph_failures_escalate_to_a_warning(caplog):
         linker=FakeLinker(),
         clock=clock,
     )
-    original_sleep = clock.sleep
+    original_wait = clock.wait
 
-    def sleep_and_maybe_stop(seconds):
-        original_sleep(seconds)
-        if len(clock.slept) >= GRAPH_ERROR_WARN_AFTER + 3:
+    def wait_and_maybe_stop(event, timeout):
+        result = original_wait(event, timeout)
+        if len(clock.waited) >= GRAPH_ERROR_WARN_AFTER + 3:
             stop.set()
+        return result
 
-    clock.sleep = sleep_and_maybe_stop  # type: ignore[method-assign]
+    clock.wait = wait_and_maybe_stop  # type: ignore[method-assign]
     tap.run(stop)
 
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
@@ -204,3 +207,41 @@ def test_repeated_graph_failures_escalate_to_a_warning(caplog):
     assert len(warnings) == 1
     assert "failing repeatedly" in warnings[0].getMessage()
     assert "pw-dump exploded" in warnings[0].getMessage()
+
+
+def test_stop_wakes_the_watcher_immediately_instead_of_waiting_out_the_interval(
+    idle_graph,
+):
+    # Regression test for a real shutdown bug: run() used to end its loop
+    # with a plain, uninterruptible clock.sleep(interval). The tap spends
+    # almost all its time there, so a shutdown request landed while asleep
+    # had to wait out the *entire* interval before router.restore() could
+    # hand the user's call audio back. A real thread and a real Clock is the
+    # only way to prove the fix: with the old sleep(), this test would have
+    # to wait out `interval` (here picked deliberately huge) before the
+    # thread joined; with wait(), it returns as soon as `stop` is set.
+    entered_wait = threading.Event()
+
+    class ProbeClock(SystemClock):
+        def wait(self, event: threading.Event, timeout: float) -> bool:
+            entered_wait.set()
+            return super().wait(event, timeout)
+
+    stop = threading.Event()
+    tap = AppTap(
+        pattern="zoom",
+        capture_node_name=CAPTURE_NODE,
+        graph=FakeGraphSource(idle_graph),
+        linker=FakeLinker(),
+        clock=ProbeClock(),
+        interval=5.0,
+    )
+
+    thread = threading.Thread(target=tap.run, args=(stop,), daemon=True)
+    thread.start()
+    assert entered_wait.wait(timeout=1.0), "tap never reached the wait"
+
+    stop.set()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive(), "tap did not wake promptly when stop was set"

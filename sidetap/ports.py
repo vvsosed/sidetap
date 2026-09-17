@@ -7,6 +7,7 @@ or the wall clock.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import BinaryIO, Iterator, Protocol, Sequence, runtime_checkable
@@ -141,3 +142,14 @@ class Clock(Protocol):
     def monotonic(self) -> float: ...
 
     def sleep(self, seconds: float) -> None: ...
+
+    def wait(self, event: threading.Event, timeout: float) -> bool:
+        """Block until `event` is set or `timeout` elapses.
+
+        Returns whether `event` was set (mirrors threading.Event.wait).
+        Unlike `sleep`, a real implementation wakes as soon as `event` is set
+        from another thread rather than only at the end of `timeout` - that
+        promptness is the whole point of using this instead of `sleep` in a
+        poll loop that a shutdown needs to interrupt.
+        """
+        ...
