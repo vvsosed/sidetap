@@ -1,0 +1,107 @@
+[
+  {
+    "id": 40,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 1001,
+        "media.class": "Audio/Sink",
+        "node.name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        "node.description": "Built-in Audio Analog Stereo"
+      }
+    }
+  },
+  {
+    "id": 42,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 1002,
+        "media.class": "Audio/Source",
+        "node.name": "alsa_input.pci-0000_00_1f.3.analog-stereo",
+        "node.description": "Built-in Audio Analog Stereo Microphone"
+      }
+    }
+  },
+  {
+    "id": 55,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 1204,
+        "media.class": "Stream/Output/Audio",
+        "node.name": "ZOOM VoiceEngine",
+        "node.description": "ZOOM VoiceEngine",
+        "application.name": "ZOOM VoiceEngine",
+        "application.process.binary": "zoom",
+        "application.process.id": 44321
+      }
+    }
+  },
+  {
+    "id": 56,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 1250,
+        "media.class": "Stream/Output/Audio",
+        "node.name": "spotify",
+        "node.description": "Spotify",
+        "application.name": "Spotify",
+        "application.process.binary": "spotify",
+        "application.process.id": 9001
+      }
+    }
+  },
+  {
+    "id": 60,
+    "type": "PipeWire:Interface:Port",
+    "info": {
+      "props": {
+        "node.id": 55,
+        "port.name": "output_FL",
+        "port.direction": "out",
+        "audio.channel": "FL"
+      }
+    }
+  },
+  {
+    "id": 61,
+    "type": "PipeWire:Interface:Port",
+    "info": {
+      "props": {
+        "node.id": 55,
+        "port.name": "output_FR",
+        "port.direction": "out",
+        "audio.channel": "FR"
+      }
+    }
+  },
+  {
+    "id": 62,
+    "type": "PipeWire:Interface:Port",
+    "info": {
+      "props": {
+        "node.id": 56,
+        "port.name": "output_FL",
+        "port.direction": "out",
+        "audio.channel": "FL"
+      }
+    }
+  },
+  {
+    "id": 99,
+    "type": "PipeWire:Interface:Metadata",
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      {
+        "key": "default.audio.sink",
+        "value": { "name": "alsa_output.pci-0000_00_1f.3.analog-stereo" }
+      },
+      {
+        "key": "default.audio.source",
+        "value": { "name": "alsa_input.pci-0000_00_1f.3.analog-stereo" }
+      }
+    ]
+  }
+]
