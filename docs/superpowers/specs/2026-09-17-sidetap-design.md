@@ -527,6 +527,12 @@ research notes that per-character prices should be reconfirmed at build time.
 
 ## Non-goals for v1
 
+**Surround sound.** Port pairing is by index over a name-sorted list, which is
+correct for stereo and mono only — a 5.1 or 7.1 default sink alphabetizes to
+FC, FL, FR, LFE, SL, SR rather than channel order, and would cross channels
+silently. Supporting it means carrying `audio.channel` through `PwPort`, which
+`graph.py` parses past today.
+
 Voice cloning or preservation. LocalAgreement-2 (the seam only). Glossaries.
 Language auto-detection. More than two participants, or diarization. Offline
 or local models. The Gemini Live single-box path. Any OS other than Linux with
