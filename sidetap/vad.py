@@ -71,7 +71,7 @@ class SilenceGate:
             return True
         self._silence_run += 1
         # Past the tail we send nothing. Keeping the stream alive through the
-        # silence is EngineWorker's job (google.py:KEEPALIVE_S), not the
+        # silence is RecognitionWorker's job (asr.py:KEEPALIVE_S), not the
         # gate's - blocks stop arriving entirely when the tapped node goes
         # away, and the gate never sees that.
         return self._silence_run <= self._tail_blocks
