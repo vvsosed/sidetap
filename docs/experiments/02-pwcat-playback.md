@@ -12,7 +12,11 @@ how honest the "drop backlog" hotkey can be.
 drift between chunks written and wall-clock elapsed. Then write 2 s of tone,
 stop writing after 200 ms, and time how long sound continues.
 
-**How to run.** Requires the virtual mic from Task 23.
+**How to run.** Needs any playback sink — the default output device is fine.
+This measures `pw-cat`'s own pacing, which does not depend on the target
+sink, so it does not need the virtual mic from Task 23.
+
+Step 1 — drift over 30 minutes of continuous silence:
 
     uv run python - <<'PY'
     import subprocess, time
@@ -31,6 +35,43 @@ stop writing after 200 ms, and time how long sound continues.
         time.sleep(0.02)
     print("wrote", written, "chunks in", time.monotonic() - start, "s")
     p.stdin.close()
+    PY
+
+Step 2 — post-flush residue. Feed 200 ms of an audible tone (so a human
+listening can cross-check), then stop writing and close stdin. `pw-cat` has
+no way to un-buffer audio it and PipeWire already queued, so the time from
+"stop writing" to the process actually exiting is a runnable proxy for how
+long sound keeps coming out after the caller stops feeding it:
+
+    uv run python - <<'PY'
+    import math, struct, subprocess, time
+
+    RATE = 24000
+
+    def tone_chunk(ms, freq=440.0, amplitude=8000):
+        n = RATE * ms // 1000
+        samples = [
+            int(amplitude * math.sin(2 * math.pi * freq * i / RATE))
+            for i in range(n)
+        ]
+        return struct.pack(f"<{n}h", *samples)
+
+    p = subprocess.Popen(
+        ["pw-cat", "--playback", "--rate", str(RATE), "--channels", "1",
+         "--format", "s16", "--raw", "-"],
+        stdin=subprocess.PIPE,
+    )
+    chunk = tone_chunk(20)      # 20 ms per write, same cadence as playout
+    written_ms = 0
+    while written_ms < 200:     # "stop writing after 200 ms"
+        p.stdin.write(chunk)
+        p.stdin.flush()
+        written_ms += 20
+    stop = time.monotonic()
+    p.stdin.close()             # no more audio is coming; what's already
+    p.wait()                    # queued keeps playing until this returns
+    drain_s = time.monotonic() - stop
+    print(f"residue: {drain_s * 1000:.0f} ms from stop-writing to pw-cat exit")
     PY
 
 **Result.** _(fill in: chunks written vs elapsed, drift, residue in ms)_
