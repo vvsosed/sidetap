@@ -173,9 +173,11 @@ def test_loopback_factory_spawns_through_the_launcher():
 
 def test_wpctl_volume_formats_the_fraction(monkeypatch):
     calls = []
+    kwargs_seen = []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
+        kwargs_seen.append(kwargs)
 
         class Result:
             returncode = 0
@@ -188,6 +190,12 @@ def test_wpctl_volume_formats_the_fraction(monkeypatch):
 
     assert WpctlVolumeControl().set_volume(42, 0.0) is True
     assert calls[0] == ["wpctl", "set-volume", "42", "0.00"]
+    # This runs synchronously on the playout thread, so it must use its own
+    # short timeout rather than LINK_TIMEOUT_S - a 5s stall here would freeze
+    # audio output, not just delay a link.
+    from sidetap.adapters import VOLUME_TIMEOUT_S
+
+    assert kwargs_seen[0]["timeout"] == VOLUME_TIMEOUT_S
 
 
 def test_wpctl_volume_reports_failure_rather_than_raising(monkeypatch):

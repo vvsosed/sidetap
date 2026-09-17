@@ -31,6 +31,11 @@ INSTALL_HINT = (
 MIN_PW_VERSION = (0, 3, 60)
 STDERR_TAIL_BYTES = 8192
 LINK_TIMEOUT_S = 5
+# Not LINK_TIMEOUT_S. This runs synchronously on the playout thread, the same
+# one feeding pw-cat's stdin, so a stall here freezes audio output rather than
+# merely delaying a link. Better to give up on the duck than to glitch the
+# call.
+VOLUME_TIMEOUT_S = 0.3
 
 
 class MissingToolError(RuntimeError):
@@ -132,6 +137,16 @@ class PopenWriter:
         try:
             self._process.stdin.close()
         except (OSError, ValueError, AttributeError):
+            pass
+        # Closing stdin alone is a polite EOF: a well-behaved pw-cat drains
+        # its buffer and exits on its own (observed ~0.4s). Give it a real
+        # chance to do that before escalating - without this wait, the
+        # killpg below fires within milliseconds, every time, and anything
+        # still buffered is cut off rather than played out.
+        try:
+            self._process.wait(timeout=0.5)
+            return
+        except subprocess.TimeoutExpired:
             pass
         try:
             os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
@@ -304,7 +319,7 @@ class WpctlVolumeControl:
                 [require_tool(WPCTL), "set-volume", str(object_id), f"{fraction:.2f}"],
                 capture_output=True,
                 text=True,
-                timeout=LINK_TIMEOUT_S,
+                timeout=VOLUME_TIMEOUT_S,
             )
         except (MissingToolError, subprocess.SubprocessError, OSError):
             return False
