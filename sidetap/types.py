@@ -1,0 +1,131 @@
+"""Value types shared by every layer. Imports nothing but the standard library."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+# Capture side. pw-record resamples to this, so nothing here does conversion.
+TARGET_RATE = 16_000
+BLOCK_MS = 100
+BLOCK_BYTES = TARGET_RATE * 2 * BLOCK_MS // 1000
+
+# Playout side. Chirp 3 HD streaming synthesis returns LINEAR16 at this rate;
+# pw-cat resamples it to whatever the sink wants.
+TTS_RATE = 24_000
+TTS_BYTES_PER_S = TTS_RATE * 2
+
+# Capture track names. These are what the recorders and queues are keyed on.
+REMOTE = "remote"
+MIC = "mic"
+
+# Seconds of un-spoken audio past which playout starts dropping the oldest.
+LAG_CAP_S = 12.0
+# Seconds of continuous outbound speech with nothing reaching the virtual mic
+# before the dead-air alarm fires.
+DEAD_AIR_S = 6.0
+
+
+class Direction(str, Enum):
+    """Which way a translation flows.
+
+    IN is them -> you, landing on your headphones.
+    OUT is you -> them, landing in the virtual mic's sink.
+    """
+
+    IN = "in"
+    OUT = "out"
+
+    @property
+    def track(self) -> str:
+        """The capture track this direction consumes."""
+        return REMOTE if self is Direction.IN else MIC
+
+    @property
+    def opposite(self) -> Direction:
+        return Direction.OUT if self is Direction.IN else Direction.IN
+
+
+@dataclass(frozen=True)
+class AudioChunk:
+    track: str
+    pcm: bytes
+    t_start: float
+
+
+@dataclass(frozen=True)
+class AsrResult:
+    """One recognition result, interim or final, on the session timeline."""
+
+    direction: Direction
+    text: str
+    is_final: bool
+    t_start: float
+    t_end: float
+    confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class Unit:
+    """A translatable unit emitted by the segmenter.
+
+    With FinalsOnlySegmenter this is one per final AsrResult. With a future
+    LocalAgreementSegmenter it would be one per committed clause, which is the
+    entire reason this type is distinct from AsrResult.
+    """
+
+    direction: Direction
+    text: str
+    t_start: float
+    t_end: float
+
+    @classmethod
+    def from_result(cls, result: AsrResult) -> Unit:
+        return cls(
+            direction=result.direction,
+            text=result.text,
+            t_start=result.t_start,
+            t_end=result.t_end,
+        )
+
+
+@dataclass(frozen=True)
+class Translated:
+    """A unit, its translation, and the synthesised audio for it."""
+
+    unit: Unit
+    text: str
+    pcm: bytes = b""
+
+    @property
+    def direction(self) -> Direction:
+        return self.unit.direction
+
+    @property
+    def audio_s(self) -> float:
+        return len(self.pcm) / TTS_BYTES_PER_S
+
+
+@dataclass(frozen=True)
+class Latency:
+    asr_ms: float = 0.0
+    mt_ms: float = 0.0
+    tts_ms: float = 0.0
+
+    @property
+    def total_ms(self) -> float:
+        return self.asr_ms + self.mt_ms + self.tts_ms
+
+
+@dataclass(frozen=True)
+class Record:
+    """One transcript row."""
+
+    unit: Unit
+    target_text: str
+    latency: Latency = field(default_factory=Latency)
+    dropped: bool = False
+
+    @property
+    def direction(self) -> Direction:
+        return self.unit.direction
