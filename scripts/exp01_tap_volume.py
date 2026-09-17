@@ -206,10 +206,14 @@ def main() -> int:
     recorder = Recorder(
         RecorderSpec(track="probe", target=None, autoconnect=False), launcher
     )
-    recorder.start()
-    time.sleep(1.0)
-
+    # start() is inside the try so the cleanup finally covers it too: the
+    # child is detached (start_new_session=True), so a Ctrl-C landing in the
+    # settle window below would otherwise leak a pw-record that the user's
+    # own interrupt cannot reach.
     try:
+        recorder.start()
+        time.sleep(1.0)
+
         snapshot = graph_source.snapshot()
         node = snapshot.node_by_name(recorder.node_name)
         if node is None:
