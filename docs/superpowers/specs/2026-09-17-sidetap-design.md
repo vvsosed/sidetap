@@ -395,10 +395,20 @@ Other cases:
 - **Fatal errors** (auth, permissions, malformed config, missing API) end the
   session immediately with a clear message, and restore the graph.
 - **Network trouble** backs off and retries per the ported policy.
-- **Dropped audio is never silent.** meetscribe's known bug — a network outage
-  overflowing a bounded queue with no marker in the output — is fixed here by
-  construction: the lag cap already requires counted, visible drops in both the
-  TUI and the transcript, and the same treatment covers capture-side overflow.
+- **Dropped audio is never silent — on both queues, which is not automatic.**
+  There are two bounded queues and they fail for different reasons. The
+  *playout* queue drops under the lag cap, and those drops are counted into
+  `Metrics` and written to the transcript with a `dropped` flag. The *capture*
+  queue (`DroppingQueue`) overflows during a network outage, when the
+  recogniser stops draining it — and that is precisely meetscribe's documented
+  bug, where dropped blocks were logged but left no marker in the output, so a
+  lost stretch simply read as nobody talking.
+
+  The playout fix does not cover it: they are different queues, and meetscribe
+  had no playout side at all. So the capture queue's drop counters are polled
+  into `Metrics` explicitly and shown per direction in the TUI. Without that,
+  sidetap reproduces the bug it claims to have fixed, on the exact side it was
+  reported against.
 
 ## Interface
 
