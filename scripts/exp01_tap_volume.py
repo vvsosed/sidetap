@@ -31,6 +31,13 @@ from sidetap.graph import PLAYBACK_STREAM
 from sidetap.ports import LinkResult
 from sidetap.recorder import Recorder, RecorderSpec
 
+# pw-record writes s16 mono at 16 kHz here: 2 bytes * 16000 samples/s =
+# 32,000 bytes/s. The default Linux pipe capacity is 65,536 bytes (16 pages
+# of 4096 bytes), i.e. about 65536 / 32000 = 2.05 s of audio can sit
+# buffered in the pipe before a writer blocks. DRAIN_SECONDS is comfortably
+# above that so drain() empties the backlog rather than racing it.
+DRAIN_SECONDS = 3.0
+
 
 def rms(pcm: bytes) -> float:
     samples = array.array("h")
@@ -40,22 +47,19 @@ def rms(pcm: bytes) -> float:
     return math.sqrt(sum(s * s for s in samples) / len(samples))
 
 
-def measure(
+def _bounded_read(
     recorder: Recorder, seconds: float, hard_cap: float | None = None
-) -> tuple[float, int, float]:
-    """Mean RMS over `seconds` of captured blocks.
+) -> tuple[list[bytes], float]:
+    """Read blocks for `seconds`, bounded by a watchdog. Returns (blocks, elapsed).
 
-    Returns (mean_rms, block_count, elapsed_seconds). Always returns within
-    roughly `hard_cap` wall-clock seconds (default: `seconds + 3.0`), even if
-    `recorder.blocks()` never yields a single block.
-
-    This matters because `Recorder.blocks()` performs a blocking `read()`
-    with no timeout, and an unlinked or dead pw-record capture produces ZERO
-    BYTES rather than silence -- so the "am I past the deadline" check below,
-    which only runs *after* a block has been yielded, would otherwise never
-    run at all in the most likely failure mode. The watchdog timer is the
-    real bound: it force-stops the recorder after `hard_cap`, which unblocks
-    the read and ends the generator, so this function always returns.
+    Shared by measure() and drain() so both get the same hang protection.
+    `Recorder.blocks()` performs a blocking `read()` with no timeout, and an
+    unlinked or dead pw-record capture produces ZERO BYTES rather than
+    silence -- so an "am I past the deadline" check that only runs *after* a
+    block has been yielded would otherwise never run at all in the most
+    likely failure mode. The watchdog timer is the real bound: it
+    force-stops the recorder after `hard_cap` (default: `seconds + 3.0`),
+    which unblocks the read and ends the generator, so this always returns.
     """
     hard_cap = seconds + 3.0 if hard_cap is None else hard_cap
     start = time.monotonic()
@@ -75,20 +79,53 @@ def measure(
     watchdog.daemon = True
     watchdog.start()
 
-    values: list[float] = []
+    blocks: list[bytes] = []
     try:
         if time.monotonic() >= deadline:
-            return 0.0, 0, 0.0
+            return blocks, 0.0
         for block in recorder.blocks():
-            values.append(rms(block))
+            blocks.append(block)
             if time.monotonic() >= deadline:
                 break
     finally:
         watchdog.cancel()
 
     elapsed = time.monotonic() - start
-    mean = sum(values) / len(values) if values else 0.0
-    return mean, len(values), elapsed
+    return blocks, elapsed
+
+
+def measure(
+    recorder: Recorder, seconds: float, hard_cap: float | None = None
+) -> tuple[float, int, float]:
+    """Mean RMS over `seconds` of freshly captured blocks.
+
+    Returns (mean_rms, block_count, elapsed_seconds). Callers must drain()
+    first if the link or a volume change happened recently -- see drain()'s
+    docstring. Bounded by `_bounded_read`'s watchdog, so this always returns.
+    """
+    blocks, elapsed = _bounded_read(recorder, seconds, hard_cap)
+    mean = sum(rms(b) for b in blocks) / len(blocks) if blocks else 0.0
+    return mean, len(blocks), elapsed
+
+
+def drain(
+    recorder: Recorder, seconds: float = DRAIN_SECONDS, hard_cap: float | None = None
+) -> tuple[int, float]:
+    """Read and discard blocks for at least `seconds`. Returns (count, elapsed).
+
+    Call this after linking and after every volume change, before trusting
+    the next measure() call. A capture that has been running for a while has
+    up to ~2.05 s of stale audio sitting in the pipe (see DRAIN_SECONDS'
+    comment for the arithmetic) captured under the OLD conditions -- e.g. a
+    measurement started right after muting would read that backlog FIRST, so
+    the "quiet" window would actually read ~2 s of leftover full-volume audio
+    ahead of the genuinely muted audio. That pulls the mean RMS up and the
+    ratio toward a false PRE-volume verdict, even though the true answer is
+    POST-volume -- exactly the wrong-verdict failure this script exists to
+    avoid. Bounded by the same watchdog as measure(), so this cannot hang.
+    """
+    blocks, elapsed = _bounded_read(recorder, seconds, hard_cap)
+    return len(blocks), elapsed
 
 
 def recorder_alive_or_report(recorder: Recorder, block_count: int, phase: str) -> bool:
@@ -117,25 +154,44 @@ def recorder_alive_or_report(recorder: Recorder, block_count: int, phase: str) -
     return True
 
 
-def get_volume(serial: int) -> str:
-    """Return the raw fraction token from `wpctl get-volume`, e.g. "0.65".
+def resolve_wpctl_target(stream) -> tuple[int, str, str]:
+    """Find which identifier `wpctl` accepts for this stream, and its volume.
 
-    Feeding this straight back into `wpctl set-volume <serial> <token>` is
-    the actual restore of whatever the user had set before this script
-    touched anything -- never a hardcoded guess. `wpctl get-volume` also
-    appends "[MUTED]" when the stream is muted; that is stripped here since
-    `set-volume` does not accept it (mute state itself is not restored).
+    `pw-dump`'s top-level "id" is the global object id that `wpctl` resolves
+    against; `object.serial` is a separate, monotonically increasing counter.
+    Passing the serial to `wpctl set-volume`/`get-volume` most likely fails
+    with "Object not found". The project's "identify nodes by object.serial,
+    never object.id" rule is for durable cross-time references -- the
+    routing journal, the tap's dedup keys -- where ids get recycled; it does
+    not apply to a wpctl call issued seconds after reading the graph inside
+    this one short-lived script, so trying id first here is safe.
+
+    Tries id, then serial, using an unchecked probe so a failure on the
+    first attempt does not abort before the second is tried. Returns
+    (identifier, "id" | "serial", current volume token). Raises RuntimeError
+    if wpctl accepts neither -- with both attempts' stderr, for diagnosis.
     """
-    result = subprocess.run(
-        ["wpctl", "get-volume", str(serial)],
-        check=True,
-        capture_output=True,
-        text=True,
+    attempts: list[str] = []
+    for identifier, label in ((stream.id, "id"), (stream.serial, "serial")):
+        result = subprocess.run(
+            ["wpctl", "get-volume", str(identifier)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.split()
+            if len(parts) < 2:
+                raise RuntimeError(
+                    f"unexpected `wpctl get-volume` output: {result.stdout!r}"
+                )
+            return identifier, label, parts[1]
+        attempts.append(
+            f"{label}={identifier}: "
+            f"{result.stderr.strip() or result.stdout.strip() or '(no output)'}"
+        )
+    raise RuntimeError(
+        "wpctl accepted neither identifier for this stream:\n  " + "\n  ".join(attempts)
     )
-    parts = result.stdout.split()
-    if len(parts) < 2:
-        raise RuntimeError(f"unexpected `wpctl get-volume` output: {result.stdout!r}")
-    return parts[1]
 
 
 def main() -> int:
@@ -209,17 +265,21 @@ def main() -> int:
             )
             return 1
 
-        original_volume = get_volume(stream.serial)
+        wpctl_id, wpctl_label, original_volume = resolve_wpctl_target(stream)
         print(
-            f"tapping {stream.label} (serial={stream.serial}), "
-            f"original volume={original_volume}"
+            f"tapping {stream.label} (serial={stream.serial}, "
+            f"wpctl {wpctl_label}={wpctl_id}), original volume={original_volume}"
         )
         print(
             "if this hangs or is interrupted, recover by hand with:\n"
-            f"  wpctl set-volume {stream.serial} {original_volume}\n"
+            f"  wpctl set-volume {wpctl_id} {original_volume}\n"
             "  pkill -f pw-record"
         )
-        time.sleep(1.0)
+
+        # The link only just came up: drain whatever is already sitting in
+        # the pipe before trusting a measurement (see drain()'s docstring).
+        drained_n, drained_s = drain(recorder)
+        print(f"drained {drained_n} stale blocks before measuring ({drained_s:.1f}s)")
 
         loud, loud_n, loud_elapsed = measure(recorder, 5.0)
         if not recorder_alive_or_report(recorder, loud_n, "full volume"):
@@ -231,21 +291,28 @@ def main() -> int:
 
         try:
             subprocess.run(
-                ["wpctl", "set-volume", str(stream.serial), "0"], check=True
+                ["wpctl", "set-volume", str(wpctl_id), "0"], check=True
             )
-            time.sleep(1.0)
+            # The volume change just happened: the pipe still holds up to
+            # ~2.05 s of full-volume audio captured before the mute. Drain it
+            # or the "quiet" measurement below reads that backlog first and
+            # reports a falsely high RMS -- see drain()'s docstring.
+            drained_n, drained_s = drain(recorder)
+            print(
+                f"drained {drained_n} stale blocks after muting ({drained_s:.1f}s)"
+            )
             quiet, quiet_n, quiet_elapsed = measure(recorder, 5.0)
         finally:
             # This restore must happen no matter what went wrong above --
             # a hang or a Ctrl-C must never leave the user's call muted.
             restore = subprocess.run(
-                ["wpctl", "set-volume", str(stream.serial), original_volume],
+                ["wpctl", "set-volume", str(wpctl_id), original_volume],
                 check=False,
             )
             if restore.returncode != 0:
                 print(
                     "ERROR: failed to restore volume automatically. Run by "
-                    f"hand: wpctl set-volume {stream.serial} {original_volume}",
+                    f"hand: wpctl set-volume {wpctl_id} {original_volume}",
                     file=sys.stderr,
                 )
 

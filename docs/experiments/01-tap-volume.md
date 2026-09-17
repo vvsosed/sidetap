@@ -11,11 +11,14 @@ application through it. If the tap is pre-volume, `routing.py` collapses to one
 `wpctl` call: no unlink, no re-route, no journal, no crash repair.
 
 **Method.** `scripts/exp01_tap_volume.py` — additively taps a playing
-application, measures mean RMS over 5 s at full volume, sets the stream volume
-to 0, measures again over 5 s, restores. Prefer a continuous level source —
-music or a test tone — over a live conversation: speech has pauses, and a
-pause landing in one 5 s window but not the other shifts the ratio for a
-reason that has nothing to do with volume.
+application, drains ~3 s of the capture pipe (pw-record can leave up to
+~2.05 s of audio buffered in the pipe from before a change, and reading that
+backlog first would contaminate the next measurement with stale audio),
+measures mean RMS over 5 s at full volume, sets the stream volume to 0,
+drains again, measures again over 5 s, restores. Prefer a continuous level
+source — music or a test tone — over a live conversation: speech has pauses,
+and a pause landing in one 5 s window but not the other shifts the ratio for
+a reason that has nothing to do with volume.
 
 **How to run.** Requires Task 10 to be complete (the script imports
 `sidetap.adapters` and `sidetap.recorder`), and an application actually playing
@@ -27,10 +30,13 @@ A ratio under 0.1 means post-volume.
 
 **Recovery.** The script restores the stream's original volume and stops its
 own `pw-record` in a `finally`, so a clean exit — including Ctrl-C in most
-cases — leaves nothing behind. If it hangs anyway, the serial and the
-original volume are printed before anything is muted; recover by hand with:
+cases — leaves nothing behind. If it hangs anyway, the script prints, before
+anything is muted, which identifier `wpctl` actually accepted for the stream
+(it tries `object.id` first, falling back to `object.serial` — these are
+different numbers, and only one of them works with `wpctl`) and the original
+volume; recover by hand with that printed identifier:
 
-    wpctl set-volume <serial> <original volume>
+    wpctl set-volume <id or serial, whichever the script printed> <original volume>
     pkill -f pw-record
 
 **Result.** _(fill in: RMS loud, RMS quiet, ratio, verdict, PipeWire version,
