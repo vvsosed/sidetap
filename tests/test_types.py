@@ -30,6 +30,13 @@ def test_direction_opposite_flips():
     assert Direction.OUT.opposite is Direction.IN
 
 
+def test_direction_values_match_the_wire_format():
+    # These strings reach the durable JSONL transcript and Textual widget ids.
+    # Identity-based tests above would not catch the two literals being swapped.
+    assert Direction.IN.value == "in"
+    assert Direction.OUT.value == "out"
+
+
 def test_audio_chunk_is_frozen():
     chunk = AudioChunk(track=MIC, pcm=b"\x00" * BLOCK_BYTES, t_start=1.5)
     with pytest.raises(AttributeError):

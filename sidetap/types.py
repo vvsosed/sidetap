@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 # Capture side. pw-record resamples to this, so nothing here does conversion.
 TARGET_RATE = 16_000
@@ -26,7 +26,7 @@ LAG_CAP_S = 12.0
 DEAD_AIR_S = 6.0
 
 
-class Direction(str, Enum):
+class Direction(StrEnum):
     """Which way a translation flows.
 
     IN is them -> you, landing on your headphones.
@@ -103,6 +103,8 @@ class Translated:
 
     @property
     def audio_s(self) -> float:
+        # Assumes pcm is a whole number of s16 frames; an odd byte count
+        # would silently treat the stray trailing byte as half a sample.
         return len(self.pcm) / TTS_BYTES_PER_S
 
 
