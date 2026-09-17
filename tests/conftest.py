@@ -158,8 +158,8 @@ class FakeVolumeControl:
         self.ok = ok
         self.calls: list[tuple[int, float]] = []
 
-    def set_volume(self, serial: int, fraction: float) -> bool:
-        self.calls.append((serial, fraction))
+    def set_volume(self, object_id: int, fraction: float) -> bool:
+        self.calls.append((object_id, fraction))
         return self.ok
 
     @property

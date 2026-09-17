@@ -91,7 +91,15 @@ class Unlinker(Protocol):
 
 @runtime_checkable
 class VolumeControl(Protocol):
-    def set_volume(self, serial: int, fraction: float) -> bool: ...
+    def set_volume(self, object_id: int, fraction: float) -> bool: ...
+    """`object_id` is the PipeWire global object.id, NOT object.serial.
+
+    wpctl resolves against the id; the serial is a separate counter and yields
+    "Object not found". This does not contradict the project's
+    "identify nodes by object.serial" rule - that is about DURABLE references
+    (the routing journal, the tap's dedup keys) where ids get recycled over
+    time. See docs/experiments/01-tap-volume.md, which hit this exact trap.
+    """
 
 
 @runtime_checkable
