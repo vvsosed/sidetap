@@ -542,7 +542,7 @@ Per direction, finals-only. STT in Frankfurt; Translation in `global` or
 | ASR final | 150–450 ms |
 | MT | 240–330 ms measured (Translation LLM); 135–180 ms (NMT) |
 | TTS synthesis | 640–1390 ms measured — see the note below |
-| playout buffer | ~40 ms |
+| playout buffer | 299 ms measured (16 KiB pipe + `--latency 20ms`; was 1259 ms at the defaults) |
 | **total, after they stop speaking** | **1.1–2.0 s** (Translation LLM); **0.9–1.8 s** (NMT) |
 
 **On the TTS line.** This originally read "TTS TTFB ~300 ms", assuming playout

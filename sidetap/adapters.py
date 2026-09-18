@@ -6,6 +6,7 @@ in one place is what lets everything else be tested against fakes.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import re
@@ -258,6 +259,34 @@ PW_LOOPBACK = "pw-loopback"
 WPCTL = "wpctl"
 
 
+# 16 KiB of stdin pipe plus a 20 ms node latency. MEASURED, not guessed.
+#
+# Playout writes silence continuously between utterances, so whatever the pipe
+# holds sits AHEAD of every real utterance. At the default 64 KiB that is over
+# a second of queued silence added to glass-to-glass latency.
+#
+# Steady-state buffering, three 12 s runs each at 24 kHz:
+#
+#     8 KiB  (171 ms cap)   -57, +129, +139 ms   <- starves; the negative run
+#                                                   means the writer fell
+#                                                   behind and the buffer ran
+#                                                   dry, which is audible
+#    16 KiB  (341 ms cap)  +299, +299, +299 ms   <- chosen: zero variance
+#    32 KiB  (683 ms cap)  +609, +609, +609 ms
+#    64 KiB (1365 ms cap) +1259,+1259,+1249 ms   <- the default
+#
+# So this buys about 960 ms. 8 KiB's lower median is not worth a buffer that
+# demonstrably runs dry - underruns crackle, and a crackle is worse than
+# 300 ms.
+#
+# --latency alone does nothing: at the default pipe size it measured 1180 ms,
+# because the OS pipe is the buffer, not pw-cat's node latency. Both are
+# needed. See docs/experiments/02-pwcat-playback.md.
+PIPE_BYTES = 16384
+PW_CAT_LATENCY = "20ms"
+F_SETPIPE_SZ = 1031
+
+
 def pwcat_argv(*, target: int | None, rate: int) -> list[str]:
     """One long-lived playback process, fed raw PCM on stdin.
 
@@ -273,6 +302,8 @@ def pwcat_argv(*, target: int | None, rate: int) -> list[str]:
         "1",
         "--format",
         "s16",
+        "--latency",
+        PW_CAT_LATENCY,
         "--raw",
     ]
     if target is not None:
@@ -346,6 +377,18 @@ class PwCatSink:
     def __init__(self, launcher, *, target: int | None, rate: int):
         self._process = launcher.spawn_writer(pwcat_argv(target=target, rate=rate))
         self.failed = False
+        self._shrink_pipe()
+
+    def _shrink_pipe(self) -> None:
+        """Cap the stdin pipe so utterances are not queued behind a second.
+
+        Best-effort: a kernel that refuses F_SETPIPE_SZ, or a fake in tests
+        whose stdin is not a real pipe, costs latency rather than correctness.
+        """
+        try:
+            fcntl.fcntl(self._process.stdin.fileno(), F_SETPIPE_SZ, PIPE_BYTES)
+        except (OSError, AttributeError, ValueError) as exc:
+            log.debug("could not shrink the playback pipe (%s); latency will be higher", exc)
 
     def write(self, pcm: bytes) -> None:
         if self.failed:

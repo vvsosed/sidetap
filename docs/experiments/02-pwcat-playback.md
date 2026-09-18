@@ -109,15 +109,53 @@ entirely on `pw-cat` blocking once its buffer is full. That blocking *is* the
 clock. So this run measured `time.sleep`'s accuracy rather than the mechanism
 playout actually rests on.
 
-**Step 1b — the corrected test (pending).** A tight loop with no sleep for
-60 s, reporting `audio_written / wall_elapsed`. A ratio near 1.000 means
-`pw-cat` blocks and paces correctly and Task 19 builds as specified. A ratio
-far above 1 means it buffers without bound, `Playout.run()` as specified is
-broken — it would dump the whole queue instantly and accumulate unbounded
-latency — and playout needs its own real-time pacing.
+**Step 1b — the corrected test: `pw-cat` blocks and paces correctly.**
 
-**Consequence.** Residue of 441 ms is recorded in `README.md` under the
-drop-backlog hotkey. The no-`sleep` design in `Playout.run()` is supported by
-the drift figure. The blocking question stays open until Step 1b runs; Task 19
-is built to the specified design in the meantime, and the loop is the only part
-that would change.
+```
+wrote 3053 chunks = 61.1s of audio in 60.0s wall
+ratio: 1.018   (1.000 = pw-cat paces correctly)
+```
+
+`Playout.run()`'s no-sleep design is sound — `pw-cat` blocking genuinely is
+the clock. No Critical flaw.
+
+**Step 1c — the 1.8% overshoot turned out to be the real finding.**
+
+61.1 s of audio accepted in 60.0 s of wall clock means ~1.06 s was sitting
+buffered. That matters more than it looks: playout writes silence continuously
+between utterances, so whatever the pipe holds sits **ahead of every real
+utterance**. A second of queued silence was being added to glass-to-glass
+latency, invisibly.
+
+The buffer is the **OS pipe**, not `pw-cat`'s node latency — 64 KiB ÷ 48000 B/s
+= 1365 ms. Passing `--latency 20ms` alone changed nothing (1180 ms). Shrinking
+the pipe with `F_SETPIPE_SZ` is what works. Steady-state buffering, three 12 s
+runs at each size:
+
+| pipe | capacity | runs (ms buffered) | |
+|---|---|---|---|
+| 8 KiB | 171 ms | `-57, +129, +139` | starves — the negative run means the buffer ran dry |
+| **16 KiB** | **341 ms** | **`+299, +299, +299`** | **chosen: zero variance** |
+| 32 KiB | 683 ms | `+609, +609, +609` | stable, leaves 300 ms unclaimed |
+| 64 KiB | 1365 ms | `+1259, +1259, +1249` | the default |
+
+`adapters.py` now sets `PIPE_BYTES = 16384` and passes `--latency 20ms`,
+buying about **960 ms off every utterance**. 8 KiB's lower median was rejected:
+a buffer that runs dry produces audible crackling, which is worse than 300 ms
+of latency.
+
+**Consequence.**
+
+1. `Playout.run()` builds as specified — no `sleep`, `pw-cat` blocking is the
+   pacing. Confirmed, not assumed.
+2. `adapters.py` shrinks the playback pipe to 16 KiB and passes
+   `--latency 20ms`, removing ~960 ms of buffered silence from in front of
+   every utterance. This is the single largest latency win found so far,
+   larger than the ~400-850 ms that unexploited TTS streaming costs.
+3. Residue of 441 ms goes in `README.md` beside the drop-backlog hotkey: the
+   queue clears at once, but what is already in the pipe still plays, so the
+   hotkey cannot cut the current sentence short.
+4. **Add to the manual smoke checklist:** listen for crackling or dropouts on
+   a real call. 16 KiB measured stable here across every run, but this is the
+   one change that trades buffer headroom for latency, and an underrun is
+   audible where the old 1.3 s buffer was merely slow.

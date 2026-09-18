@@ -106,6 +106,51 @@ from sidetap.ports import LinkResult, LoopbackSpec
 from tests.conftest import FakeLauncher
 
 
+def test_pwcat_argv_caps_the_node_latency():
+    """Measured: the default buffering puts ~1s of silence ahead of every
+    utterance. --latency alone is not sufficient (the pipe dominates) but it
+    is half the fix; PwCatSink shrinks the pipe for the other half."""
+    from sidetap.adapters import PW_CAT_LATENCY
+
+    argv = pwcat_argv(target=77, rate=24_000)
+    assert argv[argv.index("--latency") + 1] == PW_CAT_LATENCY
+
+
+def test_pwcat_sink_shrinks_the_stdin_pipe():
+    """Without this, every utterance queues behind ~1s of buffered silence."""
+    import fcntl
+    import os
+
+    from sidetap.adapters import PIPE_BYTES, PwCatSink
+
+    read_fd, write_fd = os.pipe()
+
+    class RealPipeProcess:
+        def __init__(self):
+            self.stdin = os.fdopen(write_fd, "wb")
+
+    class Launcher:
+        def spawn_writer(self, argv):
+            return RealPipeProcess()
+
+    try:
+        # Bound, not discarded: letting the sink be collected would close the
+        # fdopen'd write end before the assertion could read it.
+        sink = PwCatSink(Launcher(), target=None, rate=24_000)
+        assert fcntl.fcntl(write_fd, 1032) == PIPE_BYTES  # F_GETPIPE_SZ
+        assert sink is not None
+    finally:
+        os.close(read_fd)
+
+
+def test_pwcat_sink_survives_a_pipe_it_cannot_shrink():
+    """A fake whose stdin is not a real pipe must not blow up construction."""
+    launcher = FakeLauncher()
+    sink = PwCatSink(launcher, target=5, rate=24_000)
+    sink.write(b"\x01")
+    assert launcher.writers[0].written == b"\x01"
+
+
 def test_pwcat_argv_asks_pipewire_to_resample():
     argv = pwcat_argv(target=77, rate=24_000)
     assert argv[0] == "pw-cat"
