@@ -18,7 +18,15 @@ from .types import AsrResult, Unit
 
 
 class FinalsOnlySegmenter:
-    """One Unit per final result. Interims are discarded."""
+    """One Unit per final result. Interims are discarded.
+
+    **One instance per direction, never shared.** This implementation is
+    stateless, so sharing would work today - but LocalAgreement-2 holds the
+    previous hypothesis and the committed prefix as instance state, and one
+    instance fed by both directions would interleave two conversations and
+    emit nonsense. DirectionPipeline constructs one per direction; do not
+    "hoist the constant out of the loop".
+    """
 
     def feed(self, result: AsrResult) -> list[Unit]:
         if not result.is_final:
