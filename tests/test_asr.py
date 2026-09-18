@@ -226,29 +226,118 @@ def test_a_transient_error_backs_off_and_retries():
     assert clock.slept[:3] == [2.0, 4.0, 8.0]
 
 
+class _DeadQueue:
+    """No further block ever arrives - the tapped node went away.
+
+    Ported from meetscribe's test fake of the same shape. A real
+    ``queue.get(timeout=0.25)`` burns real wall-clock time per poll, so this
+    advances the fake clock by exactly what a real wait would have cost
+    INSIDE get() - which is what lets the worker's run() execute
+    synchronously on the test's own thread, with no second thread and nothing
+    to race against. `first`, if given, is handed back once before Empty
+    starts; that models the gate rejecting the one real chunk that did
+    arrive, after which nothing more ever does.
+    """
+
+    def __init__(self, clock, stop, first=None, stop_after_polls=40):
+        self._clock = clock
+        self._stop = stop
+        self._first = first
+        self._polls = 0
+        self._stop_after = stop_after_polls
+
+    def get(self, timeout=None):
+        if self._first is not None:
+            chunk, self._first = self._first, None
+            return chunk
+        self._polls += 1
+        self._clock.advance(timeout or 0.25)
+        if self._polls >= self._stop_after:
+            self._stop.set()
+        raise queue.Empty
+
+
 def test_the_gate_suppresses_silence_but_the_keepalive_still_sends():
     """A stream sent nothing is killed by Google with a 409.
 
     The gate drops a quiet stretch, so the keepalive has to fire from the
     worker - the gate never sees the other cause, blocks not arriving at all.
+
+    Deterministic: _DeadQueue advances the fake clock inside get(), the same
+    way a real 0.25s poll would, so run() executes synchronously on this
+    thread. No second thread, no GIL race to rely on for correctness.
     """
     silence = b"\x00" * BLOCK_BYTES
     recognizer = FakeRecognizer([])
-    audio_q = DroppingQueue()
-    audio_q.put(AudioChunk(track=MIC, pcm=silence, t_start=0.0))
     out_q: queue.Queue = queue.Queue()
     stop = threading.Event()
     clock = FakeClock()
+    audio_q = _DeadQueue(
+        clock, stop, first=AudioChunk(track=MIC, pcm=silence, t_start=0.0)
+    )
 
     gate = SilenceGate(lambda pcm: False, tail_blocks=0)
     worker = _worker(recognizer, clock, gate=gate)
-    thread = threading.Thread(target=worker.run, args=(audio_q, out_q, stop))
-    thread.start()
-    for _ in range(200):
-        clock.advance(KEEPALIVE_S)
-        if recognizer.sent:
-            break
-    stop.set()
-    thread.join(timeout=2)
+    worker.run(audio_q, out_q, stop)
 
     assert SILENCE_BLOCK in recognizer.sent
+
+
+def test_repeated_failures_escalate_to_error_level(caplog):
+    """A dead network must not scroll past at WARNING level forever."""
+    attempts = []
+    stop = threading.Event()
+    recognizer = FakeRecognizer([], error=gexc.ServiceUnavailable("nope"))
+    audio_q = DroppingQueue()
+    for i in range(8):
+        audio_q.put(_chunk(float(i)))
+
+    def factory(timeline):
+        attempts.append(1)
+        if len(attempts) >= 7:  # escalation starts at the fifth failure
+            stop.set()
+        return recognizer
+
+    worker = RecognitionWorker(
+        direction=Direction.OUT,
+        recognizer_factory=factory,
+        gate=SilenceGate(None),
+        clock=FakeClock(),
+    )
+    worker.run(audio_q, queue.Queue(), stop)
+
+    levels = [
+        record.levelname
+        for record in caplog.records
+        if "speech stream error" in record.getMessage()
+    ]
+    # Four warnings, then ERROR for every failure after - a dead network must
+    # not scroll past at warning level forever.
+    assert levels == ["WARNING"] * 4 + ["ERROR"] * 2
+
+
+def test_reports_audio_lost_while_offline(caplog):
+    """An unmarked gap in a transcript reads as silence - say how much went."""
+    attempts = []
+    stop = threading.Event()
+    recognizer = FakeRecognizer([], error=gexc.ServiceUnavailable("nope"))
+    audio_q = DroppingQueue()
+    for i in range(3):
+        audio_q.put(_chunk(float(i)))
+
+    def factory(timeline):
+        attempts.append(1)
+        audio_q.dropped += 30  # the pump kept dropping while we were offline
+        if len(attempts) >= 2:
+            stop.set()
+        return recognizer
+
+    worker = RecognitionWorker(
+        direction=Direction.OUT,
+        recognizer_factory=factory,
+        gate=SilenceGate(None),
+        clock=FakeClock(),
+    )
+    worker.run(audio_q, queue.Queue(), stop)
+
+    assert any("3s of audio dropped" in r.getMessage() for r in caplog.records)

@@ -225,7 +225,8 @@ class RecognitionWorker:
                 # No stop check inside this loop. blocks() already returns when
                 # stop is set, which ends the stream on its own, and breaking
                 # out here would discard finals the engine emitted on the way
-                # out - exactly the ones cli.py drains for after Ctrl-C.
+                # out - exactly the ones DirectionPipeline.consume drains for
+                # after Ctrl-C.
                 for result in self._factory(timeline).stream(blocks()):
                     out_q.put(result)
                 consecutive_failures = 0
