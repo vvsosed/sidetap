@@ -74,7 +74,53 @@ long sound keeps coming out after the caller stops feeding it:
     print(f"residue: {drain_s * 1000:.0f} ms from stop-writing to pw-cat exit")
     PY
 
-**Result.** _(fill in: chunks written vs elapsed, drift, residue in ms)_
+**Result.** Run 2026-09-18.
+
+**Step 2 — post-flush residue: 441 ms.**
+
+```
+residue: 441 ms from stop-writing to pw-cat exit
+```
+
+Larger than the ~100-200 ms the plan assumed. When the drop-backlog hotkey
+fires, the queue clears at once but nearly half a second of already-queued
+audio still plays — so it cannot cut the current sentence short, only prevent
+the next one. Goes in `README.md` beside the hotkey.
+
+**Step 1 — inconclusive as originally written. The test was wrong.**
+
+```
+wrote 89382 chunks in 1800.0s
+audio written: 1787.6s | drift: -12.4s
+```
+
+Two things came out of it, one useful and one a flaw in the experiment:
+
+*Useful:* `pw-cat` fed continuously for 30 minutes without crashing, stalling
+or disconnecting. And a **sleep-paced** loop drifts −0.69% — each iteration
+cost 20.14 ms against a 20 ms target, under-feeding the sink by 12.4 s over
+half an hour. That independently validates `Playout.run()` having **no**
+`sleep`: a sleep-paced playout would slowly starve the sink and produce gaps.
+
+*The flaw:* because the loop slept 20 ms per 20 ms chunk, the pipe buffer never
+filled, so **`pw-cat` never had to block**. The loop paced itself. But
+`Playout.run()` has no sleep at all — it writes in a tight loop and depends
+entirely on `pw-cat` blocking once its buffer is full. That blocking *is* the
+clock. So this run measured `time.sleep`'s accuracy rather than the mechanism
+playout actually rests on.
+
+**Step 1b — the corrected test (pending).** A tight loop with no sleep for
+60 s, reporting `audio_written / wall_elapsed`. A ratio near 1.000 means
+`pw-cat` blocks and paces correctly and Task 19 builds as specified. A ratio
+far above 1 means it buffers without bound, `Playout.run()` as specified is
+broken — it would dump the whole queue instantly and accumulate unbounded
+latency — and playout needs its own real-time pacing.
+
+**Consequence.** Residue of 441 ms is recorded in `README.md` under the
+drop-backlog hotkey. The no-`sleep` design in `Playout.run()` is supported by
+the drift figure. The blocking question stays open until Step 1b runs; Task 19
+is built to the specified design in the meantime, and the loop is the only part
+that would change.
 
 **Consequence.** If residue exceeds ~300 ms, note it in `README.md` under the
 drop-backlog hotkey. If drift is non-zero, playout needs to track written-vs-
