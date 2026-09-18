@@ -36,13 +36,15 @@ class DuckControl:
         self._closed = False
 
     def close(self) -> None:
-        if not self._closed:
-            self._volume.set_volume(self._object_id, 0.0)
+        # Only flip on a successful call. set_volume returns False rather
+        # than raising when wpctl fails; flipping anyway would desync the
+        # flag from the real volume and the next transition would think it
+        # is already in the target state and skip retrying.
+        if not self._closed and self._volume.set_volume(self._object_id, 0.0):
             self._closed = True
 
     def open(self) -> None:
-        if self._closed:
-            self._volume.set_volume(self._object_id, 1.0)
+        if self._closed and self._volume.set_volume(self._object_id, 1.0):
             self._closed = False
 
 
@@ -102,8 +104,18 @@ class Playout:
 
     def _trim_locked(self) -> None:
         # A single item longer than the cap is kept: dropping it would make a
-        # long sentence unsayable at any cap setting.
-        while len(self._queue) > 1 and self._backlog_locked() > self._lag_cap_s:
+        # long sentence unsayable at any cap setting. That rule is about the
+        # queue's sole survivor, not about _current - if something is already
+        # playing in _current, every queued item is still droppable, because
+        # dropping them still leaves _current to finish. Looking only at
+        # len(self._queue) misses exactly the ordinary shape of a monologue
+        # (one utterance playing, the next queued), where the cap would
+        # otherwise never act.
+        while (
+            self._queue
+            and (len(self._queue) > 1 or self._current is not None)
+            and self._backlog_locked() > self._lag_cap_s
+        ):
             victim = self._queue.popleft()
             self.dropped += 1
             log.warning(
@@ -112,8 +124,28 @@ class Playout:
                 self._backlog_locked(),
                 self.dropped,
             )
-            if self._on_dropped is not None:
-                self._on_dropped(victim)
+            self._invoke(self._on_dropped, victim)
+
+    def _invoke(
+        self, callback: Callable[[Translated], None] | None, item: Translated
+    ) -> None:
+        """Run a consumer callback without letting it take down this thread.
+
+        `on_spoken` fires on the playout thread, inside tick(), right after
+        the duck closes. `on_dropped` fires wherever submit() is called,
+        while the lock is held. Either one raising - a transcript write
+        hitting a full disk, say (Task 25) - must not propagate: out of
+        tick() it would kill the playout thread with the duck stuck closed,
+        which is exactly the fail-safe this module exists to provide,
+        inverted into silence; out of submit() it would silently stop the
+        producer thread from submitting anything further.
+        """
+        if callback is None:
+            return
+        try:
+            callback(item)
+        except Exception:
+            log.exception("playout callback raised; continuing")
 
     def _backlog_locked(self) -> float:
         return sum(i.audio_s for i in self._queue) + len(self._pending) / TTS_BYTES_PER_S
@@ -146,8 +178,8 @@ class Playout:
         if self._duck is not None:
             self._duck.close()
         self._sink.write(chunk)
-        if finished is not None and self._on_spoken is not None:
-            self._on_spoken(finished)
+        if finished is not None:
+            self._invoke(self._on_spoken, finished)
         return True
 
     def run(self, stop: threading.Event) -> None:
@@ -164,11 +196,20 @@ class Playout:
         thing pacing this loop and it would pin a CPU core until hangup. The
         fallback wait below is not belt-and-braces; it is the whole reason the
         `failed` flag is readable from here.
+
+        The try/finally is defense in depth: on_spoken/on_dropped are already
+        isolated by _invoke, so in practice tick() should not raise, but if
+        it ever does, cleanup still has to run. Leaving the duck closed would
+        replace the module's one fail-safe - a dead pipeline leaves the user
+        hearing the remote party untranslated - with silence instead, which
+        is the opposite.
         """
-        while not stop.is_set():
-            self.tick()
-            if getattr(self._sink, "failed", False):
-                stop.wait(CHUNK_MS / 1000)
-        if self._duck is not None:
-            self._duck.open()
-        self._sink.close()
+        try:
+            while not stop.is_set():
+                self.tick()
+                if getattr(self._sink, "failed", False):
+                    stop.wait(CHUNK_MS / 1000)
+        finally:
+            if self._duck is not None:
+                self._duck.open()
+            self._sink.close()

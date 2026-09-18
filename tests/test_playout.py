@@ -174,3 +174,91 @@ def test_a_failed_sink_does_not_stall_the_queue():
     playout.tick()
     playout.tick()
     assert playout.backlog_s() == 0.0
+
+
+def test_a_raising_on_spoken_still_leaves_the_duck_open_and_the_sink_closed():
+    """A consumer's bookkeeping failure (e.g. Task 25's transcript write)
+    must not leave the duck stuck closed.
+
+    A dead pipeline is supposed to fail safe: nothing gets written, the duck
+    never closes, and the user hears the remote party untranslated. A duck
+    stuck closed because on_spoken raised inverts that into silence, the one
+    outcome this module exists to prevent.
+    """
+    import threading
+    import time
+
+    def boom(item):
+        raise ValueError("boom")
+
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, object_id=42)
+    sink = FakeAudioSink()
+    playout = Playout(Direction.IN, sink, duck=duck, on_spoken=boom)
+    playout.submit(_translated(0.02))
+
+    stop = threading.Event()
+    thread = threading.Thread(target=playout.run, args=(stop,), daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    stop.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert volume.calls[-1] == (42, 1.0)  # duck ended up open
+    assert sink.closed is True
+
+
+def test_a_raising_on_dropped_does_not_propagate_out_of_submit():
+    """A raise here today happens inside _trim_locked, called from submit()
+    on the producer thread - so uncaught it would silently stop that thread
+    from submitting anything further.
+    """
+
+    def boom(item):
+        raise ValueError("boom")
+
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=5.0, on_dropped=boom
+    )
+    playout.submit(_translated(2.0, "first"))
+    playout.submit(_translated(2.0, "second"))
+    playout.submit(_translated(2.0, "third"))  # over the cap; on_dropped raises
+
+    assert playout.dropped == 1
+    assert playout.backlog_s() == 4.0
+
+
+def test_the_cap_drops_a_queued_item_even_while_the_current_one_still_plays():
+    """The ordinary shape of a monologue: one utterance already playing in
+    _current, the next one queued behind it. Looking only at _queue's length
+    misses exactly this, the most common case - the cap would never act
+    during an ordinary monologue.
+    """
+    dropped = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=5.0, on_dropped=dropped.append
+    )
+    playout.submit(_translated(10.0, "long"))
+    playout.tick()  # moves "long" into _current/_pending; _queue is now empty
+    playout.submit(_translated(3.0, "short"))  # _queue is len 1, but backlog is ~13s
+
+    assert [d.unit.text for d in dropped] == ["short"]
+    assert playout.dropped == 1
+
+
+def test_a_failed_duck_transition_does_not_flip_the_closed_flag():
+    """set_volume returns False rather than raising when wpctl fails.
+
+    Flipping the flag anyway would desync it from the real volume: the next
+    speech chunk would see `_closed` already True and skip retrying the
+    close, so the duck silently stops working after one transient failure.
+    """
+    volume = FakeVolumeControl(ok=False)
+    duck = DuckControl(volume, object_id=42)
+
+    duck.close()
+    duck.close()
+    # Both calls actually reached wpctl - the flag never flipped, so close()
+    # kept retrying rather than assuming the first call had worked.
+    assert volume.calls == [(42, 0.0), (42, 0.0)]
