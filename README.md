@@ -246,7 +246,7 @@ aspirational TODOs.
   means there is no overlay to fall back on, and v1 only translates complete,
   finalised utterances (no incremental commit yet) — so both parties talking
   continuously without pausing pushes the translation further and further
-  behind rather than keeping pace, until the lag cap (default 12 s) starts
+  behind rather than keeping pace, until the lag cap (default 20 s) starts
   dropping the oldest queued utterances.
 - **Cloud Translation cannot be pinned to `europe-west3`.** Unlike
   Speech-to-Text, Translation only accepts `global` or `us-central1`

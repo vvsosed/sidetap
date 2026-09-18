@@ -20,7 +20,18 @@ REMOTE = "remote"
 MIC = "mic"
 
 # Seconds of un-spoken audio past which playout starts dropping the oldest.
-LAG_CAP_S = 12.0
+#
+# A dropped utterance is a sentence the user never hears, which is a harder
+# failure than briefly trailing the conversation, so the cap errs toward
+# holding audio rather than discarding it. It is a ceiling on transient
+# spikes, not a cure for a backlog that grows: if the translated language
+# runs longer than its source, only --speaking-rate-in can make it drain, and
+# a higher cap merely postpones the first drop.
+#
+# Not measured against a real two-way call - at this setting a reply arrives
+# up to 20 s after what it answers, which is past conversational. Lower it
+# with --lag-cap when keeping pace matters more than hearing every sentence.
+LAG_CAP_S = 20.0
 # Seconds of continuous outbound speech with nothing reaching the virtual mic
 # before the dead-air alarm fires.
 DEAD_AIR_S = 6.0
