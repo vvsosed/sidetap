@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from .graph import PLAYBACK_STREAM, PwGraph
-from .ports import GraphSource, Linker, LoopbackFactory, LoopbackSpec, Unlinker
+from .ports import GraphSource, Linker, LinkResult, LoopbackFactory, LoopbackSpec, Unlinker
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,13 @@ DUCK_NODE = "sidetap_duck"
 VIRTMIC_SINK = "sidetap_tts_sink"
 VIRTMIC_SOURCE = "sidetap_virtmic"
 VIRTMIC_DESCRIPTION = "sidetap Virtual Mic"
+# Deliberately different from VIRTMIC_DESCRIPTION. sidetap_tts_sink (capture)
+# is a sink only sidetap itself ever writes into; sidetap_virtmic (playback)
+# is the microphone the user's messenger is meant to select. Giving both the
+# same description makes them indistinguishable in a volume control UI, and
+# the failure mode of picking the wrong one is silent: the remote party hears
+# nothing, with no error anywhere to explain why.
+VIRTMIC_CAPTURE_DESCRIPTION = "sidetap TTS input"
 
 VIRTMIC_CONFIG = f"""\
 # Installed by `sidetap doctor`.
@@ -51,6 +59,7 @@ context.modules = [
       node.description = "{VIRTMIC_DESCRIPTION}"
       capture.props = {{
         node.name       = "{VIRTMIC_SINK}"
+        node.description = "{VIRTMIC_CAPTURE_DESCRIPTION}"
         media.class     = Audio/Sink
         audio.position  = [ MONO ]
         audio.rate      = 48000
@@ -108,19 +117,49 @@ class Journal:
     made: tuple[LinkRef, ...] = ()
 
     def save(self, path: Path) -> None:
+        """Write atomically: a temp file in the same directory, then os.replace().
+
+        A bare write_text() can leave a truncated file if interrupted.
+        os.replace() is atomic on the same filesystem, so a reader only ever
+        sees the old content or the new content, never a half-written mix.
+        This matters more here than it looks: _route() does a load-modify-
+        save of the ACCUMULATED journal on every call that routes something,
+        so a torn write on the second or later call would not just lose the
+        entry being added - it would erase the record of every mutation
+        already applied and still live in the graph.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "broken": [r.to_dict() for r in self.broken],
             "made": [r.to_dict() for r in self.made],
         }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path: Path) -> Journal:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # A half-written file from a kill -9 must not stop the next run.
+        except FileNotFoundError:
+            # The common case: no session has ever journalled here. Quiet.
+            return cls()
+        except (OSError, json.JSONDecodeError) as exc:
+            # NOT the common case: a file exists but cannot be read as a
+            # journal, which can only mean a write was interrupted. Since
+            # save() does a load-modify-save of the accumulated journal, this
+            # may be the only record of a link that is still live in the
+            # graph. Refusing to start would be worse than starting with
+            # nothing to restore, but doing so silently would not be - so say
+            # so loudly rather than swallowing it like a merely absent file.
+            log.error(
+                "routing journal at %s is unreadable (%s) - proceeding as if "
+                "there is nothing to restore, but the audio graph may still "
+                "be modified from a previous session. Run `sidetap doctor "
+                "--repair` and check manually if call audio sounds wrong.",
+                path,
+                exc,
+            )
             return cls()
         return cls(
             broken=tuple(LinkRef.from_dict(d) for d in payload.get("broken", ())),
@@ -197,6 +236,16 @@ class Router:
         # same hazard AppTap's dedup key guards against.
         self._routed: set[int] = set()
         self._app_pattern: str | None = None
+        # Held across the whole of _route_locked()/restore()/repair(). Once a
+        # Session exists, run()'s watcher thread calls poll_once() on its own
+        # cadence while the main thread can call restore() at any moment (on
+        # shutdown, or the user asking for it) - without this, a poll can
+        # re-break a link restore() just fixed, or a restore can run against
+        # a snapshot a concurrent poll is mid-way through acting on. Held
+        # across full method bodies rather than fine-grained, since these run
+        # at most a few times a session and never per audio block - so
+        # contention is irrelevant and correctness is what matters.
+        self._lock = threading.Lock()
         # BOTH, deliberately. The serial is the durable identifier the journal
         # records; the id is what wpctl resolves against for the duck volume.
         # Conflating them makes the duck silently never close - see
@@ -204,32 +253,43 @@ class Router:
         self.duck_serial: int | None = None
         self.duck_id: int | None = None
 
-    def engage(self, app_pattern: str, capture_node_name: str | None) -> None:
-        self._app_pattern = app_pattern
-        # Exactly one snapshot for this call, taken BEFORE the loopback is
-        # spawned - we need the current default sink's name to give
-        # pw-loopback a --playback-props target.object, and that has to
-        # happen before create() is called at all.
-        #
-        # It is then reused, rather than re-read, to look up the duck itself.
-        # spawn_writer() returns as soon as the process forks; there is no
-        # guarantee the loopback has registered its nodes with the graph by
-        # the time a subsequent pw-dump would run, so a fresh read here could
-        # race it either way. Reusing this snapshot means engage() simply
-        # finds no duck yet (_route() below then does nothing but record the
-        # pattern) and the very next poll_once() - at most POLL_INTERVAL_S
-        # later, the same bound AppTap already relies on for a restarted
-        # stream - completes the routing once the duck has appeared. What
-        # engage() must never do is guess at duck ports from a snapshot that
-        # cannot possibly contain them and journal something that was never
-        # actually linked.
-        snapshot = self._graph.snapshot()
-        default_sink = snapshot.node_by_name(snapshot.default_sink or "")
-        target_sink_name = default_sink.name if default_sink else ""
+    def engage(self, app_pattern: str) -> None:
+        with self._lock:
+            if self._loopback is not None:
+                # Otherwise the old handle leaks (nothing ever terminates
+                # it) and a second node also named sidetap_duck gets
+                # created, making every node_by_name(DUCK_NODE) lookup from
+                # here on nondeterministic about which one it means.
+                raise RuntimeError(
+                    "Router.engage() called while already engaged - call "
+                    "restore() before engaging again"
+                )
+            self._app_pattern = app_pattern
+            # Exactly one snapshot for this call, taken BEFORE the loopback is
+            # spawned - we need the current default sink's name to give
+            # pw-loopback a --playback-props target.object, and that has to
+            # happen before create() is called at all.
+            #
+            # It is then reused, rather than re-read, to look up the duck
+            # itself. spawn_writer() returns as soon as the process forks;
+            # there is no guarantee the loopback has registered its nodes
+            # with the graph by the time a subsequent pw-dump would run, so a
+            # fresh read here could race it either way. Reusing this snapshot
+            # means engage() simply finds no duck yet (_route_locked() below
+            # then does nothing but record the pattern) and the very next
+            # poll_once() - at most POLL_INTERVAL_S later, the same bound
+            # AppTap already relies on for a restarted stream - completes the
+            # routing once the duck has appeared. What engage() must never do
+            # is guess at duck ports from a snapshot that cannot possibly
+            # contain them and journal something that was never actually
+            # linked.
+            snapshot = self._graph.snapshot()
+            default_sink = snapshot.node_by_name(snapshot.default_sink or "")
+            target_sink_name = default_sink.name if default_sink else ""
 
-        self._loopback = self._loopbacks.create(duck_loopback_spec(target_sink_name))
+            self._loopback = self._loopbacks.create(duck_loopback_spec(target_sink_name))
 
-        self._route(snapshot, app_pattern, initial=True)
+            self._route_locked(snapshot, app_pattern, initial=True)
 
     def poll_once(self) -> int:
         """Route any matching stream that is not routed yet. Returns how many.
@@ -243,10 +303,12 @@ class Router:
         """
         if self._app_pattern is None:
             return 0
-        snapshot = self._graph.snapshot()
-        return self._route(snapshot, self._app_pattern, initial=False)
+        with self._lock:
+            snapshot = self._graph.snapshot()
+            return self._route_locked(snapshot, self._app_pattern, initial=False)
 
-    def _route(self, snapshot: PwGraph, app_pattern: str, *, initial: bool) -> int:
+    def _route_locked(self, snapshot: PwGraph, app_pattern: str, *, initial: bool) -> int:
+        """Caller must hold self._lock."""
         duck = snapshot.node_by_name(DUCK_NODE)
         # Refreshed on every call, not just engage()'s. engage()'s own
         # snapshot can predate the loopback actually registering (see the
@@ -271,7 +333,7 @@ class Router:
 
         broken: list[LinkRef] = []
         made: list[LinkRef] = []
-        routed = 0
+        candidates: set[int] = set()
 
         for stream in snapshot.by_class(PLAYBACK_STREAM):
             if not stream.matches(app_pattern):
@@ -304,12 +366,11 @@ class Router:
                     made.append(
                         LinkRef(stream.serial, out_port.name, duck.serial, in_port.name)
                     )
-            self._routed.add(stream.serial)
-            routed += 1
+            candidates.add(stream.serial)
             log.info("routing %s (serial=%s) through the duck", stream.label, stream.serial)
 
         if not broken and not made:
-            return routed
+            return 0
 
         # Durable BEFORE the graph is touched. A crash in between is exactly
         # the case the journal exists for. On the first call the journal is
@@ -320,12 +381,34 @@ class Router:
             made=journal.made + tuple(made),
         ).save(self._journal_path)
 
+        # A FAILED apply must NOT be treated as done - this mirrors tap.py's
+        # AppTap, which deliberately does not record a pair on FAILED ("so it
+        # is retried"). If the unlink from the speakers succeeds but the link
+        # into the duck fails, the stream ends up connected to nothing at all
+        # - silent call audio - and leaving its serial out of self._routed is
+        # what makes the next poll_once() retry it instead of considering it
+        # done forever.
+        failed: set[int] = set()
         for ref in broken:
-            self._apply(snapshot, ref, link=False)
+            if self._apply(snapshot, ref, link=False) is LinkResult.FAILED:
+                failed.add(ref.src_serial)
         for ref in made:
-            self._apply(snapshot, ref, link=True)
+            if self._apply(snapshot, ref, link=True) is LinkResult.FAILED:
+                failed.add(ref.src_serial)
 
-        if initial:
+        succeeded = candidates - failed
+        self._routed |= succeeded
+        if failed:
+            log.warning(
+                "could not fully route %r through %s (serials=%s) - will retry "
+                "on the next poll; the original may be briefly audible over "
+                "the translation until then",
+                app_pattern,
+                DUCK_NODE,
+                sorted(failed),
+            )
+
+        if initial and succeeded:
             log.info(
                 "routed %r through %s (%d links broken, %d made)",
                 app_pattern,
@@ -333,7 +416,7 @@ class Router:
                 len(broken),
                 len(made),
             )
-        return routed
+        return len(succeeded)
 
     def run(self, stop: threading.Event, interval: float = POLL_INTERVAL_S) -> None:
         """Re-scan until stopped. A transient graph read must not kill this."""
@@ -345,15 +428,36 @@ class Router:
             stop.wait(interval)
 
     def restore(self) -> None:
+        with self._lock:
+            self._restore_locked()
+
+    def _restore_locked(self) -> None:
+        """Caller must hold self._lock."""
         journal = Journal.load(self._journal_path)
         if journal.is_empty():
             return
         snapshot = self._graph.snapshot()
+        failed = False
         for ref in journal.made:
-            self._apply(snapshot, ref, link=False)
+            if self._apply(snapshot, ref, link=False) is LinkResult.FAILED:
+                failed = True
         for ref in journal.broken:
-            self._apply(snapshot, ref, link=True)
-        Journal().save(self._journal_path)
+            if self._apply(snapshot, ref, link=True) is LinkResult.FAILED:
+                failed = True
+
+        if failed:
+            # A journal that survives one failed restore is recoverable; one
+            # that gets erased anyway is not. A transient pw-link timeout
+            # during an otherwise normal exit must not both fail to restore
+            # the graph AND destroy the only record that could repair it.
+            log.error(
+                "could not fully restore the audio graph - at least one link "
+                "failed to apply. Keeping the routing journal so the next "
+                "repair can retry; run `sidetap doctor --repair`."
+            )
+        else:
+            Journal().save(self._journal_path)
+
         if self._loopback is not None:
             self._loopback.terminate()
             self._loopback = None
@@ -362,26 +466,54 @@ class Router:
         """Replay a journal left behind by a session that died.
 
         Returns True if there was one. Idempotent: entries whose nodes are
-        gone are skipped, and the journal is cleared either way.
+        gone are skipped, and the journal is cleared only once every apply in
+        the replay succeeded - see restore().
         """
-        journal = Journal.load(self._journal_path)
-        if journal.is_empty():
-            return False
-        log.warning(
-            "found a routing journal from a previous session; repairing the graph"
-        )
-        self.restore()
-        return True
+        with self._lock:
+            # A kill -9 leaves pw-loopback running: SubprocessLauncher spawns
+            # it with start_new_session=True precisely so terminate() can
+            # reach a whole process group, but that also means it survives
+            # its parent's death as an orphan, and this fresh Router instance
+            # has no PID for it (a restart loses any handle) and the journal
+            # records links, not processes. If a duck node already exists in
+            # the graph before this instance has ever called engage(), it can
+            # only be that leftover - the best repair() can do is say so.
+            snapshot = self._graph.snapshot()
+            duck = snapshot.node_by_name(DUCK_NODE)
+            if duck is not None:
+                log.warning(
+                    "found an existing %s node (id=%s) from a previous "
+                    "session - its pw-loopback process may still be running "
+                    "with nothing able to stop it automatically. If call "
+                    "audio still sounds wrong after this repair, stop it by "
+                    "hand: pkill -f 'pw-loopback.*%s'",
+                    DUCK_NODE,
+                    duck.id,
+                    DUCK_NODE,
+                )
 
-    def _apply(self, snapshot: PwGraph, ref: LinkRef, *, link: bool) -> None:
+            journal = Journal.load(self._journal_path)
+            if journal.is_empty():
+                return False
+            log.warning(
+                "found a routing journal from a previous session; repairing the graph"
+            )
+            self._restore_locked()
+            return True
+
+    def _apply(self, snapshot: PwGraph, ref: LinkRef, *, link: bool) -> LinkResult:
         ports = resolve(snapshot, ref)
         if ports is None:
             # The application exited; its serial is gone for good. Nothing to
-            # restore, and refusing to continue would strand the rest.
+            # restore, and refusing to continue would strand the rest. This
+            # is a no-op, not a failure - ALREADY_LINKED is the closest of
+            # the three LinkResult values to "nothing needed doing", and the
+            # only one of them that must never keep a journal alive (see
+            # restore()/_restore_locked()).
             log.debug("skipping stale link %s", ref)
-            return
+            return LinkResult.ALREADY_LINKED
         src, dst = ports
         if link:
-            self._linker.link(src, dst)
+            return self._linker.link(src, dst)
         else:
-            self._unlinker.unlink(src, dst)
+            return self._unlinker.unlink(src, dst)

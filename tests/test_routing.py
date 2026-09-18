@@ -1,9 +1,15 @@
 import json
+import logging
+import os
+
+import pytest
 
 from sidetap.ports import LinkResult
 from sidetap.routing import (
     DUCK_NODE,
+    VIRTMIC_CAPTURE_DESCRIPTION,
     VIRTMIC_CONFIG,
+    VIRTMIC_DESCRIPTION,
     VIRTMIC_SINK,
     VIRTMIC_SOURCE,
     Journal,
@@ -88,7 +94,7 @@ def test_engage_journals_before_it_touches_the_graph(tmp_path, routing_graph):
         loopbacks=FakeLoopbackFactory(),
         journal_path=path,
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
 
     assert writes, "no unlink happened at all"
     assert all(existed for _, existed in writes)
@@ -104,7 +110,7 @@ def test_engage_creates_the_duck_loopback(tmp_path, routing_graph):
         loopbacks=loopbacks,
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     assert len(loopbacks.specs) == 1
 
 
@@ -123,7 +129,7 @@ def test_restore_terminates_the_duck_loopback(tmp_path, routing_graph):
         loopbacks=loopbacks,
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     router.restore()
     assert loopbacks.processes[0].terminated
 
@@ -137,7 +143,7 @@ def test_restore_relinks_what_was_broken_and_breaks_what_was_made(tmp_path, rout
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     made = len(linker.links)
     broken = len(linker.unlinks)
 
@@ -159,7 +165,7 @@ def test_restore_clears_the_journal(tmp_path, routing_graph):
         loopbacks=FakeLoopbackFactory(),
         journal_path=path,
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     router.restore()
     assert Journal.load(path) == Journal()
 
@@ -173,7 +179,7 @@ def test_restore_is_idempotent(tmp_path, routing_graph):
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     router.restore()
     linker.links.clear()
     router.restore()
@@ -245,7 +251,7 @@ def test_engage_pairs_channels_rather_than_crossing_them(tmp_path, routing_graph
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
 
     journal = Journal.load(tmp_path / "j.json")
     assert [(r.src_port, r.dst_port) for r in journal.broken] == [
@@ -280,7 +286,7 @@ def test_poll_routes_a_stream_that_appeared_after_engage(tmp_path, routing_graph
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     assert linker.links == [], "nothing was playing yet"
 
     assert router.poll_once() == 1
@@ -297,7 +303,7 @@ def test_poll_does_not_reroute_the_same_stream(tmp_path, routing_graph):
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
     before = len(linker.links)
     assert router.poll_once() == 0
     assert len(linker.links) == before
@@ -332,7 +338,7 @@ def test_engage_records_both_the_ducks_serial_and_its_id(tmp_path, routing_graph
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
 
     duck = routing_graph.node_by_name(DUCK_NODE)
     assert router.duck_serial == duck.serial
@@ -366,7 +372,7 @@ def test_engage_leaves_sidetaps_own_sinks_alone(tmp_path, routing_graph):
         loopbacks=FakeLoopbackFactory(),
         journal_path=tmp_path / "j.json",
     )
-    router.engage(app_pattern="zoom", capture_node_name=None)
+    router.engage(app_pattern="zoom")
 
     journal = Journal.load(tmp_path / "j.json")
     # 1400 is sidetap_tts_sink: touching it would cut the virtual mic.
@@ -380,3 +386,252 @@ def test_the_virtmic_config_declares_both_halves():
     assert "Audio/Sink" in VIRTMIC_CONFIG
     assert "Audio/Source" in VIRTMIC_CONFIG
     assert "libpipewire-module-loopback" in VIRTMIC_CONFIG
+
+
+# --- Quality review follow-ups -------------------------------------------
+
+
+def test_a_failed_route_is_not_marked_routed_and_is_retried(tmp_path, routing_graph):
+    """A FAILED apply must not be recorded as routed.
+
+    tap.py's AppTap deliberately leaves a failed pair unrecorded "so it is
+    retried" - Router must behave the same way. Recording it anyway would
+    mean: if the unlink from the speakers succeeds but the link into the
+    duck fails, the stream ends up connected to nothing at all, and
+    poll_once() would never try again because the serial already looks done.
+    """
+    linker = FakeLinker(result=LinkResult.FAILED)
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+    attempts_after_engage = len(linker.links) + len(linker.unlinks)
+    assert attempts_after_engage > 0, "engage() should still have tried"
+
+    # If the stream had been (wrongly) marked routed, this call would make no
+    # further linker calls at all.
+    router.poll_once()
+    attempts_after_poll = len(linker.links) + len(linker.unlinks)
+    assert attempts_after_poll > attempts_after_engage, "a failed route was never retried"
+
+
+def test_a_failed_route_succeeds_once_the_transient_failure_clears(tmp_path, routing_graph):
+    linker = FakeLinker(result=LinkResult.FAILED)
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+
+    linker.result = LinkResult.LINKED
+    assert router.poll_once() == 1
+
+
+def test_restore_keeps_the_journal_when_a_link_fails(tmp_path, routing_graph):
+    """A journal that survives one failed restore is recoverable; one that
+
+    gets erased anyway is not. A transient pw-link timeout during a normal
+    exit must not both fail to restore the graph AND destroy the only record
+    that could repair it at next startup.
+    """
+    path = tmp_path / "j.json"
+    linker = FakeLinker()
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=path,
+    )
+    router.engage(app_pattern="zoom")
+    before = Journal.load(path)
+    assert not before.is_empty()
+
+    linker.result = LinkResult.FAILED
+    router.restore()
+
+    assert Journal.load(path) == before, "a failed restore must not erase the journal"
+
+
+def test_restore_logs_an_error_when_it_cannot_fully_restore(tmp_path, routing_graph, caplog):
+    linker = FakeLinker()
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+    linker.result = LinkResult.FAILED
+    with caplog.at_level(logging.ERROR):
+        router.restore()
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_journal_save_is_atomic_a_failed_write_does_not_corrupt_the_previous_file(
+    tmp_path, monkeypatch
+):
+    """_route() does a load-modify-save of the ACCUMULATED journal on every
+
+    call, so a torn write on the second or later call would destroy the
+    record of mutations that are already applied and live, not just the one
+    being added. save() must write elsewhere and swap the file in atomically.
+    """
+    path = tmp_path / "journal.json"
+    original = Journal(broken=(LinkRef(1, "a", 2, "b"),))
+    original.save(path)
+    original_bytes = path.read_bytes()
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    newer = Journal(broken=(LinkRef(9, "x", 9, "y"),))
+    with pytest.raises(OSError):
+        newer.save(path)
+
+    assert path.read_bytes() == original_bytes, "a failed save corrupted the live journal"
+
+
+def test_loading_a_corrupt_journal_logs_an_error(tmp_path, caplog):
+    # Unlike a merely missing journal, a file that exists but cannot be
+    # parsed can only mean a write was interrupted - possibly the only record
+    # of a link that is still live. That must not be silent.
+    path = tmp_path / "journal.json"
+    path.write_text("{ not json")
+    with caplog.at_level(logging.ERROR):
+        Journal.load(path)
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_loading_a_missing_journal_does_not_log_an_error(tmp_path, caplog):
+    # The common case - no session has ever journalled here - must stay
+    # quiet, or every ordinary startup would print a scary error.
+    with caplog.at_level(logging.WARNING):
+        Journal.load(tmp_path / "nope.json")
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_route_holds_the_lock_while_reading_the_graph(tmp_path, routing_graph):
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=FakeLinker(),
+        unlinker=FakeLinker(),
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    held_during_read = []
+
+    class SpyGraph:
+        def snapshot(self):
+            acquired = router._lock.acquire(blocking=False)
+            held_during_read.append(acquired)
+            if acquired:
+                router._lock.release()
+            return routing_graph
+
+    router._graph = SpyGraph()
+    router.engage(app_pattern="zoom")
+    assert held_during_read == [False], "engage() must hold the lock while reading the graph"
+
+
+def test_restore_holds_the_lock_while_reading_the_graph(tmp_path, routing_graph):
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=FakeLinker(),
+        unlinker=FakeLinker(),
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+
+    held_during_read = []
+
+    class SpyGraph:
+        def snapshot(self):
+            acquired = router._lock.acquire(blocking=False)
+            held_during_read.append(acquired)
+            if acquired:
+                router._lock.release()
+            return routing_graph
+
+    router._graph = SpyGraph()
+    router.restore()
+    assert held_during_read == [False], "restore() must hold the lock while reading the graph"
+
+
+def test_repair_holds_the_lock_while_reading_the_graph(tmp_path, routing_graph):
+    router = Router(
+        graph=None,
+        linker=FakeLinker(),
+        unlinker=FakeLinker(),
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "absent.json",
+    )
+    held_during_read = []
+
+    class SpyGraph:
+        def snapshot(self):
+            acquired = router._lock.acquire(blocking=False)
+            held_during_read.append(acquired)
+            if acquired:
+                router._lock.release()
+            return routing_graph
+
+    router._graph = SpyGraph()
+    router.repair()
+    assert held_during_read == [False], "repair() must hold the lock while reading the graph"
+
+
+def test_engage_twice_raises_instead_of_leaking_a_second_duck(tmp_path, routing_graph):
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=FakeLinker(),
+        unlinker=FakeLinker(),
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+    with pytest.raises(RuntimeError):
+        router.engage(app_pattern="zoom")
+
+
+def test_repair_warns_about_an_orphaned_duck_node(tmp_path, routing_graph, caplog):
+    """A kill -9 leaves pw-loopback running under start_new_session=True.
+
+    repair() has no PID to kill it with - the journal records links, not
+    processes - so the best it can do is tell the user how to find it by
+    hand.
+    """
+    router = Router(
+        graph=FakeGraphSource(routing_graph),  # already contains sidetap_duck
+        linker=FakeLinker(),
+        unlinker=FakeLinker(),
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "absent.json",
+    )
+    with caplog.at_level(logging.WARNING):
+        router.repair()
+    assert any("pkill" in r.message for r in caplog.records)
+
+
+def test_the_virtmic_config_distinguishes_the_two_nodes():
+    """Both nodes showing the same description in a volume UI invites
+
+    picking the wrong one - the symptom would be the remote party hearing
+    nothing, with no error anywhere to explain why.
+    """
+    assert VIRTMIC_CAPTURE_DESCRIPTION != VIRTMIC_DESCRIPTION
+    _, after_capture = VIRTMIC_CONFIG.split("capture.props")
+    capture_section, playback_section = after_capture.split("playback.props")
+    assert VIRTMIC_CAPTURE_DESCRIPTION in capture_section
+    assert VIRTMIC_DESCRIPTION not in capture_section
+    assert VIRTMIC_DESCRIPTION in playback_section
