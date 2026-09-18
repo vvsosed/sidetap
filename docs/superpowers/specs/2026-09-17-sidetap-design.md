@@ -337,10 +337,16 @@ no benefit at this granularity.
 The preferred model is Translation LLM rather than NMT: roughly cost-parity
 ($10 in + $10 out vs $20 per 1M characters) and better on conversational
 register. **Translation LLM's region and language-pair coverage is narrower
-than NMT's and is not confirmed for EN↔RU in `europe-west3`.** The model is
-therefore a configuration value, with automatic fallback to NMT on error or on
-exceeding a latency budget. If coverage is missing this is a flag change, not a
-rewrite. See **Experiment 3**.
+than NMT's, and Experiment 3 measured what that costs.** It covers EN↔RU and
+EN↔UK, but runs about **195 ms slower** than NMT (238–333 ms against
+134–178 ms) — overrunning this spec's own MT budget and eating roughly 13% of
+the glass-to-glass target.
+
+It stays the default anyway, per the rule committed before the measurement was
+taken: the quality gap is real on idiom, where NMT flattens "не успеваю" ("I
+won't manage it in time") into "I don't have time". The model remains a
+configuration value with automatic NMT fallback on error, so `--mt-model
+general/nmt` buys back ~195 ms whenever latency matters more than register.
 
 Glossaries are out of scope for v1, and are the first thing to add if proper
 nouns are mangled in practice.
@@ -441,8 +447,13 @@ sidetap run --app zoom --their-lang ru-RU --my-lang en-US \
             --phrase "Volodymyr" --phrase "sidetap"
 ```
 
-Region defaults: `europe-west3` for STT and Translation, the `eu` multi-region
-for TTS (Frankfurt is not available as a TTS single-region).
+Region defaults: **three separate settings, not one.** `europe-west3` for STT,
+`global` for Translation, and the `eu` multi-region for TTS. Experiment 3
+established that Cloud Translation does not exist in `europe-west3` at all — it
+rejects the location outright ("Must be 'us-central1' or 'global'") — while
+Speech-to-Text accepts it. Frankfurt is likewise not available as a TTS
+single-region. `us-central1` measured marginally faster than `global` for
+Translation and is one flag away.
 
 ### TUI
 
@@ -514,22 +525,25 @@ that continuously written silence produces no buffer growth or drift across
 30 minutes, and measure the residual audio that emerges after a flush.
 
 **Experiment 3 — Translation LLM coverage.** Confirm whether the model is
-available for the target language pair in `europe-west3`, and measure its
-latency against NMT on representative utterances.
+available for the target language pair, and measure its latency against NMT on
+representative utterances. **Answered: `europe-west3` is not a valid
+Translation location at all**, both models work for EN↔RU and EN↔UK from
+`global`/`us-central1`, and Translation LLM costs ~195 ms over NMT.
 
 ## Latency and cost
 
-Per direction, finals-only, pinned to Frankfurt:
+Per direction, finals-only. STT in Frankfurt; Translation in `global` or
+`us-central1`, which is why its share is larger than originally budgeted:
 
 | Stage | Budget |
 |---|---|
 | capture + VAD frame | 20–60 ms |
 | endpoint / final wait | 300–800 ms |
 | ASR final | 150–450 ms |
-| MT | 100–300 ms |
+| MT | 240–330 ms measured (Translation LLM); 135–180 ms (NMT) |
 | TTS TTFB | ~300 ms |
 | playout buffer | ~40 ms |
-| **total, after they stop speaking** | **0.9–1.9 s** |
+| **total, after they stop speaking** | **1.1–2.0 s** (Translation LLM); **0.9–1.8 s** (NMT) |
 
 Cost lands near $0.02–0.05 per active direction-minute — roughly $2–5 for an
 hour of bilingual conversation. VAD gating is what keeps it there. The
