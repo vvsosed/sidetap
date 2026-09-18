@@ -85,3 +85,22 @@ def test_the_output_rate_matches_the_playout_contract():
     list(synth.synthesize("hi", "ru-RU-Chirp3-HD-Kore"))
     audio_config = client.requests[0].streaming_config.streaming_audio_config
     assert audio_config.sample_rate_hertz == TTS_RATE
+
+
+def test_the_speaking_rate_reaches_the_streaming_config():
+    """Dropped here, the flag would be silently inert.
+
+    Nothing downstream would notice: audio still arrives, just at the wrong
+    length, and the backlog it was meant to drain keeps growing.
+    """
+    sent = {}
+
+    class Client:
+        def streaming_synthesize(self, requests):
+            first = next(iter(requests))
+            sent["rate"] = first.streaming_config.streaming_audio_config.speaking_rate
+            return iter(())
+
+    synth = ChirpSynthesizer(TtsConfig(speaking_rate=1.3), Client())
+    list(synth.synthesize("привет", "ru-RU-Chirp3-HD-Kore"))
+    assert sent["rate"] == pytest.approx(1.3)

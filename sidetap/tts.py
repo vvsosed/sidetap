@@ -49,9 +49,26 @@ def voice_language(voice_name: str) -> str:
     return "-".join(parts[:2]) if len(parts) >= 2 else voice_name
 
 
+# Measured against Chirp 3 HD streaming, not taken from the documentation:
+# 2.1 and 4.0 are both rejected, even though the API's own error message says
+# "ensure that speaking_rate is in the range [0.25, 4.0]". Validate against
+# what the service does, not what it claims.
+MIN_SPEAKING_RATE = 0.25
+MAX_SPEAKING_RATE = 2.0
+
+
 @dataclass(frozen=True)
 class TtsConfig:
     region: str = "eu"
+    # 1.0 is neutral, and the default stays neutral because the useful value
+    # depends on the language pair. Measured on real utterances, Russian takes
+    # 1.23x as long to speak as the English it was translated from - so at 1.0
+    # the output is structurally longer than the input, and a continuous
+    # speaker builds a backlog no amount of waiting will drain. At 1.3 the same
+    # Russian comes out at 0.86x the English and the backlog drains instead.
+    # A pair whose target language is more compact needs no adjustment at all,
+    # which is why guessing a global default would be wrong.
+    speaking_rate: float = 1.0
 
 
 class ChirpSynthesizer:
@@ -59,7 +76,9 @@ class ChirpSynthesizer:
         self._config = config
         self._client = client
 
-    def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
+    def synthesize(
+        self, text: str, voice: str, speaking_rate: float | None = None
+    ) -> Iterator[bytes]:
         text = text.strip()
         if not text:
             return
@@ -73,6 +92,11 @@ class ChirpSynthesizer:
             streaming_audio_config=tts.StreamingAudioConfig(
                 audio_encoding=tts.AudioEncoding.PCM,
                 sample_rate_hertz=TTS_RATE,
+                speaking_rate=(
+                    self._config.speaking_rate
+                    if speaking_rate is None
+                    else speaking_rate
+                ),
             ),
         )
 

@@ -61,14 +61,20 @@ def build_direction_configs(args) -> dict[Direction, DirectionConfig]:
             source_lang=args.their_lang,
             target_lang=args.my_lang,
             voice=args.voice_in or default_voice(args.my_lang),
+            speaking_rate=_rate(args, "in"),
         ),
         Direction.OUT: DirectionConfig(
             direction=Direction.OUT,
             source_lang=args.my_lang,
             target_lang=args.their_lang,
             voice=args.voice_out or default_voice(args.their_lang),
+            speaking_rate=_rate(args, "out"),
         ),
     }
+
+
+def _rate(args, side: str) -> float:
+    return getattr(args, f"speaking_rate_{side}", 1.0)
 
 
 class Session:
@@ -189,6 +195,8 @@ class Session:
             on_downgrade=self.metrics.set_mt_model,
         )
         synthesizer = self._synthesizer or build_synthesizer(
+            # No rate here: it is passed per utterance, because the two
+            # directions want different ones.
             TtsConfig(region=args.tts_region)
         )
 
@@ -263,7 +271,13 @@ class Session:
         # is the utterance where the user decides whether this works at all.
         # Failure here is not fatal; it is an optimisation, not a dependency.
         try:
-            list(synthesizer.synthesize(".", configs[Direction.OUT].voice))
+            list(
+                synthesizer.synthesize(
+                    ".",
+                    configs[Direction.OUT].voice,
+                    configs[Direction.OUT].speaking_rate,
+                )
+            )
         except Exception as exc:
             log.debug("TTS warm-up failed, first utterance will be slower: %s", exc)
 

@@ -216,9 +216,13 @@ class FakeSynthesizer:
         self.bytes_per_char = bytes_per_char
         self.error = error
         self.calls: list[tuple[str, str]] = []
+        self.rates: list[float] = []
 
-    def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
+    def synthesize(
+        self, text: str, voice: str, speaking_rate: float = 1.0
+    ) -> Iterator[bytes]:
         self.calls.append((text, voice))
+        self.rates.append(speaking_rate)
         if self.error is not None:
             raise self.error
         # Two chunks, so consumers that assume one are caught.

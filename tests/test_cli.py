@@ -254,3 +254,49 @@ def test_verbose_raises_sidetap_not_every_library(tmp_path, monkeypatch):
         logging.getLogger("sidetap").setLevel(logging.NOTSET)
         for h in list(logging.getLogger().handlers):
             logging.getLogger().removeHandler(h)
+
+
+def test_speaking_rates_default_to_neutral_per_direction():
+    """The useful value depends on the language pair, so guessing one is wrong.
+
+    And there is no shared flag: the two directions translate opposite ways,
+    so one value cannot be right for both.
+    """
+    args = build_parser().parse_args(
+        ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US"]
+    )
+    assert args.speaking_rate_in == 1.0
+    assert args.speaking_rate_out == 1.0
+    assert not hasattr(args, "speaking_rate"), "the shared flag was removed"
+
+
+def test_an_out_of_range_speaking_rate_fails_at_parse_time():
+    """The service reports OutOfRange only once audio is already flowing.
+
+    On a live call that means the translation simply never arrives, with the
+    reason buried in a retry warning.
+    """
+    import pytest
+
+    for bad in ("2.1", "0.24", "4.0", "fast"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                ["run", "--app", "z", "--their-lang", "ru-RU",
+                 "--my-lang", "en-US", "--speaking-rate-in", bad]
+            )
+
+
+def test_the_measured_bounds_are_used_not_the_documented_ones():
+    """Chirp 3 HD rejects 2.1 while its own error message claims 4.0 is fine."""
+    from sidetap.tts import MAX_SPEAKING_RATE, MIN_SPEAKING_RATE
+
+    assert (MIN_SPEAKING_RATE, MAX_SPEAKING_RATE) == (0.25, 2.0)
+
+
+def test_a_valid_rate_is_accepted():
+    args = build_parser().parse_args(
+        ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US",
+         "--speaking-rate-in", "1.3"]
+    )
+    assert args.speaking_rate_in == 1.3
+    assert args.speaking_rate_out == 1.0, "one direction must not move the other"

@@ -127,7 +127,17 @@ class Translator(Protocol):
 
 @runtime_checkable
 class Synthesizer(Protocol):
-    def synthesize(self, text: str, voice: str) -> Iterator[bytes]: ...
+    def synthesize(
+        self, text: str, voice: str, speaking_rate: float = 1.0
+    ) -> Iterator[bytes]:
+        """The rate is per call, for the same reason the voice is.
+
+        The two directions translate opposite ways, so their useful rates are
+        inverses of each other: if the target language is 1.23x the length of
+        the source one way, it is 0.81x the other. One shared rate makes one
+        direction right and the other needlessly fast.
+        """
+        ...
 
 
 @runtime_checkable

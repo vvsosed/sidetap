@@ -36,6 +36,9 @@ class DirectionConfig:
     source_lang: str
     target_lang: str
     voice: str
+    # Per direction, because the two translate opposite ways and their useful
+    # rates are inverses. See the Synthesizer port.
+    speaking_rate: float = 1.0
 
 
 class DeadAirWatch:
@@ -151,7 +154,11 @@ class DirectionPipeline:
 
         started = self._clock.monotonic()
         try:
-            pcm = b"".join(self._synthesizer.synthesize(target_text, self._config.voice))
+            pcm = b"".join(
+                self._synthesizer.synthesize(
+                    target_text, self._config.voice, self._config.speaking_rate
+                )
+            )
             self._metrics.set_health(direction, tts=Health.OK)
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)

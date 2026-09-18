@@ -18,6 +18,7 @@ from .adapters import (
     SystemClock,
 )
 from .capture import CaptureError
+from .tts import MAX_SPEAKING_RATE, MIN_SPEAKING_RATE
 from .graph import PLAYBACK_STREAM, SINK, SOURCE, PwGraph
 from .ports import Clock, GraphSource, Linker, ProcessLauncher
 
@@ -121,6 +122,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="general/translation-llm (better on idiom) or general/nmt "
         "(~195 ms faster). Falls back to nmt automatically on error.",
     )
+    # Per direction, with no shared flag, for the same reason there is no
+    # --voice: the two directions translate opposite ways, so their useful
+    # rates are inverses. A pair whose target runs 1.23x the length of its
+    # source one way runs about 0.81x the other, so a single value applied to
+    # both fixes one direction and makes the other needlessly fast. Mirrors
+    # --voice-in / --voice-out exactly.
+    cloud.add_argument(
+        "--speaking-rate-in",
+        type=speaking_rate,
+        default=1.0,
+        metavar="RATE",
+        help="how fast the voice YOU hear speaks (%s-%s, default 1.0). Raise "
+        "it when the language you hear is wordier than the one it came from: "
+        "Russian takes about 1.23x as long to say as the English behind it, "
+        "so at 1.0 a continuous speaker builds a backlog that never drains, "
+        "and around 1.3 it does." % (MIN_SPEAKING_RATE, MAX_SPEAKING_RATE),
+    )
+    cloud.add_argument(
+        "--speaking-rate-out",
+        type=speaking_rate,
+        default=1.0,
+        metavar="RATE",
+        help="how fast the voice THEY hear speaks (%s-%s, default 1.0)"
+        % (MIN_SPEAKING_RATE, MAX_SPEAKING_RATE),
+    )
     cloud.add_argument(
         "--tts-region", default="eu",
         help="TTS region; Frankfurt has no TTS single-region, so this is the "
@@ -220,6 +246,24 @@ def _configure_logging(args, level: int) -> tuple[Path | None, str | None]:
         stream.setFormatter(fmt)
         root.addHandler(stream)
     return None, session
+
+
+def speaking_rate(value: str) -> float:
+    """Reject an out-of-range rate at parse time, not at the first utterance.
+
+    The service returns OutOfRange only once audio is already flowing, which
+    on a live call means the translation simply never arrives.
+    """
+    try:
+        rate = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if not MIN_SPEAKING_RATE <= rate <= MAX_SPEAKING_RATE:
+        raise argparse.ArgumentTypeError(
+            f"speaking rate must be between {MIN_SPEAKING_RATE} and "
+            f"{MAX_SPEAKING_RATE}; got {rate}"
+        )
+    return rate
 
 
 def describe_graph(graph: PwGraph) -> str:

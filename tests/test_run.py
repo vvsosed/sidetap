@@ -24,6 +24,7 @@ def _args(**kwargs):
         project="proj", region="europe-west3", mt_region="global",
         mt_model="general/translation-llm", tts_region="eu", model="chirp_3",
         phrases=None, out=Path("transcripts"), lag_cap=None, no_tui=True, verbose=False,
+        speaking_rate_in=1.0, speaking_rate_out=1.0,
     )
     base.update(kwargs)
     return argparse.Namespace(**base)
@@ -436,3 +437,27 @@ def test_a_sink_spawned_before_a_failed_setup_is_not_left_running(
     ]]
     assert playback, "no pw-cat playback process was spawned"
     assert all(w.terminated for w in playback), "a pw-cat was left orphaned"
+
+
+def test_each_direction_gets_its_own_speaking_rate():
+    """The two translate opposite ways, so their useful rates are inverses.
+
+    If the target is 1.23x the length of the source one way, it is 0.81x the
+    other; one shared value makes the second direction needlessly fast.
+    """
+    configs = build_direction_configs(
+        _args(speaking_rate_in=1.3, speaking_rate_out=0.95)
+    )
+    assert configs[Direction.IN].speaking_rate == 1.3
+    assert configs[Direction.OUT].speaking_rate == 0.95
+
+
+def test_both_directions_default_to_neutral():
+    """No shared flag, for the same reason there is no --voice.
+
+    The useful rates are inverses of each other, so a single value applied to
+    both fixes one direction and makes the other needlessly fast.
+    """
+    configs = build_direction_configs(_args())
+    assert configs[Direction.IN].speaking_rate == 1.0
+    assert configs[Direction.OUT].speaking_rate == 1.0
