@@ -541,9 +541,24 @@ Per direction, finals-only. STT in Frankfurt; Translation in `global` or
 | endpoint / final wait | 300–800 ms |
 | ASR final | 150–450 ms |
 | MT | 240–330 ms measured (Translation LLM); 135–180 ms (NMT) |
-| TTS TTFB | 186–267 ms measured warm; ~543 ms on the first call of a session |
+| TTS synthesis | 640–1390 ms measured — see the note below |
 | playout buffer | ~40 ms |
 | **total, after they stop speaking** | **1.1–2.0 s** (Translation LLM); **0.9–1.8 s** (NMT) |
+
+**On the TTS line.** This originally read "TTS TTFB ~300 ms", assuming playout
+would begin on the first chunk. It does not. `_speak` materialises the whole
+utterance with `b"".join(synthesize(...))`, because `Playout`'s lag cap needs
+an utterance's duration up front to measure the backlog in seconds. So the
+number that applies is full synthesis wall time, not time-to-first-audio.
+
+Measured: 3.84 s of English took 637 ms wall against a 167 ms TTFB; 6.2 s of
+Russian took 1390 ms against 543 ms. Streaming into playout would recover
+roughly 400–850 ms per utterance — at the cost of making the backlog only
+*estimable* rather than known, which is the mechanism the lag-cap decision
+rests on. **Kept as-is for v1, with the cost recorded rather than hidden.**
+The manual smoke checklist measures real glass-to-glass; if that lands over
+the 2.5 s criterion, streaming playout is the first thing to reach for, and
+this paragraph is the evidence for it.
 
 Cost lands near $0.02–0.05 per active direction-minute — roughly $2–5 for an
 hour of bilingual conversation. VAD gating is what keeps it there. The

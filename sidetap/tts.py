@@ -1,8 +1,24 @@
 """Google Cloud Text-to-Speech, Chirp 3: HD streaming synthesis.
 
-Bidirectional streaming so playout starts before the whole utterance has been
-synthesised. One fixed voice per direction - no cloning, which costs roughly
-600 ms of time-to-first-audio for a v1 that does not need it.
+One fixed voice per direction - no cloning, which costs roughly 600 ms of
+time-to-first-audio for a v1 that does not need it.
+
+`synthesize` is a true incremental generator: 6.2 s of Russian arrives as 27
+separate chunks, the first within 186-267 ms warm (measured - see
+docs/experiments/04-tts-streaming.md). **The pipeline does not currently
+exploit that.** DirectionPipeline._speak does `b"".join(synthesize(...))`,
+because Playout's lag cap needs an utterance's duration up front to measure
+backlog in seconds. So the latency that actually applies is full synthesis
+wall time - 637 ms for 3.84 s of audio, 1390 ms for 6.2 s - not
+time-to-first-chunk.
+
+Do not "fix" this docstring by claiming early playout. Fix the pipeline, and
+accept that the backlog becomes estimated rather than known; the trade-off is
+written up in the spec's latency section.
+
+The first call after construction costs ~543 ms against a ~267 ms warm median,
+which is why Session.setup() performs a throwaway synthesis while the audio
+graph is being rewired.
 """
 
 from __future__ import annotations
