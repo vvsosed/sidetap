@@ -39,8 +39,44 @@ volume; recover by hand with that printed identifier:
     wpctl set-volume <id or serial, whichever the script printed> <original volume>
     pkill -f pw-record
 
-**Result.** _(fill in: RMS loud, RMS quiet, ratio, verdict, PipeWire version,
-date)_
+**Result.** Run 2026-09-18 against Firefox playing continuous audio.
+PipeWire 1.6.8 (libpipewire), Python 3.13.12.
+
+```
+tapping Firefox (serial=145, wpctl id=76), original volume=1.00
+drained 30 stale blocks before measuring (3.1s)
+RMS at full volume: 7028.0  (51 blocks, 5.1s measured)
+drained 31 stale blocks after muting (3.1s)
+RMS at zero volume: 0.0  (51 blocks, 5.1s measured)
+
+ratio=0.000 -> tap is POST-volume (duck node REQUIRED)
+```
+
+**Verdict: POST-volume.** Unambiguous — not a marginal ratio. The tap received
+a strong signal (RMS 7028 of a 32767 maximum) at full volume and *literally
+zero* at muted, across 51 captured blocks in each window. Both windows measured
+the full 5.1 s, so this is a real measurement and not a truncated one.
+
+Three things this run also confirmed, each of which had been a correctness fix
+made on review rather than on evidence:
+
+1. **`object.serial` and wpctl's id are genuinely different numbers here** —
+   serial 145, wpctl id 76. Passing the serial to `wpctl set-volume`, as the
+   plan originally did, would have failed with "Object not found", and the
+   duck would have silently never engaged.
+2. **The stale-pipe-backlog fix was necessary.** 30-31 blocks (3.1 s) of stale
+   audio were discarded before each measurement. Without the drain, roughly
+   two seconds of *full-volume* audio would have been read at the head of the
+   quiet window, pulling the ratio toward 0.4 and printing "PRE-volume" — the
+   exact opposite of the truth.
+3. **The volume restore read the prior value** (1.00) rather than assuming it,
+   and put it back.
+
+**Consequence.** The duck-node design in Task 20 is **required**, exactly as
+specified: ducking the application's own stream volume would also silence the
+recogniser that has to hear the next sentence. No simplification follow-up —
+`routing.py` keeps the separate duck node, the re-route, the journal and the
+startup repair.
 
 **Consequence.** The duck-node design in Task 20 is what gets built either way.
 If the verdict is PRE-volume, open a follow-up to simplify `routing.py` — do
