@@ -134,8 +134,16 @@ class Journal:
             "made": [r.to_dict() for r in self.made],
         }
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            # Do not leave a stray .tmp behind. It is harmless to the journal
+            # itself - load() never reads it - but a file that accumulates on
+            # every failure and is never cleaned is the kind of thing that
+            # makes a later reader distrust the directory.
+            tmp.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def load(cls, path: Path) -> Journal:
