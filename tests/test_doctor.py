@@ -39,12 +39,35 @@ def test_all_tools_present_passes(monkeypatch):
     assert all(c.ok for c in check_tools())
 
 
-def test_virtmic_check_wants_both_halves(idle_graph):
+def test_virtmic_check_wants_both_halves(idle_graph, tmp_path):
     # A sink with no source means the loopback half-loaded; the messenger sees
     # no microphone at all.
-    check = check_virtmic(idle_graph)
+    #
+    # config_path is pinned rather than left to default: the default is the
+    # developer's own ~/.config, so on a machine where sidetap has actually
+    # been installed this test would read a real file and get the other branch.
+    check = check_virtmic(idle_graph, config_path=tmp_path / "absent.conf")
     assert check.ok is False
     assert VIRTMIC_SOURCE in check.detail or VIRTMIC_SINK in check.detail
+
+
+def test_a_written_but_unloaded_config_says_restart_not_install(idle_graph, tmp_path):
+    """Otherwise doctor tells you to run the command you just ran.
+
+    That is how someone concludes the tool is broken and stops reading it.
+    """
+    written = tmp_path / "90-sidetap-mic.conf"
+    written.write_text("# installed")
+    check = check_virtmic(idle_graph, config_path=written)
+    assert check.ok is False
+    assert "restart" in check.detail
+    assert "--install" not in check.detail
+
+
+def test_no_config_at_all_still_says_install(idle_graph, tmp_path):
+    check = check_virtmic(idle_graph, config_path=tmp_path / "absent.conf")
+    assert check.ok is False
+    assert "--install" in check.detail
 
 
 def test_virtmic_check_passes_when_both_nodes_exist(idle_graph):

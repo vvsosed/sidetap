@@ -68,7 +68,14 @@ def check_pipewire_version() -> Check:
     )
 
 
-def check_virtmic(graph: PwGraph) -> Check:
+def check_virtmic(graph: PwGraph, config_path: Path = VIRTMIC_CONFIG_PATH) -> Check:
+    """Are both halves of the virtual mic present in the live graph?
+
+    The config file is consulted so this can tell the two failures apart. They
+    need different actions, and conflating them tells a user who has just run
+    `--install` to run `--install` - which is how someone concludes the tool is
+    broken and stops reading its output.
+    """
     sink = graph.node_by_name(VIRTMIC_SINK)
     source = graph.node_by_name(VIRTMIC_SOURCE)
     if sink is not None and source is not None:
@@ -79,6 +86,13 @@ def check_virtmic(graph: PwGraph) -> Check:
         for name, node in ((VIRTMIC_SINK, sink), (VIRTMIC_SOURCE, source))
         if node is None
     ]
+    if config_path.exists():
+        return Check(
+            "virtual mic",
+            False,
+            f"config is written but not loaded yet - run: "
+            f"systemctl --user restart pipewire pipewire-pulse",
+        )
     return Check(
         "virtual mic",
         False,
