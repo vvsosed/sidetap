@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from sidetap.doctor import (
+    check_pipewire_version,
     Check,
     check_credentials,
     check_linking,
@@ -196,3 +197,29 @@ def test_install_creates_missing_parent_directories(tmp_path):
     path = tmp_path / "a" / "b" / "90-sidetap-mic.conf"
     assert install_virtmic_config(path) is True
     assert path.exists()
+
+
+def test_pw_cli_is_one_of_the_required_tools():
+    """check_pipewire_version shells out to it.
+
+    Left out of the list, a machine missing only pw-cli is told PipeWire is
+    version 0.0.0 and to upgrade - which is not the problem it has.
+    """
+    from sidetap.doctor import REQUIRED_TOOLS
+
+    assert "pw-cli" in REQUIRED_TOOLS
+
+
+def test_an_unreadable_version_is_not_reported_as_version_zero(monkeypatch):
+    monkeypatch.setattr("sidetap.doctor.installed_pw_version", lambda: (0, 0, 0))
+    check = check_pipewire_version()
+    assert check.ok is False
+    assert "0.0.0" not in check.detail
+    assert "pw-cli" in check.detail
+
+
+def test_a_real_version_below_the_minimum_still_says_so(monkeypatch):
+    monkeypatch.setattr("sidetap.doctor.installed_pw_version", lambda: (0, 3, 40))
+    check = check_pipewire_version()
+    assert check.ok is False
+    assert "0.3.40" in check.detail
