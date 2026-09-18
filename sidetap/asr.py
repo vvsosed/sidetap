@@ -143,8 +143,13 @@ def project_from_environment() -> str:
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     if not project:
         raise RuntimeError(
-            "No GCP project. Pass --project or set GOOGLE_CLOUD_PROJECT, and "
-            "point GOOGLE_APPLICATION_CREDENTIALS at a service account key."
+            "No GCP project. Pass --project or set GOOGLE_CLOUD_PROJECT. "
+            "For credentials, either run `gcloud auth application-default "
+            "login` or point GOOGLE_APPLICATION_CREDENTIALS at a service "
+            "account key. The project is asked for separately on purpose: "
+            "the one your ADC defaults to is whatever gcloud was last "
+            "pointed at, which is routinely not the one with these APIs "
+            "enabled."
         )
     return project
 
