@@ -400,7 +400,22 @@ class PwCatSink:
             # pw-cat died. Playout must keep draining its queue rather than
             # deadlocking; the health flag is what the TUI turns red.
             self.failed = True
-            log.error("playout sink died: %s", self._process.stderr_text())
+            # The exit code, not just stderr: pw-cat killed by a signal exits
+            # silently, so "playout sink died: " with nothing after it was all
+            # the user got - and that is the common case, because killing
+            # sidetap kills its process group. A negative code is a signal and
+            # means somebody stopped it; anything else is a real crash.
+            code = self._process.poll()
+            detail = (self._process.stderr_text() or "").strip()
+            if code is not None and code < 0:
+                reason = f"killed by signal {-code}"
+            elif code is not None:
+                reason = f"exited {code}"
+            else:
+                reason = "stopped accepting audio"
+            log.error(
+                "playout sink died (%s)%s", reason, f": {detail}" if detail else ""
+            )
 
     def close(self) -> None:
         self._process.terminate()

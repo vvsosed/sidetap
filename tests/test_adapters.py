@@ -263,3 +263,26 @@ def test_unlink_classifies_a_missing_link_as_already_gone():
     # pw-link -d on a link that is not there is success for our purposes:
     # the desired end state holds.
     assert classify_link_output(1, "No such link") is LinkResult.ALREADY_LINKED
+
+
+def test_a_sink_killed_by_a_signal_says_so_rather_than_nothing(caplog):
+    """pw-cat killed by a signal exits silently.
+
+    That is the common case, because stopping sidetap stops its process group,
+    and all the user saw was "playout sink died: " with nothing after it.
+    """
+    import logging
+
+    from sidetap.types import TTS_RATE
+
+    launcher = FakeLauncher()
+    sink = PwCatSink(launcher, target=None, rate=TTS_RATE)
+    process = launcher.writers[0]
+    process.terminate()
+    process._stdin.close()
+
+    with caplog.at_level(logging.ERROR):
+        sink.write(b"\x00" * 64)
+
+    assert sink.failed is True
+    assert "killed by signal 15" in caplog.text
