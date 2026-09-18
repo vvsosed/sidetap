@@ -541,7 +541,7 @@ Per direction, finals-only. STT in Frankfurt; Translation in `global` or
 | endpoint / final wait | 300–800 ms |
 | ASR final | 150–450 ms |
 | MT | 240–330 ms measured (Translation LLM); 135–180 ms (NMT) |
-| TTS TTFB | ~300 ms |
+| TTS TTFB | 186–267 ms measured warm; ~543 ms on the first call of a session |
 | playout buffer | ~40 ms |
 | **total, after they stop speaking** | **1.1–2.0 s** (Translation LLM); **0.9–1.8 s** (NMT) |
 
