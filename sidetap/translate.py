@@ -171,8 +171,18 @@ class GoogleTranslator:
         return response.translations[0].translated_text
 
 
-def build_translator(config: TranslateConfig) -> GoogleTranslator:
-    """Google's SDK is imported lazily so the suite needs no credentials."""
+def build_translator(
+    config: TranslateConfig,
+    on_downgrade: Callable[[str], None] | None = None,
+) -> GoogleTranslator:
+    """Google's SDK is imported lazily so the suite needs no credentials.
+
+    `on_downgrade` fires when the sticky fallback to NMT happens, so the
+    session can surface which model is actually in use. Without a destination
+    the downgrade is undetectable from outside this module.
+    """
     from google.cloud import translate
 
-    return GoogleTranslator(config, translate.TranslationServiceClient())
+    return GoogleTranslator(
+        config, translate.TranslationServiceClient(), on_downgrade=on_downgrade
+    )

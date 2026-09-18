@@ -41,6 +41,10 @@ class Snapshot:
     directions: dict[Direction, DirectionState]
     cost_usd: float = 0.0
     bypassed: bool = False
+    # Which translation model is actually in use. Session-level, not
+    # per-direction: one GoogleTranslator serves both directions, so its
+    # sticky downgrade to NMT applies to the whole call.
+    mt_model: str = ""
 
 
 class Metrics:
@@ -49,6 +53,7 @@ class Metrics:
         self._states = {d: DirectionState() for d in Direction}
         self._cost_usd = 0.0
         self._bypassed = False
+        self._mt_model = ""
 
     def set_interim(self, direction: Direction, text: str) -> None:
         with self._lock:
@@ -117,6 +122,18 @@ class Metrics:
         with self._lock:
             self._bypassed = value
 
+    def set_mt_model(self, model: str) -> None:
+        """Record which translation model is in use.
+
+        The point is the sticky downgrade: when the preferred model turns out
+        to be unavailable, GoogleTranslator falls back to NMT for the rest of
+        the session. Nothing else would show that - the next successful NMT
+        call sets mt=Health.OK, so the pane goes green and the user has no way
+        to tell quality dropped.
+        """
+        with self._lock:
+            self._mt_model = model
+
     def snapshot(self) -> Snapshot:
         """A deep copy. The UI renders from this while threads keep writing."""
         with self._lock:
@@ -124,4 +141,5 @@ class Metrics:
                 directions=deepcopy(self._states),
                 cost_usd=self._cost_usd,
                 bypassed=self._bypassed,
+                mt_model=self._mt_model,
             )

@@ -110,6 +110,21 @@ def test_concurrent_writers_do_not_lose_counts():
     assert metrics.snapshot().directions[Direction.IN].dropped == 800
 
 
+def test_the_translation_model_in_use_is_recorded():
+    """Task 16's on_downgrade needs somewhere to land.
+
+    Without this the sticky NMT downgrade is invisible: the next successful
+    call sets mt=Health.OK, so the pane goes green while quality has dropped
+    for the rest of the session.
+    """
+    metrics = Metrics()
+    assert metrics.snapshot().mt_model == ""
+    metrics.set_mt_model("general/translation-llm")
+    assert metrics.snapshot().mt_model == "general/translation-llm"
+    metrics.set_mt_model("general/nmt")
+    assert metrics.snapshot().mt_model == "general/nmt"
+
+
 def test_cost_accumulates_across_directions():
     metrics = Metrics()
     metrics.add_cost(0.01)
