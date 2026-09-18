@@ -84,6 +84,7 @@ class Session:
         synthesizer=None,
         volume=None,
         journal_path=None,
+        session_name=None,
     ):
         self._args = args
         self._graph = graph
@@ -103,6 +104,8 @@ class Session:
         # this one - must not write there. Production leaves this at
         # routing.JOURNAL_PATH so `doctor --repair` still knows where to look.
         self._journal_path = journal_path if journal_path is not None else JOURNAL_PATH
+        # Shared with the log file so a run's three artifacts sort together.
+        self._session_name = session_name
 
         self.metrics = Metrics()
         # Session-wide: set by Ctrl-C, or once every direction has died.
@@ -168,7 +171,7 @@ class Session:
         self.router.repair()
         self.router.engage(app_pattern=args.app)
 
-        self.transcript = BilingualTranscript(args.out)
+        self.transcript = BilingualTranscript(args.out, session=self._session_name)
 
         # Built once and shared by both pipelines and both recognition
         # workers: one estimate for the whole call, not four independent
@@ -600,9 +603,10 @@ class Session:
 
 
 def run_session(args, *, graph, launcher, linker, clock, recognizer_factory=None,
-                translator=None, synthesizer=None) -> int:
+                translator=None, synthesizer=None, session=None) -> int:
     session = Session(
-        args, graph, launcher, linker, clock, recognizer_factory, translator, synthesizer
+        args, graph, launcher, linker, clock, recognizer_factory, translator,
+        synthesizer, session_name=session,
     )
 
     def handle_signal(*_):
@@ -648,7 +652,13 @@ def run_session(args, *, graph, launcher, linker, clock, recognizer_factory=None
     finally:
         session.shutdown()
 
-    print(f"\nSaved:\n  {session.transcript.jsonl_path}\n  {session.transcript.md_path}")
+    saved = [session.transcript.jsonl_path, session.transcript.md_path]
+    log_path = session.transcript.jsonl_path.with_suffix(".log")
+    if log_path.exists():
+        saved.append(log_path)
+    print("\nSaved:")
+    for path in saved:
+        print(f"  {path}")
     return 0
 
 

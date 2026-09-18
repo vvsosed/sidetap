@@ -187,10 +187,11 @@ def test_tui_mode_does_not_log_to_a_terminal_textual_owns(tmp_path, monkeypatch)
 
     monkeypatch.setattr(cli, "LOG_PATH", tmp_path / "sidetap.log")
     args = build_parser().parse_args(
-        ["run", "--app", "zoom", "--their-lang", "ru-RU", "--my-lang", "en-US"]
+        ["run", "--app", "zoom", "--their-lang", "ru-RU", "--my-lang", "en-US",
+         "--out", str(tmp_path)]
     )
     try:
-        path = cli._configure_logging(args, logging.INFO)
+        path, _ = cli._configure_logging(args, logging.INFO)
         assert path is not None, "TUI mode must not log to stderr"
         handlers = logging.getLogger().handlers
         assert any(isinstance(h, logging.FileHandler) for h in handlers)
@@ -207,13 +208,17 @@ def test_no_tui_still_logs_to_stderr(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "LOG_PATH", tmp_path / "sidetap.log")
     args = build_parser().parse_args(
-        ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US", "--no-tui"]
+        ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US",
+         "--no-tui", "--out", str(tmp_path)]
     )
     try:
-        assert cli._configure_logging(args, logging.INFO) is None
-        assert any(
-            type(h) is logging.StreamHandler for h in logging.getLogger().handlers
-        )
+        path, session = cli._configure_logging(args, logging.INFO)
+        handlers = logging.getLogger().handlers
+        # stderr for the live view, AND a file for the durable copy.
+        assert any(type(h) is logging.StreamHandler for h in handlers)
+        assert any(isinstance(h, logging.FileHandler) for h in handlers)
+        assert path is not None and path.parent == tmp_path
+        assert session and path.name == f"{session}.log"
     finally:
         for h in list(logging.getLogger().handlers):
             logging.getLogger().removeHandler(h)
@@ -232,7 +237,7 @@ def test_verbose_raises_sidetap_not_every_library(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "LOG_PATH", tmp_path / "sidetap.log")
     args = build_parser().parse_args(
         ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US",
-         "--no-tui", "-v"]
+         "--no-tui", "-v", "--out", str(tmp_path)]
     )
     try:
         cli._configure_logging(args, logging.DEBUG)

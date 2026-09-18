@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from .adapters import (
@@ -144,10 +145,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-LOG_PATH = Path.home() / ".local/state/sidetap/sidetap.log"
+# Only a fallback, for when --out cannot be written to. A session's log
+# normally lands beside its own transcript.
+FALLBACK_LOG_PATH = Path.home() / ".local/state/sidetap/sidetap.log"
+LOG_PATH = FALLBACK_LOG_PATH
 
 
-def _configure_logging(args, level: int) -> Path | None:
+def session_name() -> str:
+    """The stem shared by a session's .log, .jsonl and .md.
+
+    One name for all three so a run's artifacts sort together and a log line
+    can be lined up against the utterance it explains. Sub-second resolution
+    because two runs started in the same second would otherwise collide.
+    """
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def _configure_logging(args, level: int) -> tuple[Path | None, str | None]:
     """stderr, unless Textual is about to take the terminal away.
 
     This is not a tidiness question. Textual paints over the whole screen, so
@@ -157,8 +171,9 @@ def _configure_logging(args, level: int) -> Path | None:
     directions died on a 403 at the first block, the panes went red, and the
     reason existed nowhere the user could reach it.
 
-    Returns the log file's path when one is in use, so the caller can say
-    where it is.
+    Either way a `run` also writes a log file next to its transcript, named
+    after the same session, so a finished call leaves one set of files that
+    explain each other. Returns that path and the session name.
     """
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     root = logging.getLogger()
@@ -174,24 +189,37 @@ def _configure_logging(args, level: int) -> Path | None:
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    if args.cmd != "run" or getattr(args, "no_tui", False):
+    if args.cmd != "run":
         stream = logging.StreamHandler(sys.stderr)
         stream.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
         root.addHandler(stream)
-        return None
+        return None, None
 
-    try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    except OSError:
-        # Better a corrupted-looking display than a silent failure.
+    # Textual paints over the whole screen, so a stderr handler under the TUI
+    # writes into a terminal that is being overwritten. Without the TUI it is
+    # still wanted: the file is the durable copy, stderr is the live one.
+    if getattr(args, "no_tui", False):
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(stream)
+
+    session = session_name()
+    for candidate in (Path(args.out) / f"{session}.log", FALLBACK_LOG_PATH):
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(candidate, encoding="utf-8")
+        except OSError:
+            continue
+        handler.setFormatter(fmt)
+        root.addHandler(handler)
+        return candidate, session
+
+    if not root.handlers:
+        # Never leave a run with nowhere to report a failure.
         stream = logging.StreamHandler(sys.stderr)
         stream.setFormatter(fmt)
         root.addHandler(stream)
-        return None
-    handler.setFormatter(fmt)
-    root.addHandler(handler)
-    return LOG_PATH
+    return None, session
 
 
 def describe_graph(graph: PwGraph) -> str:
@@ -306,7 +334,7 @@ def main(
     args = build_parser().parse_args(argv)
 
     level = logging.DEBUG if getattr(args, "verbose", False) else logging.INFO
-    log_path = _configure_logging(args, level)
+    log_path, session = _configure_logging(args, level)
 
     graph = graph or PwDumpGraphSource()
     launcher = launcher or SubprocessLauncher()
@@ -322,13 +350,14 @@ def main(
         from .run import run_session
 
         if log_path is not None:
-            print(f"Logs (the TUI owns the terminal): {log_path}")
+            print(f"Log: {log_path}")
         return run_session(
             args,
             graph=graph,
             launcher=launcher,
             linker=linker,
             clock=clock,
+            session=session,
             recognizer_factory=recognizer_factory,
             translator=translator,
             synthesizer=synthesizer,
