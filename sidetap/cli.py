@@ -162,7 +162,15 @@ def _configure_logging(args, level: int) -> Path | None:
     """
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     root = logging.getLogger()
-    root.setLevel(level)
+    # -v raises SIDETAP's verbosity, not the whole process's. Setting the root
+    # logger to DEBUG turns on debug output for every library in it: urllib3
+    # narrating each OAuth token fetch, asyncio announcing its selector, grpc.
+    # This is the log a user reads precisely because the TUI has hidden
+    # everything else, and burying sidetap's own lines in third-party chatter
+    # defeats the point of writing it. Third-party WARNING and above still
+    # come through, because those can matter.
+    root.setLevel(logging.WARNING)
+    logging.getLogger("sidetap").setLevel(level)
     for handler in list(root.handlers):
         root.removeHandler(handler)
 

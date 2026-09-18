@@ -217,3 +217,35 @@ def test_no_tui_still_logs_to_stderr(tmp_path, monkeypatch):
     finally:
         for h in list(logging.getLogger().handlers):
             logging.getLogger().removeHandler(h)
+
+
+def test_verbose_raises_sidetap_not_every_library(tmp_path, monkeypatch):
+    """Root at DEBUG turns on urllib3, asyncio and grpc debug output too.
+
+    This is the log a user reads because the TUI has hidden everything else;
+    burying sidetap's own lines in third-party chatter defeats the point.
+    """
+    import logging
+
+    from sidetap import cli
+
+    monkeypatch.setattr(cli, "LOG_PATH", tmp_path / "sidetap.log")
+    args = build_parser().parse_args(
+        ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US",
+         "--no-tui", "-v"]
+    )
+    try:
+        cli._configure_logging(args, logging.DEBUG)
+        assert logging.getLogger("sidetap").level == logging.DEBUG
+        assert logging.getLogger().level == logging.WARNING
+        # a third-party DEBUG record must not pass, a WARNING must
+        assert not logging.getLogger("urllib3.connectionpool").isEnabledFor(
+            logging.DEBUG
+        )
+        assert logging.getLogger("urllib3.connectionpool").isEnabledFor(
+            logging.WARNING
+        )
+    finally:
+        logging.getLogger("sidetap").setLevel(logging.NOTSET)
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)
