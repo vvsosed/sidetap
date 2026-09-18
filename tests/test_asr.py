@@ -117,3 +117,138 @@ def test_recognizer_path_uses_the_wildcard_recognizer():
         recognizer_path("proj", "europe-west3")
         == "projects/proj/locations/europe-west3/recognizers/_"
     )
+
+
+import queue
+import threading
+
+from sidetap.asr import KEEPALIVE_S, SILENCE_BLOCK, RecognitionWorker
+from sidetap.capture import DroppingQueue
+from sidetap.rotation import AudioTimeline
+from sidetap.types import BLOCK_BYTES, AudioChunk, MIC
+from sidetap.vad import SilenceGate
+from tests.conftest import FakeClock, FakeRecognizer
+
+SPEECH = b"\x10\x00" * (BLOCK_BYTES // 2)
+
+
+def _chunk(t: float) -> AudioChunk:
+    return AudioChunk(track=MIC, pcm=SPEECH, t_start=t)
+
+
+def _worker(recognizer, clock, *, max_stream_s=240.0, gate=None):
+    return RecognitionWorker(
+        direction=Direction.OUT,
+        recognizer_factory=lambda timeline: recognizer,
+        gate=gate or SilenceGate(None),
+        clock=clock,
+        max_stream_s=max_stream_s,
+    )
+
+
+def test_worker_forwards_results_to_the_output_queue():
+    result = AsrResultFactory()
+    recognizer = FakeRecognizer([result])
+    audio_q = DroppingQueue()
+    audio_q.put(_chunk(0.0))
+    out_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+
+    clock = FakeClock()
+    worker = _worker(recognizer, clock)
+    thread = threading.Thread(target=worker.run, args=(audio_q, out_q, stop))
+    thread.start()
+    got = out_q.get(timeout=2)
+    stop.set()
+    thread.join(timeout=2)
+
+    assert got is result
+
+
+def AsrResultFactory():
+    from sidetap.types import AsrResult
+
+    return AsrResult(
+        direction=Direction.OUT, text="hello", is_final=True, t_start=0.0, t_end=1.0
+    )
+
+
+def test_a_fatal_error_stops_this_direction_only():
+    """The two directions carry different language codes.
+
+    A config error in one says nothing about the other, and dropping a live
+    call because the OTHER direction was misconfigured is worse than
+    interpreting one way. The event passed in is per-direction; Session
+    decides when enough of them are dead to give up.
+    """
+    fatal = []
+    recognizer = FakeRecognizer([], error=gexc.InvalidArgument("bad config"))
+    audio_q = DroppingQueue()
+    audio_q.put(_chunk(0.0))
+    out_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+
+    worker = RecognitionWorker(
+        direction=Direction.OUT,
+        recognizer_factory=lambda timeline: recognizer,
+        gate=SilenceGate(None),
+        clock=FakeClock(),
+        on_fatal=lambda d, exc: fatal.append((d, exc)),
+    )
+    worker.run(audio_q, out_q, stop)
+
+    # Not a retry loop: the config is wrong and will stay wrong.
+    assert stop.is_set()
+    # And the session is told WHICH direction died, so it can decide.
+    assert [d for d, _ in fatal] == [Direction.OUT]
+
+
+def test_a_transient_error_backs_off_and_retries():
+    recognizer = FakeRecognizer([], error=gexc.ServiceUnavailable("later"))
+    audio_q = DroppingQueue()
+    for i in range(6):
+        audio_q.put(_chunk(float(i)))
+    out_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    clock = FakeClock()
+
+    def stop_soon():
+        while len(clock.slept) < 3:
+            pass
+        stop.set()
+
+    watcher = threading.Thread(target=stop_soon, daemon=True)
+    watcher.start()
+    _worker(recognizer, clock).run(audio_q, out_q, stop)
+    watcher.join(timeout=2)
+
+    # Exponential, and never escalated to a fatal stop by itself.
+    assert clock.slept[:3] == [2.0, 4.0, 8.0]
+
+
+def test_the_gate_suppresses_silence_but_the_keepalive_still_sends():
+    """A stream sent nothing is killed by Google with a 409.
+
+    The gate drops a quiet stretch, so the keepalive has to fire from the
+    worker - the gate never sees the other cause, blocks not arriving at all.
+    """
+    silence = b"\x00" * BLOCK_BYTES
+    recognizer = FakeRecognizer([])
+    audio_q = DroppingQueue()
+    audio_q.put(AudioChunk(track=MIC, pcm=silence, t_start=0.0))
+    out_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    clock = FakeClock()
+
+    gate = SilenceGate(lambda pcm: False, tail_blocks=0)
+    worker = _worker(recognizer, clock, gate=gate)
+    thread = threading.Thread(target=worker.run, args=(audio_q, out_q, stop))
+    thread.start()
+    for _ in range(200):
+        clock.advance(KEEPALIVE_S)
+        if recognizer.sent:
+            break
+    stop.set()
+    thread.join(timeout=2)
+
+    assert SILENCE_BLOCK in recognizer.sent

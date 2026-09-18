@@ -150,3 +150,132 @@ def project_from_environment() -> str:
 
 
 RecognizerFactory = Callable[[AudioTimeline], Recognizer]
+
+
+class RecognitionWorker:
+    """Drives one direction's audio through rotating recognition streams."""
+
+    def __init__(
+        self,
+        direction: Direction,
+        recognizer_factory: RecognizerFactory,
+        gate: SilenceGate,
+        clock: Clock,
+        max_stream_s: float = MAX_STREAM_SECONDS,
+        on_fatal: Callable[[Direction, BaseException], None] | None = None,
+    ):
+        self._on_fatal = on_fatal
+        self._direction = direction
+        self._factory = recognizer_factory
+        self._gate = gate
+        self._clock = clock
+        self._max_stream_s = max_stream_s
+
+    @staticmethod
+    def _dropped(audio_q) -> int:
+        """Blocks the queue has discarded, when it counts them.
+
+        A plain queue.Queue does not, so this reports 0 rather than failing.
+        """
+        return getattr(audio_q, "dropped", 0)
+
+    def run(self, audio_q, out_q: queue_module.Queue, stop: threading.Event) -> None:
+        stream_clock = StreamClock(max_stream_s=self._max_stream_s)
+        backoff = BACKOFF_START_S
+        consecutive_failures = 0
+        dropped_at_success = self._dropped(audio_q)
+
+        while not stop.is_set():
+            last_chunk_t = stream_clock.offset
+            started = self._clock.monotonic()
+            # One timeline per stream: the engine numbers its results from the
+            # start of the audio we send it, and the gate means that is not
+            # elapsed time.
+            timeline = AudioTimeline(stream_clock.offset)
+
+            def blocks() -> Iterator[bytes]:
+                nonlocal last_chunk_t
+                last_chunk_at = started
+                last_sent_at = started
+                while not stop.is_set():
+                    now = self._clock.monotonic()
+                    if stream_clock.should_rotate(now - started):
+                        log.debug("rotating %s stream", self._direction.value)
+                        return
+                    try:
+                        chunk = audio_q.get(timeout=0.25)
+                    except queue_module.Empty:
+                        chunk = None
+                    now = self._clock.monotonic()
+                    if chunk is not None:
+                        last_chunk_t = chunk.t_start
+                        last_chunk_at = now
+                    if chunk is not None and self._gate.allows(chunk.pcm):
+                        last_sent_at = now
+                        timeline.sent(chunk.t_start)
+                        yield chunk.pcm
+                    elif now - last_sent_at >= KEEPALIVE_S:
+                        # Nothing worth sending, or nothing arriving at all.
+                        # Either way the stream dies unless we say something.
+                        last_sent_at = now
+                        timeline.sent(last_chunk_t + (now - last_chunk_at))
+                        yield SILENCE_BLOCK
+
+            try:
+                # No stop check inside this loop. blocks() already returns when
+                # stop is set, which ends the stream on its own, and breaking
+                # out here would discard finals the engine emitted on the way
+                # out - exactly the ones cli.py drains for after Ctrl-C.
+                for result in self._factory(timeline).stream(blocks()):
+                    out_q.put(result)
+                consecutive_failures = 0
+                backoff = BACKOFF_START_S
+                dropped_at_success = self._dropped(audio_q)
+            except Exception as exc:
+                if stop.is_set():
+                    break
+                if is_fatal(exc):
+                    # Stops THIS direction only. `stop` is per-direction, not
+                    # the session-wide event: the two directions carry
+                    # different language codes, so a config error in one says
+                    # nothing about the other. meetscribe had a single stream,
+                    # so "fatal ends the run" and "fatal ends the process"
+                    # were the same thing; here they are not, and dropping a
+                    # live call because the OTHER direction was misconfigured
+                    # is worse than interpreting one way. Session decides when
+                    # enough directions are dead to give up.
+                    log.error(
+                        "speech configuration error (%s), not retryable — this "
+                        "direction is now dead: %s",
+                        self._direction.value,
+                        exc,
+                    )
+                    stop.set()
+                    if self._on_fatal is not None:
+                        self._on_fatal(self._direction, exc)
+                    return
+                consecutive_failures += 1
+                level = (
+                    logging.ERROR
+                    if consecutive_failures >= ESCALATE_AFTER_FAILURES
+                    else logging.WARNING
+                )
+                lost_blocks = self._dropped(audio_q) - dropped_at_success
+                lost = (
+                    f"; {lost_blocks * BLOCK_MS / 1000:.0f}s of audio dropped "
+                    "while offline"
+                    if lost_blocks
+                    else ""
+                )
+                log.log(
+                    level,
+                    "speech stream error (%s), retrying in %.0fs: %s%s",
+                    self._direction.value,
+                    backoff,
+                    exc,
+                    lost,
+                )
+                self._clock.sleep(backoff)
+                backoff = next_backoff(backoff)
+
+            stream_clock = stream_clock.rotated(last_chunk_t)
