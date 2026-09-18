@@ -635,3 +635,76 @@ def test_the_virtmic_config_distinguishes_the_two_nodes():
     assert VIRTMIC_CAPTURE_DESCRIPTION in capture_section
     assert VIRTMIC_DESCRIPTION not in capture_section
     assert VIRTMIC_DESCRIPTION in playback_section
+
+
+def test_restore_terminates_the_duck_even_when_no_stream_was_ever_routed(
+    tmp_path, idle_graph
+):
+    """Starting sidetap before the call and quitting before it begins.
+
+    Nothing matches the app pattern, so the journal stays empty for the whole
+    session. restore() used to return early on that and skip the loopback it
+    created in engage(), orphaning a pw-loopback whose PID no later run can
+    recover - and the next engage() then adds a SECOND node called
+    sidetap_duck, after which node_by_name picks one of them arbitrarily.
+    """
+    loopbacks = FakeLoopbackFactory()
+    linker = FakeLinker()
+    router = Router(
+        graph=FakeGraphSource(idle_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=loopbacks,
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="nothing-is-playing")
+    assert not (tmp_path / "j.json").exists() or Journal.load(
+        tmp_path / "j.json"
+    ).is_empty()
+    router.restore()
+    assert loopbacks.processes[0].terminated, "the duck outlived the session"
+
+
+def test_a_persistently_failing_stream_does_not_grow_the_journal(
+    tmp_path, routing_graph
+):
+    """The retry is deliberate; re-recording the same refs each time is not.
+
+    A failing stream is kept out of _routed so every poll retries it. Appending
+    its refs unconditionally meant a full JSON rewrite per poll, under the lock
+    shutdown needs to restore the graph, and every duplicate replayed again on
+    the way out.
+    """
+    linker = FakeLinker(result=LinkResult.FAILED)
+    router = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+    after_engage = Journal.load(tmp_path / "j.json")
+    for _ in range(5):
+        router.poll_once()
+    after_polls = Journal.load(tmp_path / "j.json")
+
+    assert after_engage.broken, "the fixture must produce refs or this proves nothing"
+    assert len(after_polls.broken) == len(after_engage.broken)
+    assert len(after_polls.made) == len(after_engage.made)
+
+
+def test_a_failed_journal_write_leaves_no_temp_file_behind(tmp_path, monkeypatch):
+    """The temp file is the whole mechanism; a stray one accumulates silently."""
+    path = tmp_path / "j.json"
+    Journal(broken=(LinkRef(1, "a", 2, "b"),)).save(path)
+
+    def boom(src, dst):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr("sidetap.routing.os.replace", boom)
+    with pytest.raises(OSError):
+        Journal(broken=(LinkRef(3, "c", 4, "d"),)).save(path)
+
+    assert Journal.load(path).broken == (LinkRef(1, "a", 2, "b"),)
+    assert list(tmp_path.glob("*.tmp")) == []

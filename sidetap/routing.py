@@ -384,10 +384,24 @@ class Router:
         # the case the journal exists for. On the first call the journal is
         # empty on disk, so loading and appending also covers engage().
         journal = Journal.load(self._journal_path)
-        Journal(
-            broken=journal.broken + tuple(broken),
-            made=journal.made + tuple(made),
-        ).save(self._journal_path)
+        # Only what is not already recorded. A stream whose link keeps failing
+        # is deliberately left out of self._routed so that the next poll
+        # retries it (see the comment below), which means these same refs are
+        # recomputed on every poll for as long as the failure lasts. Appending
+        # blindly grew the journal without bound - thousands of duplicates
+        # over a long call, each one a full JSON rewrite on the poll path
+        # while holding self._lock, which is the same lock shutdown needs to
+        # restore the graph promptly, and every duplicate replayed again by
+        # that restore.
+        known_broken = set(journal.broken)
+        known_made = set(journal.made)
+        new_broken = tuple(ref for ref in broken if ref not in known_broken)
+        new_made = tuple(ref for ref in made if ref not in known_made)
+        if new_broken or new_made:
+            Journal(
+                broken=journal.broken + new_broken,
+                made=journal.made + new_made,
+            ).save(self._journal_path)
 
         # A FAILED apply must NOT be treated as done - this mirrors tap.py's
         # AppTap, which deliberately does not record a pair on FAILED ("so it
@@ -441,6 +455,24 @@ class Router:
 
     def _restore_locked(self) -> None:
         """Caller must hold self._lock."""
+        try:
+            self._replay_locked()
+        finally:
+            # Unconditional, and that is the point. The duck is created by
+            # engage(), not by routing a stream, so it exists even when no
+            # stream was ever routed and the journal therefore stayed empty -
+            # starting sidetap before the call and quitting before it begins
+            # does exactly that, and it is an ordinary thing to do. Returning
+            # early on an empty journal used to skip this, orphaning a
+            # pw-loopback whose PID no later run can recover (the launcher
+            # uses start_new_session=True), after which the next engage()
+            # creates a SECOND node also called sidetap_duck and node_by_name
+            # stops being deterministic.
+            if self._loopback is not None:
+                self._loopback.terminate()
+                self._loopback = None
+
+    def _replay_locked(self) -> None:
         journal = Journal.load(self._journal_path)
         if journal.is_empty():
             return
@@ -465,10 +497,6 @@ class Router:
             )
         else:
             Journal().save(self._journal_path)
-
-        if self._loopback is not None:
-            self._loopback.terminate()
-            self._loopback = None
 
     def repair(self) -> bool:
         """Replay a journal left behind by a session that died.
