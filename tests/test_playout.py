@@ -262,3 +262,23 @@ def test_a_failed_duck_transition_does_not_flip_the_closed_flag():
     # Both calls actually reached wpctl - the flag never flipped, so close()
     # kept retrying rather than assuming the first call had worked.
     assert volume.calls == [(42, 0.0), (42, 0.0)]
+
+
+def test_a_suppressed_playout_writes_silence_and_speaks_nothing():
+    sink = FakeAudioSink()
+    playout = Playout(Direction.IN, sink)
+    playout.set_suppressed(True)
+    assert playout.tick() is False
+    # sink.written is already the joined bytes (see FakeAudioSink.written in
+    # conftest.py), not a list of chunks - re-joining it with b"".join()
+    # would iterate over its individual byte VALUES (ints) and raise
+    # TypeError, not check anything.
+    assert sink.written and set(sink.written) == {0}
+
+
+def test_entering_bypass_throws_the_backlog_away():
+    """It is a translation of a conversation that already happened without it."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    playout.submit(_translated(1.0))
+    playout.set_suppressed(True)
+    assert playout.backlog_s() == 0.0

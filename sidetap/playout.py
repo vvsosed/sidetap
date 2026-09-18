@@ -47,6 +47,10 @@ class DuckControl:
         if self._closed and self._volume.set_volume(self._object_id, 1.0):
             self._closed = False
 
+    @property
+    def is_open(self) -> bool:
+        return not self._closed
+
 
 class Playout:
     def __init__(
@@ -61,6 +65,7 @@ class Playout:
     ):
         self.direction = direction
         self.dropped = 0
+        self.suppressed = False
         self._sink = sink
         self._duck = duck
         self._lag_cap_s = lag_cap_s
@@ -70,6 +75,10 @@ class Playout:
         self._queue: deque[Translated] = deque()
         self._current: Translated | None = None
         self._pending = b""
+
+    @property
+    def duck(self) -> DuckControl | None:
+        return self._duck
 
     def submit(self, item: Translated) -> None:
         with self._lock:
@@ -150,8 +159,35 @@ class Playout:
     def _backlog_locked(self) -> float:
         return sum(i.audio_s for i in self._queue) + len(self._pending) / TTS_BYTES_PER_S
 
+    def set_suppressed(self, value: bool) -> None:
+        """Entering bypass throws the queue away.
+
+        Two reasons. The conversation during bypass happens unmediated, so a
+        translation of it is worth nothing by the time it plays - it would
+        arrive as a voice recapping a minute the user has already had. And the
+        lag cap lives below the suppressed branch in tick(), so a backlog built
+        while suppressed is never trimmed: a two-minute bypass would come back
+        with two minutes queued and push the lot through on_dropped at once.
+
+        The flag is set before the flush so a tick already in flight returns
+        early rather than pulling a fresh item; the 20 ms chunk it may already
+        have written is gone, for the reason flush() documents.
+        """
+        self.suppressed = value
+        if value:
+            self.flush()
+
     def tick(self) -> bool:
         """Write exactly one chunk. True if it carried speech."""
+        if self.suppressed:
+            # Bypass: the parties are talking to each other unmediated. Keep
+            # writing silence so pw-cat's buffer stays primed and the duck
+            # stays open, but speak nothing.
+            if self._duck is not None:
+                self._duck.open()
+            self._sink.write(SILENCE_CHUNK)
+            return False
+
         finished: Translated | None = None
         with self._lock:
             if not self._pending and self._queue:
