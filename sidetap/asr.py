@@ -280,3 +280,107 @@ class RecognitionWorker:
                 backoff = next_backoff(backoff)
 
             stream_clock = stream_clock.rotated(last_chunk_t)
+
+
+@dataclass(frozen=True)
+class AsrConfig:
+    project_id: str
+    region: str = "europe-west3"
+    model: str = "chirp_3"
+    language_code: str = "en-US"
+    phrases: tuple[str, ...] = ()
+    interim: bool = True
+
+
+class GoogleRecognizer:
+    """One StreamingRecognize call. Discarded and rebuilt on every rotation."""
+
+    def __init__(self, config: AsrConfig, client, timeline: AudioTimeline, direction: Direction):
+        self._config = config
+        self._client = client
+        # An AudioTimeline, deliberately - NOT a StreamClock. See SessionTime
+        # in this module for why substituting one would silently understate
+        # every timestamp by the amount of silence the gate dropped.
+        self._clock = timeline
+        self._direction = direction
+
+    def _config_request(self):
+        from google.cloud.speech_v2.types import cloud_speech as cs
+
+        adaptation = None
+        if self._config.phrases:
+            adaptation = cs.SpeechAdaptation(
+                phrase_sets=[
+                    cs.SpeechAdaptation.AdaptationPhraseSet(
+                        inline_phrase_set=cs.PhraseSet(
+                            phrases=[
+                                # 0-20, where high values start degrading
+                                # general accuracy. 15 is aggressive enough for
+                                # names and jargon without that trade-off.
+                                cs.PhraseSet.Phrase(value=p, boost=15.0)
+                                for p in self._config.phrases
+                            ]
+                        )
+                    )
+                ]
+            )
+
+        recognition_config = cs.RecognitionConfig(
+            explicit_decoding_config=cs.ExplicitDecodingConfig(
+                encoding=cs.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=TARGET_RATE,
+                audio_channel_count=1,
+            ),
+            # One code per direction, not a list: the channel decides the
+            # source language, so there is nothing to detect and never any
+            # ambiguity about which way to translate.
+            language_codes=[self._config.language_code],
+            model=self._config.model,
+            # No enable_word_time_offsets: Chirp 3 rejects it outright in
+            # streaming mode, a fatal InvalidArgument that ends the run before
+            # a single word is transcribed.
+            features=cs.RecognitionFeatures(enable_automatic_punctuation=True),
+            **({"adaptation": adaptation} if adaptation else {}),
+        )
+
+        streaming_config = cs.StreamingRecognitionConfig(
+            config=recognition_config,
+            streaming_features=cs.StreamingRecognitionFeatures(
+                interim_results=self._config.interim,
+            ),
+        )
+        return cs.StreamingRecognizeRequest(
+            recognizer=recognizer_path(self._config.project_id, self._config.region),
+            streaming_config=streaming_config,
+        )
+
+    def stream(self, pcm: Iterator[bytes]) -> Iterator[AsrResult]:
+        from google.cloud.speech_v2.types import cloud_speech as cs
+
+        def requests():
+            yield self._config_request()
+            for block in pcm:
+                yield cs.StreamingRecognizeRequest(audio=block)
+
+        for response in self._client.streaming_recognize(
+            requests=requests(), timeout=STREAM_TIMEOUT_S
+        ):
+            for response_result in response.results:
+                result = result_from_response(response_result, self._clock, self._direction)
+                if result is not None:
+                    yield result
+
+
+def build_recognizer_factory(config: AsrConfig, direction: Direction) -> RecognizerFactory:
+    """Create the factory the RecognitionWorker calls on every rotation."""
+    from google.api_core.client_options import ClientOptions
+    from google.cloud.speech_v2 import SpeechClient
+
+    client = SpeechClient(
+        client_options=ClientOptions(api_endpoint=speech_endpoint(config.region))
+    )
+
+    def factory(timeline: AudioTimeline) -> Recognizer:
+        return GoogleRecognizer(config, client, timeline, direction)
+
+    return factory

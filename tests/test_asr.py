@@ -2,6 +2,7 @@ import pytest
 from google.api_core import exceptions as gexc
 
 from sidetap.asr import (
+    STREAM_TIMEOUT_S,
     duration_seconds,
     is_fatal,
     next_backoff,
@@ -341,3 +342,79 @@ def test_reports_audio_lost_while_offline(caplog):
     worker.run(audio_q, queue.Queue(), stop)
 
     assert any("3s of audio dropped" in r.getMessage() for r in caplog.records)
+
+
+from sidetap.asr import AsrConfig, GoogleRecognizer
+
+
+class FakeSpeechClient:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+        self.requests = None
+        self.timeout = None
+
+    def streaming_recognize(self, requests, timeout=None):
+        self.requests = list(requests)
+        self.timeout = timeout
+        return iter(self.responses)
+
+
+class FakeResponse:
+    def __init__(self, results):
+        self.results = results
+
+
+def _config(**kwargs) -> AsrConfig:
+    base = dict(project_id="proj", region="europe-west3", language_code="ru-RU")
+    base.update(kwargs)
+    return AsrConfig(**base)
+
+
+def test_the_first_request_carries_the_config_and_the_rest_carry_audio():
+    client = FakeSpeechClient()
+    session = GoogleRecognizer(_config(), client, AudioTimeline(), Direction.IN)
+    list(session.stream(iter([b"\x01" * BLOCK_BYTES, b"\x02" * BLOCK_BYTES])))
+
+    assert client.requests[0].recognizer.endswith("/recognizers/_")
+    assert client.requests[0].streaming_config.config.language_codes == ["ru-RU"]
+    assert client.requests[1].audio == b"\x01" * BLOCK_BYTES
+    assert client.requests[2].audio == b"\x02" * BLOCK_BYTES
+
+
+def test_interim_results_are_requested():
+    client = FakeSpeechClient()
+    session = GoogleRecognizer(_config(), client, AudioTimeline(), Direction.IN)
+    list(session.stream(iter([b"\x01" * BLOCK_BYTES])))
+    # The segmenter discards interims in v1, but the TUI shows them - under
+    # full-replacement routing they are the only "they are talking" signal.
+    assert client.requests[0].streaming_config.streaming_features.interim_results is True
+
+
+def test_word_timestamps_are_never_requested():
+    # Chirp 3 rejects enable_word_time_offsets in streaming mode with a fatal
+    # InvalidArgument that ends the run before anything is transcribed.
+    client = FakeSpeechClient()
+    session = GoogleRecognizer(_config(), client, AudioTimeline(), Direction.IN)
+    list(session.stream(iter([b"\x01" * BLOCK_BYTES])))
+    features = client.requests[0].streaming_config.config.features
+    assert not getattr(features, "enable_word_time_offsets", False)
+
+
+def test_phrases_become_a_boosted_inline_phrase_set():
+    client = FakeSpeechClient()
+    session = GoogleRecognizer(
+        _config(phrases=("Volodymyr", "sidetap")), client, AudioTimeline(), Direction.IN
+    )
+    list(session.stream(iter([b"\x01" * BLOCK_BYTES])))
+    adaptation = client.requests[0].streaming_config.config.adaptation
+    values = [p.value for p in adaptation.phrase_sets[0].inline_phrase_set.phrases]
+    assert values == ["Volodymyr", "sidetap"]
+
+
+def test_the_stream_carries_a_deadline():
+    # gRPC sets none by default, so a black-holed connection would otherwise
+    # hang this direction for the rest of the call.
+    client = FakeSpeechClient()
+    session = GoogleRecognizer(_config(), client, AudioTimeline(), Direction.IN)
+    list(session.stream(iter([b"\x01" * BLOCK_BYTES])))
+    assert client.timeout == STREAM_TIMEOUT_S
