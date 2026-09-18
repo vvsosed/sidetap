@@ -121,7 +121,3 @@ drop-backlog hotkey. The no-`sleep` design in `Playout.run()` is supported by
 the drift figure. The blocking question stays open until Step 1b runs; Task 19
 is built to the specified design in the meantime, and the loop is the only part
 that would change.
-
-**Consequence.** If residue exceeds ~300 ms, note it in `README.md` under the
-drop-backlog hotkey. If drift is non-zero, playout needs to track written-vs-
-elapsed and skip silence chunks to stay in sync.
