@@ -203,9 +203,16 @@ class Session:
         session_t0 = self._clock.monotonic()
 
         for direction, config in configs.items():
+            # No `if duck_id is not None` guard, and that is the point.
+            # engage() returns before pw-loopback has registered the duck, so
+            # duck_id is still None right here; the id arrives on the next
+            # poll. Deciding now meant the duck was never built, ducking never
+            # happened, and the original played under every translation for
+            # the whole call with nothing logged to say so. The callable lets
+            # the id turn up late.
             duck = (
-                DuckControl(self._volume, self.router.duck_id)
-                if direction is Direction.IN and self.router.duck_id is not None
+                DuckControl(self._volume, lambda: self.router.duck_id)
+                if direction is Direction.IN
                 else None
             )
             sink = PwCatSink(self._launcher, target=targets[direction], rate=TTS_RATE)

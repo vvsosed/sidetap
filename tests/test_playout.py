@@ -282,3 +282,31 @@ def test_entering_bypass_throws_the_backlog_away():
     playout.submit(_translated(1.0))
     playout.set_suppressed(True)
     assert playout.backlog_s() == 0.0
+
+
+def test_a_duck_whose_node_appears_late_still_ducks():
+    """Router.engage() returns before pw-loopback registers the duck node.
+
+    Resolving the id once, at construction, meant no duck was ever built: the
+    original played underneath every translation for the entire call, and
+    nothing was logged because nothing ever tried.
+    """
+    volume = FakeVolumeControl()
+    duck_id = None
+    duck = DuckControl(volume, lambda: duck_id)
+
+    duck.close()
+    assert volume.calls == [], "nothing to set the volume on yet"
+
+    duck_id = 77
+    duck.close()
+    assert volume.calls == [(77, 0.0)], "the duck never engaged once it appeared"
+    duck.open()
+    assert volume.calls == [(77, 0.0), (77, 1.0)]
+
+
+def test_a_plain_integer_object_id_still_works():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    duck.close()
+    assert volume.calls == [(42, 0.0)]

@@ -30,21 +30,44 @@ class DuckControl:
     of 20 ms speech chunks produces one wpctl call, not fifty per second.
     """
 
-    def __init__(self, volume: VolumeControl, object_id: int):
+    def __init__(self, volume: VolumeControl, object_id: int | Callable[[], int | None]):
+        """`object_id` may be a callable, and for a live session it must be.
+
+        Router.engage() finishes before pw-loopback has registered the duck
+        with the graph - deliberately, because the alternative is journalling
+        links to ports that do not exist yet - so the duck's object id is
+        still None when Session.setup() builds this. Reading it once there
+        meant the duck was never created at all, ducking never happened, and
+        the user heard the original underneath every translation for the whole
+        call, with nothing logged. Resolving it on each transition lets the id
+        arrive a poll later, which is exactly when it does arrive.
+        """
         self._volume = volume
         self._object_id = object_id
         self._closed = False
+
+    def _resolve(self) -> int | None:
+        if callable(self._object_id):
+            return self._object_id()
+        return self._object_id
 
     def close(self) -> None:
         # Only flip on a successful call. set_volume returns False rather
         # than raising when wpctl fails; flipping anyway would desync the
         # flag from the real volume and the next transition would think it
-        # is already in the target state and skip retrying.
-        if not self._closed and self._volume.set_volume(self._object_id, 0.0):
+        # is already in the target state and skip retrying. A duck that has
+        # not appeared yet is the same case: not an error, just not yet.
+        if self._closed:
+            return
+        object_id = self._resolve()
+        if object_id is not None and self._volume.set_volume(object_id, 0.0):
             self._closed = True
 
     def open(self) -> None:
-        if self._closed and self._volume.set_volume(self._object_id, 1.0):
+        if not self._closed:
+            return
+        object_id = self._resolve()
+        if object_id is not None and self._volume.set_volume(object_id, 1.0):
             self._closed = False
 
     @property
