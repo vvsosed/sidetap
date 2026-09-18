@@ -279,3 +279,160 @@ def test_recognition_keeps_running_while_bypassed(tmp_path, routing_graph):
     session.set_bypass(True)
     assert session.stop.is_set() is False
     session.shutdown()
+
+
+def _session_with(tmp_path, routing_graph, **over):
+    """_session, but with individual collaborators replaceable."""
+    linker = over.pop("linker", None) or FakeLinker()
+    defaults = dict(
+        args=_args(out=tmp_path),
+        graph=FakeGraphSource(routing_graph),
+        launcher=FakeLauncher(),
+        linker=linker,
+        clock=FakeClock(),
+        recognizer_factory=lambda config, direction: (lambda timeline: None),
+        translator=FakeTranslator(),
+        synthesizer=FakeSynthesizer(),
+        volume=FakeVolumeControl(),
+        journal_path=tmp_path / "routing-journal.json",
+    )
+    defaults.update(over)
+    return Session(**defaults)
+
+
+def test_a_failure_in_start_still_gives_the_audio_graph_back(tmp_path, routing_graph):
+    """start() runs after engage() has already rewired the call.
+
+    capture.start() can time out waiting for a node, and _make_recognizer
+    builds a live SpeechClient per direction, so the second can fail after the
+    first succeeded. Left outside the guard, every one of those exits with the
+    user's call audio routed into a duck node and no process left to undo it.
+    """
+    import pytest
+
+    from sidetap import run as run_module
+
+    session = _session_with(tmp_path, routing_graph)
+
+    def explode():
+        raise RuntimeError("capture node never appeared")
+
+    def fake_session(*a, **k):
+        session.start = explode
+        return session
+
+    original = run_module.Session
+    run_module.Session = fake_session
+    try:
+        with pytest.raises(RuntimeError, match="capture node never appeared"):
+            run_module.run_session(
+                _args(out=tmp_path),
+                graph=FakeGraphSource(routing_graph),
+                launcher=FakeLauncher(),
+                linker=FakeLinker(),
+                clock=FakeClock(),
+            )
+    finally:
+        run_module.Session = original
+
+    assert session.router_restored is True, "the call was left inside the duck"
+
+
+def test_bypass_does_not_claim_success_when_the_mic_link_fails(
+    tmp_path, routing_graph, caplog
+):
+    """Both playouts are already suppressed by this point.
+
+    So a silently failed link means the other party hears nothing at all while
+    the interface reports bypass as fully engaged.
+    """
+    import logging
+
+    from sidetap.ports import LinkResult
+
+    session = _session_with(tmp_path, routing_graph)
+    session.setup()
+    session._linker = FakeLinker(result=LinkResult.FAILED)
+    with caplog.at_level(logging.ERROR):
+        session.set_bypass(True)
+
+    assert session._real_mic_links == [], "a failed link was recorded as live"
+    assert "hearing silence" in caplog.text
+    session.shutdown()
+
+
+def test_a_bypass_that_raises_partway_still_gets_cleaned_up(tmp_path, routing_graph):
+    """The links already made are live even though set_bypass never finished.
+
+    They outlive the process, the virtual mic is permanent, and nothing
+    journals them - so doctor --repair cannot find them either.
+    """
+    import pytest
+
+    state = {"armed": False}
+
+    class HalfBrokenLinker(FakeLinker):
+        def link(self, src_port, dst_port):
+            # Armed only across set_bypass, so router.restore()'s own
+            # re-linking during shutdown still works - otherwise this test
+            # would be about a broken restore rather than about the leak.
+            # The link itself lands; what fails is everything after it, which
+            # is the case a naive "record it once we know it worked" ordering
+            # gets wrong.
+            result = super().link(src_port, dst_port)
+            if state["armed"]:
+                raise RuntimeError("pw-link vanished")
+            return result
+
+    linker = HalfBrokenLinker()
+    session = _session_with(tmp_path, routing_graph, linker=linker)
+    session.setup()
+
+    state["armed"] = True
+    with pytest.raises(RuntimeError):
+        session.set_bypass(True)
+    state["armed"] = False
+
+    live = list(session._real_mic_links)
+    assert live, "this test proves nothing unless a link really was made"
+    assert session._bypassed is True, "bypass must be claimed before it can leak"
+
+    session.shutdown()
+    for pair in live:
+        assert pair in linker.unlinks, f"{pair} was left wired into the virtual mic"
+
+
+def test_a_sink_spawned_before_a_failed_setup_is_not_left_running(
+    tmp_path, routing_graph
+):
+    """The playout threads' own finally cannot help here.
+
+    Those threads only exist once start() has succeeded. The launcher uses
+    start_new_session=True, so an orphaned pw-cat survives this process
+    entirely and accumulates on every failed launch.
+    """
+    import pytest
+
+    from sidetap import run as run_module
+
+    launcher = FakeLauncher()
+    session = _session_with(tmp_path, routing_graph, launcher=launcher)
+
+    def boom(*a, **k):
+        raise run_module.CaptureError("no default microphone")
+
+    original = run_module.PipeWireCapture
+    run_module.PipeWireCapture = boom
+    try:
+        with pytest.raises(run_module.CaptureError):
+            session.setup()
+    finally:
+        run_module.PipeWireCapture = original
+
+    assert session.sinks, "this test proves nothing unless a sink was built"
+    session.shutdown()
+    playback = [w for w in launcher.writers if "--playback" in launcher.writer_calls[
+        launcher.writers.index(w)
+    ]]
+    assert playback, "no pw-cat playback process was spawned"
+    assert all(w.terminated for w in playback), "a pw-cat was left orphaned"

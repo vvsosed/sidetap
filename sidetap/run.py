@@ -14,6 +14,7 @@ from .capture import CaptureConfig, CaptureError, PipeWireCapture
 from .metrics import Health, Metrics
 from .pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
 from .playout import DuckControl, Playout, earcon
+from .ports import LinkResult
 from .routing import JOURNAL_PATH, VIRTMIC_SINK, Router
 from .segment import FinalsOnlySegmenter
 from .transcript import BilingualTranscript
@@ -114,6 +115,10 @@ class Session:
         self.router_restored = False
         self._threads: list[threading.Thread] = []
         self._shutdown_done = False
+        # The signal handler, the TUI and run_session's finally can all reach
+        # shutdown(), and the TUI can call set_bypass while shutdown is tearing
+        # the same links down.
+        self._lifecycle_lock = threading.RLock()
         self._bypassed = False
         self._real_mic_links: list[tuple[int, int]] = []
         # None until setup() gets far enough to create them. setup() can
@@ -396,6 +401,10 @@ class Session:
         unmediated conversation bypass exists to step out of. Recognition keeps
         running so the transcript stays continuous.
         """
+        with self._lifecycle_lock:
+            self._set_bypass_locked(value)
+
+    def _set_bypass_locked(self, value: bool) -> None:
         for playout in self.playouts.values():
             playout.set_suppressed(value)
         if value:
@@ -408,8 +417,21 @@ class Session:
                 if playout.duck is not None:
                     playout.duck.open()
         self.metrics.set_bypassed(value)
-        self._link_real_mic(value)
-        self._bypassed = value
+        # Set BEFORE the linking, not after. _link_real_mic can raise partway
+        # through - pw-link vanishing from PATH, a snapshot failing - and a
+        # pair already linked then stays live while _bypassed reads False, so
+        # shutdown's "drop bypass first" step skips it and the user's raw
+        # microphone stays wired into the virtual mic forever. Nothing
+        # journals that link, so doctor --repair cannot find it either.
+        # Claiming bypass slightly too early only costs a cleanup pass that
+        # finds nothing; claiming it too late costs the leak.
+        if value:
+            self._bypassed = True
+        try:
+            self._link_real_mic(value)
+        finally:
+            if not value and not self._real_mic_links:
+                self._bypassed = False
 
     def _link_real_mic(self, connected: bool) -> None:
         """Wire the user's real microphone straight into the virtual mic.
@@ -440,14 +462,38 @@ class Session:
             return
         outputs = snapshot.ports_of(mic.id, "out")
         inputs = snapshot.ports_of(virtmic.id, "in")
+        failed = False
         for index, out_port in enumerate(outputs):
             if not inputs:
                 break
             # Same index-pairing limit as routing.engage(): correct for
             # stereo and mono only. See that comment for why.
             in_port = inputs[min(index, len(inputs) - 1)]
-            self._linker.link(out_port.id, in_port.id)
-            self._real_mic_links.append((out_port.id, in_port.id))
+            pair = (out_port.id, in_port.id)
+            # Recorded BEFORE the attempt, and withdrawn only on a definite
+            # failure. _real_mic_links is what shutdown replays to tear these
+            # down, and the two mistakes it can make are not symmetric:
+            # unlinking something that was never linked is a no-op the adapter
+            # already classifies, while failing to unlink something live wires
+            # the user's raw microphone into the virtual mic for good. So if
+            # anything raises between the link landing and this being written
+            # down - a Ctrl-C is enough - the conservative record is the one
+            # that survives.
+            self._real_mic_links.append(pair)
+            # The result is checked, exactly as routing._route_locked checks
+            # it. A discarded LinkResult matters more here than in the router:
+            # bypass has already suppressed both playouts, so a silently failed
+            # link means the remote party hears absolute silence while the
+            # interface reports bypass as fully engaged.
+            if self._linker.link(*pair) is LinkResult.FAILED:
+                self._real_mic_links.remove(pair)
+                failed = True
+        if failed:
+            log.error(
+                "bypass could not connect your microphone to the virtual mic, "
+                "so the other party is hearing silence. Toggle bypass off to "
+                "restore the interpretation, or check `pw-link -l`."
+            )
 
     def alarm_dead_air(self) -> None:
         """Straight to the sink, bypassing the queue.
@@ -477,18 +523,28 @@ class Session:
             )
 
     def shutdown(self) -> None:
-        if self._shutdown_done:
-            return
-        self._shutdown_done = True
+        with self._lifecycle_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
         self.stop.set()
         for event in self.direction_stop.values():
             event.set()
-        if self._bypassed:
-            # Quitting while bypassed must not leave the real microphone wired
-            # into the virtual mic. It is not in the journal, the virtual mic
-            # outlives the process, and the next call would carry the user's
-            # raw voice alongside every translation.
-            self._link_real_mic(False)
+        with self._lifecycle_lock:
+            if self._bypassed or self._real_mic_links:
+                # Quitting while bypassed must not leave the real microphone
+                # wired into the virtual mic. It is not in the journal, the
+                # virtual mic outlives the process, and the next call would
+                # carry the user's raw voice alongside every translation.
+                # _real_mic_links is checked too, because a set_bypass that
+                # raised partway can leave live links behind either flag.
+                try:
+                    self._link_real_mic(False)
+                except Exception:
+                    log.exception(
+                        "could not unlink the real microphone from the virtual "
+                        "mic; run: pw-link -l and remove it by hand"
+                    )
         try:
             if self.capture is not None:
                 self.capture.stop.set()
@@ -512,6 +568,16 @@ class Session:
                     log.exception(
                         "could not restore the audio graph. Run: sidetap doctor --repair"
                     )
+            # Directly, not via the playout threads' own finally: those
+            # threads only exist once start() has succeeded, so a setup() that
+            # failed after spawning a sink leaves pw-cat running. The launcher
+            # uses start_new_session=True, so an orphan survives this process
+            # entirely and accumulates on every failed launch.
+            for sink in self.sinks.values():
+                try:
+                    sink.close()
+                except Exception:
+                    log.debug("could not close a playback sink", exc_info=True)
             if self.transcript is not None:
                 self.transcript.close()
 
@@ -544,9 +610,18 @@ def run_session(args, *, graph, launcher, linker, clock, recognizer_factory=None
         session.shutdown()
         raise
 
-    session.start()
-
+    # start() is inside the SAME guard as setup(), not after it. It runs
+    # strictly after engage() has already rewired the graph, and it does real
+    # fallible work before any thread exists: capture.start() can time out
+    # waiting for a capture node, and _make_recognizer constructs a live
+    # SpeechClient per direction, so the second can fail after the first
+    # succeeded. Every one of those used to raise straight out of run_session
+    # with the call routed into the duck and no process left to undo it -
+    # the same failure setup()'s own guard exists to prevent, stopping one
+    # call too early.
     try:
+        session.start()
+
         if args.no_tui:
             _run_headless(session)
         else:
