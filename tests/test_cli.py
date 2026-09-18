@@ -90,9 +90,12 @@ def test_region_defaults_match_the_spec():
     args = build_parser().parse_args(
         ["run", "--app", "zoom", "--their-lang", "ru-RU", "--my-lang", "en-US"]
     )
-    # Three different regions, deliberately: Translation is rejected outright
-    # in europe-west3, and TTS has no Frankfurt single-region.
-    assert args.region == "europe-west3"
+    # Three different regions, deliberately. Translation is rejected outright
+    # in europe-west3 and TTS has no Frankfurt single-region - and the STT
+    # region is europe-west4 rather than the nearer europe-west3 because
+    # chirp_2 does not exist in Frankfurt at all, while the models that do
+    # (long, short) reject ru-RU. Measured, not assumed.
+    assert args.region == "europe-west4"
     assert args.mt_region == "global"
     assert args.tts_region == "eu"
 
@@ -143,3 +146,74 @@ def test_verbose_reraises_for_a_real_traceback():
     with pytest.raises(ValueError):
         main(["devices", "-v"], graph=ExplodingGraph(), launcher=FakeLauncher(),
              linker=FakeLinker(), clock=FakeClock())
+
+
+def test_the_default_asr_model_is_one_that_still_exists():
+    """chirp_3 returns 403 "no longer generally available" for every locale.
+
+    It was the documented model when the spec was written. Shipping it as the
+    default meant every direction died on its first block, and because the TUI
+    owned the terminal the 403 was never seen.
+    """
+    args = build_parser().parse_args(
+        ["run", "--app", "zoom", "--their-lang", "ru-RU", "--my-lang", "en-US"]
+    )
+    assert args.model == "chirp_2"
+
+
+def test_doctor_can_be_told_which_languages_to_check():
+    """Reaching the API is a different question from serving your languages.
+
+    list_recognizers succeeded against a project whose model had been
+    withdrawn, so doctor reported speech-to-text OK while every call was dead.
+    """
+    args = build_parser().parse_args(
+        ["doctor", "--their-lang", "ru-RU", "--my-lang", "en-US"]
+    )
+    assert args.their_lang == "ru-RU"
+    assert args.my_lang == "en-US"
+    assert args.model == "chirp_2"
+
+
+def test_tui_mode_does_not_log_to_a_terminal_textual_owns(tmp_path, monkeypatch):
+    """Every line would otherwise be painted over as it is written.
+
+    Including "this direction is now dead" - the one line explaining why
+    nothing is being translated. A real run failed exactly that way.
+    """
+    import logging
+
+    from sidetap import cli
+
+    monkeypatch.setattr(cli, "LOG_PATH", tmp_path / "sidetap.log")
+    args = build_parser().parse_args(
+        ["run", "--app", "zoom", "--their-lang", "ru-RU", "--my-lang", "en-US"]
+    )
+    try:
+        path = cli._configure_logging(args, logging.INFO)
+        assert path is not None, "TUI mode must not log to stderr"
+        handlers = logging.getLogger().handlers
+        assert any(isinstance(h, logging.FileHandler) for h in handlers)
+        assert not any(type(h) is logging.StreamHandler for h in handlers)
+    finally:
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)
+
+
+def test_no_tui_still_logs_to_stderr(tmp_path, monkeypatch):
+    import logging
+
+    from sidetap import cli
+
+    monkeypatch.setattr(cli, "LOG_PATH", tmp_path / "sidetap.log")
+    args = build_parser().parse_args(
+        ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US", "--no-tui"]
+    )
+    try:
+        assert cli._configure_logging(args, logging.INFO) is None
+        assert any(
+            type(h) is logging.StreamHandler for h in logging.getLogger().handlers
+        )
+    finally:
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)

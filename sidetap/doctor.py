@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from typing import Sequence
 from pathlib import Path
 
 from .adapters import MIN_PW_VERSION, installed_pw_version
@@ -198,7 +199,12 @@ def check_credentials(project_override: str | None = None) -> Check:
 
 
 def check_apis(
-    project_id: str, asr_region: str, mt_region: str, tts_region: str
+    project_id: str,
+    asr_region: str,
+    mt_region: str,
+    tts_region: str,
+    model: str = "chirp_2",
+    languages: Sequence[str] = (),
 ) -> list[Check]:
     """One real, cheap RPC per API. Imported lazily.
 
@@ -235,6 +241,8 @@ def check_apis(
             Check("speech-to-text", False, f"{asr_region}: {_explain(exc)}")
         )
 
+    checks.extend(check_asr_model(project_id, asr_region, model, languages))
+
     try:
         from google.cloud import translate
 
@@ -265,6 +273,53 @@ def check_apis(
     return checks
 
 
+def check_asr_model(
+    project_id: str, region: str, model: str, languages: Sequence[str] = ()
+) -> list[Check]:
+    """Will this exact model actually recognise these exact languages here?
+
+    Reaching the API is not the same question. `list_recognizers` succeeds on a
+    project whose configured model has been withdrawn, or whose model exists
+    but rejects the language — so doctor reported speech-to-text OK while every
+    call died on its first block with a 403 or a 400. That is the whole failure
+    doctor exists to move from the middle of a conversation to setup, and it
+    was walking straight past it.
+
+    Both were real, both measured: `chirp_3` returns 403 "no longer generally
+    available" everywhere, and `long` in europe-west3 returns 400 for ru-RU
+    while happily accepting en-US - so testing one language proves nothing
+    about the other, and each is checked separately.
+
+    Costs one short stream of silence per language, about two seconds.
+    """
+    from .asr import AsrConfig, build_recognizer_factory
+    from .types import BLOCK_BYTES, Direction
+
+    checks = []
+    for language in languages:
+        label = f"asr {model}/{language}"
+        try:
+            from .rotation import AudioTimeline
+
+            config = AsrConfig(
+                project_id=project_id,
+                region=region,
+                model=model,
+                language_code=language,
+            )
+            recognizer = build_recognizer_factory(config, Direction.IN)(
+                AudioTimeline(0.0)
+            )
+            for _ in recognizer.stream(
+                (b"\x00" * BLOCK_BYTES for _ in range(5))
+            ):
+                pass
+            checks.append(Check(label, True, region))
+        except Exception as exc:
+            checks.append(Check(label, False, f"{region}: {_explain(exc)}"))
+    return checks
+
+
 def _explain(exc: Exception) -> str:
     """Turn a Google error into the sentence that names the fix.
 
@@ -284,6 +339,15 @@ def _explain(exc: Exception) -> str:
         # application-default login` drops the quota project, after which
         # Translation and Text-to-Speech both 403 while Speech-to-Text keeps
         # working - because that one is called with an explicit parent.
+        if "generally available" in exc.message:
+            # Not an enablement problem, and telling the user to enable it
+            # sends them to a console page that will look correct. The model
+            # itself has been withdrawn; nothing about this project can fix it.
+            return (
+                f"{exc.message} - this model has been withdrawn, so enabling "
+                "anything will not help. Use --model chirp_2 with "
+                "--region europe-west4."
+            )
         if "quota project" in exc.message:
             return (
                 f"{exc.message} - this is NOT a disabled API. Run: gcloud auth "

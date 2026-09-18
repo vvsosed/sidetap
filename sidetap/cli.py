@@ -52,9 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--project", help="GCP project id")
     # Three, because they are genuinely three different settings: Cloud
     # Translation rejects europe-west3 outright. Defaults match `run`.
-    doctor.add_argument("--region", default="europe-west3", help="Speech-to-Text region")
+    doctor.add_argument("--region", default="europe-west4", help="Speech-to-Text region")
     doctor.add_argument("--mt-region", default="global", help="Translation region")
     doctor.add_argument("--tts-region", default="eu", help="Text-to-Speech region")
+    # The languages you will actually run with. Without them doctor can only
+    # prove the API is reachable, which it was in the case that motivated this:
+    # chirp_3 returned 403 for every locale while list_recognizers said OK.
+    doctor.add_argument("--their-lang", metavar="BCP47", help="check this language too")
+    doctor.add_argument("--my-lang", metavar="BCP47", help="check this language too")
+    doctor.add_argument("--model", default="chirp_2", help="Speech-to-Text model")
     doctor.add_argument("-v", "--verbose", action="store_true")
 
     run = sub.add_parser("run", help="start interpreting")
@@ -95,7 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     cloud = run.add_argument_group("cloud")
     cloud.add_argument("--project", help="GCP project id")
     cloud.add_argument(
-        "--region", default="europe-west3", help="Speech-to-Text region"
+        "--region",
+        default="europe-west4",
+        help="Speech-to-Text region. NOT europe-west3: chirp_2 does not exist "
+        "there, and the models that do (long, short) reject ru-RU.",
     )
     cloud.add_argument(
         "--mt-region",
@@ -116,7 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="TTS region; Frankfurt has no TTS single-region, so this is the "
         "eu multi-region by default",
     )
-    cloud.add_argument("--model", default="chirp_3")
+    cloud.add_argument(
+        "--model",
+        default="chirp_2",
+        help="Speech-to-Text model. chirp_3 is no longer generally available "
+        "and returns 403 for every locale.",
+    )
     cloud.add_argument(
         "--phrase", action="append", dest="phrases",
         help="boost a term (names, jargon); repeat as needed",
@@ -128,6 +142,48 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--no-tui", action="store_true", help="plain console logging")
     out.add_argument("-v", "--verbose", action="store_true")
     return parser
+
+
+LOG_PATH = Path.home() / ".local/state/sidetap/sidetap.log"
+
+
+def _configure_logging(args, level: int) -> Path | None:
+    """stderr, unless Textual is about to take the terminal away.
+
+    This is not a tidiness question. Textual paints over the whole screen, so
+    with a stderr handler every log line is destroyed as it is written - and
+    that includes "this direction is now dead", the one line that explains why
+    nothing is being translated. A real run failed exactly this way: both
+    directions died on a 403 at the first block, the panes went red, and the
+    reason existed nowhere the user could reach it.
+
+    Returns the log file's path when one is in use, so the caller can say
+    where it is.
+    """
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(level)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    if args.cmd != "run" or getattr(args, "no_tui", False):
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(stream)
+        return None
+
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    except OSError:
+        # Better a corrupted-looking display than a silent failure.
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(fmt)
+        root.addHandler(stream)
+        return None
+    handler.setFormatter(fmt)
+    root.addHandler(handler)
+    return LOG_PATH
 
 
 def describe_graph(graph: PwGraph) -> str:
@@ -205,9 +261,24 @@ def _doctor(args, graph: GraphSource, launcher, linker, clock) -> int:
         # so the fallback is unreachable - but a KeyError here would surface
         # as an unexpected crash rather than a clear message.
         project = args.project or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-        checks.extend(
-            check_apis(project, args.region, args.mt_region, args.tts_region)
+        languages = tuple(
+            lang for lang in (args.their_lang, args.my_lang) if lang
         )
+        checks.extend(
+            check_apis(
+                project,
+                args.region,
+                args.mt_region,
+                args.tts_region,
+                model=args.model,
+                languages=languages,
+            )
+        )
+        if not languages:
+            print(
+                "  note: pass --their-lang and --my-lang to check that the "
+                "model actually serves them.\n"
+            )
 
     print(render_report(checks))
     return 0 if all(c.ok for c in checks) else 1
@@ -226,11 +297,8 @@ def main(
 ) -> int:
     args = build_parser().parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    level = logging.DEBUG if getattr(args, "verbose", False) else logging.INFO
+    log_path = _configure_logging(args, level)
 
     graph = graph or PwDumpGraphSource()
     launcher = launcher or SubprocessLauncher()
@@ -245,6 +313,8 @@ def main(
             return _doctor(args, graph, launcher, linker, clock)
         from .run import run_session
 
+        if log_path is not None:
+            print(f"Logs (the TUI owns the terminal): {log_path}")
         return run_session(
             args,
             graph=graph,

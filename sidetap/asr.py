@@ -1,4 +1,23 @@
-"""Google Cloud Speech-to-Text v2 (chirp_3) streaming recognition."""
+"""Google Cloud Speech-to-Text v2 streaming recognition.
+
+The model is `chirp_2` in `europe-west4`, NOT Chirp 3, and not Frankfurt.
+Measured against the live API on 2026-09-18:
+
+    chirp_3  any region      -> 403 "no longer generally available"
+    chirp_2  europe-west3    -> 400 "does not exist in this location"
+    chirp_2  europe-west4    -> works, and is the closest region that does
+    long     europe-west3    -> works for en-US, but 400 for ru-RU
+
+The design spec named Chirp 3 because it was documented as available when the
+spec was written; Google has since withdrawn it from general availability. The
+combination that still fails silently is the tempting one - Frankfurt is the
+nearest region and `long` works there for English - so anyone "simplifying"
+the region back to europe-west3 breaks every non-English language with a 400
+that only appears once audio is already flowing.
+
+Note TTS is unaffected: Chirp 3 HD voices are still available, and tts.py
+continues to use them.
+"""
 
 from __future__ import annotations
 
@@ -297,8 +316,8 @@ class RecognitionWorker:
 @dataclass(frozen=True)
 class AsrConfig:
     project_id: str
-    region: str = "europe-west3"
-    model: str = "chirp_3"
+    region: str = "europe-west4"
+    model: str = "chirp_2"
     language_code: str = "en-US"
     phrases: tuple[str, ...] = ()
     interim: bool = True

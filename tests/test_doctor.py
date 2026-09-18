@@ -246,3 +246,23 @@ def test_a_real_version_below_the_minimum_still_says_so(monkeypatch):
     check = check_pipewire_version()
     assert check.ok is False
     assert "0.3.40" in check.detail
+
+
+def test_a_withdrawn_model_is_not_reported_as_a_permissions_problem():
+    """"Enable it" sends the user to a console page that looks correct.
+
+    Nothing about their project can fix a model Google has withdrawn.
+    """
+    from google.api_core import exceptions as gexc
+
+    from sidetap.doctor import _explain
+
+    detail = _explain(
+        gexc.PermissionDenied(
+            "Permission denied for project 1 on model chirp_3 locale en-US. "
+            "It is no longer generally available."
+        )
+    )
+    assert "chirp_2" in detail
+    assert "europe-west4" in detail
+    assert "enable it, then re-run" not in detail
