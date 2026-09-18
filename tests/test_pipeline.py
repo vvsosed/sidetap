@@ -242,3 +242,34 @@ def test_earcon_is_audible_and_the_right_length():
     pcm = earcon(duration_s=0.2)
     assert len(pcm) == int(TTS_BYTES_PER_S * 0.2)
     assert pcm != b"\x00" * len(pcm)
+
+
+# --- cost accounting ---------------------------------------------------------
+
+
+def test_translation_and_synthesis_are_billed():
+    from sidetap.cost import Rates
+
+    metrics = Metrics()
+    pipeline = _pipeline(
+        translator=FakeTranslator({"привет": "hello"}),
+        metrics=metrics,
+        rates=Rates(mt_per_million_chars=1_000_000.0, tts_per_million_chars=1_000_000.0),
+    )
+    pipeline.handle(_final("привет"))
+    # 6 source characters translated + 5 target characters synthesised, at
+    # $1 per character.
+    assert metrics.snapshot().cost_usd == 11.0
+
+
+def test_a_failed_translation_bills_nothing():
+    from sidetap.cost import Rates
+
+    metrics = Metrics()
+    pipeline = _pipeline(
+        translator=FakeTranslator(error=RuntimeError("503")),
+        metrics=metrics,
+        rates=Rates(mt_per_million_chars=1_000_000.0),
+    )
+    pipeline.handle(_final("привет"))
+    assert metrics.snapshot().cost_usd == 0.0

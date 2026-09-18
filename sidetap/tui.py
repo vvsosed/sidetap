@@ -120,11 +120,11 @@ class SidetapApp(App):
             pane = self.query_one(f"#pane-{suffix}")
             pane.set_class(state.dead_air or state.no_audio, "alarm")
 
-        self.sub_title = (
-            f"BYPASSED  ${snapshot.cost_usd:.2f}"
-            if snapshot.bypassed
-            else f"${snapshot.cost_usd:.2f}"
-        )
+        # The model matters because a sticky downgrade to NMT is otherwise
+        # invisible - the health dots stay green, quality just quietly drops.
+        model = snapshot.mt_model.rsplit("/", 1)[-1] or "—"
+        state = "BYPASSED  " if snapshot.bypassed else ""
+        self.sub_title = f"{state}mt:{model}  est. ${snapshot.cost_usd:.2f}"
 
     def action_bypass(self) -> None:
         self._bypassed = not self._bypassed

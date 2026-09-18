@@ -11,6 +11,7 @@ import time
 from .adapters import PwCatSink, PwLoopbackFactory, WpctlVolumeControl
 from .asr import AsrConfig, RecognitionWorker, build_recognizer_factory, project_from_environment
 from .capture import CaptureConfig, CaptureError, PipeWireCapture
+from .cost import Rates
 from .metrics import Health, Metrics
 from .pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
 from .playout import DuckControl, Playout, earcon
@@ -169,6 +170,11 @@ class Session:
 
         self.transcript = BilingualTranscript(args.out)
 
+        # Built once and shared by both pipelines and both recognition
+        # workers: one estimate for the whole call, not four independent
+        # ones.
+        self.rates = Rates()
+
         # on_downgrade has a destination, which is the whole point of it
         # existing: a sticky fallback to NMT is otherwise invisible, because
         # the next successful call sets mt=Health.OK and the pane goes green.
@@ -223,6 +229,7 @@ class Session:
                 session_t0=session_t0,
                 on_record=self.transcript.write,
                 dead_air=self._dead_air if direction is Direction.OUT else None,
+                rates=self.rates,
             )
 
         self.capture = PipeWireCapture(
@@ -304,6 +311,9 @@ class Session:
                 gate=SilenceGate(webrtc_detector()),
                 clock=self._clock,
                 on_fatal=self._on_direction_fatal,
+                on_audio_sent=lambda seconds: self.metrics.add_cost(
+                    self.rates.recognition_usd(seconds)
+                ),
             )
             self._spawn(
                 worker.run,

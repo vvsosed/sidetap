@@ -122,8 +122,9 @@ def test_recognizer_path_uses_the_wildcard_recognizer():
 
 import queue
 import threading
+import time
 
-from sidetap.asr import KEEPALIVE_S, SILENCE_BLOCK, RecognitionWorker
+from sidetap.asr import BLOCK_MS, KEEPALIVE_S, SILENCE_BLOCK, RecognitionWorker
 from sidetap.capture import DroppingQueue
 from sidetap.rotation import AudioTimeline
 from sidetap.types import BLOCK_BYTES, AudioChunk, MIC
@@ -418,3 +419,31 @@ def test_the_stream_carries_a_deadline():
     session = GoogleRecognizer(_config(), client, AudioTimeline(), Direction.IN)
     list(session.stream(iter([b"\x01" * BLOCK_BYTES])))
     assert client.timeout == STREAM_TIMEOUT_S
+
+
+def test_the_worker_reports_the_audio_it_actually_sent():
+    """Only gated-through audio is billed, which is the point of the gate."""
+    sent = []
+    recognizer = FakeRecognizer([])
+    audio_q = DroppingQueue()
+    audio_q.put(_chunk(0.0))
+    out_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    clock = FakeClock()
+
+    worker = RecognitionWorker(
+        direction=Direction.OUT,
+        recognizer_factory=lambda timeline: recognizer,
+        gate=SilenceGate(None),
+        clock=clock,
+        on_audio_sent=sent.append,
+    )
+    thread = threading.Thread(target=worker.run, args=(audio_q, out_q, stop))
+    thread.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not sent:
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=2)
+
+    assert sent and sent[0] == BLOCK_MS / 1000

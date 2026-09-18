@@ -13,6 +13,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
+from .cost import Rates
 from .metrics import Health, Metrics
 from .playout import Playout
 from .ports import Clock, Segmenter, Synthesizer, Translator
@@ -81,6 +82,7 @@ class DirectionPipeline:
         session_t0: float = 0.0,
         on_record: Callable[[Record], None] | None = None,
         dead_air: DeadAirWatch | None = None,
+        rates: "Rates | None" = None,
     ):
         self._config = config
         self._segmenter = segmenter
@@ -92,6 +94,7 @@ class DirectionPipeline:
         self._session_t0 = session_t0
         self._on_record = on_record
         self._dead_air = dead_air
+        self._rates = rates or Rates()
 
     @property
     def direction(self) -> Direction:
@@ -141,6 +144,7 @@ class DirectionPipeline:
             self._metrics.set_health(direction, mt=Health.FAILED)
             return
         mt_ms = round((self._clock.monotonic() - started) * 1000, 1)
+        self._metrics.add_cost(self._rates.translation_usd(len(unit.text)))
 
         if not target_text.strip():
             return
@@ -154,6 +158,7 @@ class DirectionPipeline:
             self._metrics.set_health(direction, tts=Health.FAILED)
             return
         tts_ms = round((self._clock.monotonic() - started) * 1000, 1)
+        self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
         latency = Latency(asr_ms=asr_ms, mt_ms=mt_ms, tts_ms=tts_ms)
         self._metrics.set_final(direction, unit.text, target_text, latency)

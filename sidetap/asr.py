@@ -168,6 +168,7 @@ class RecognitionWorker:
         clock: Clock,
         max_stream_s: float = MAX_STREAM_SECONDS,
         on_fatal: Callable[[Direction, BaseException], None] | None = None,
+        on_audio_sent: Callable[[float], None] | None = None,
     ):
         self._on_fatal = on_fatal
         self._direction = direction
@@ -175,6 +176,7 @@ class RecognitionWorker:
         self._gate = gate
         self._clock = clock
         self._max_stream_s = max_stream_s
+        self._on_audio_sent = on_audio_sent
 
     @staticmethod
     def _dropped(audio_q) -> int:
@@ -218,12 +220,17 @@ class RecognitionWorker:
                     if chunk is not None and self._gate.allows(chunk.pcm):
                         last_sent_at = now
                         timeline.sent(chunk.t_start)
+                        if self._on_audio_sent is not None:
+                            self._on_audio_sent(BLOCK_MS / 1000)
                         yield chunk.pcm
                     elif now - last_sent_at >= KEEPALIVE_S:
                         # Nothing worth sending, or nothing arriving at all.
                         # Either way the stream dies unless we say something.
                         last_sent_at = now
                         timeline.sent(last_chunk_t + (now - last_chunk_at))
+                        if self._on_audio_sent is not None:
+                            # Keepalive silence is still billed audio.
+                            self._on_audio_sent(BLOCK_MS / 1000)
                         yield SILENCE_BLOCK
 
             try:
