@@ -163,7 +163,7 @@ second implementation.
 | `transcript.py` | bilingual `.jsonl` (append, flushed per unit) + `.md` (written at close) |
 | `tui.py` | Textual dashboard, hotkeys |
 | `run.py` | `Session` — builds every stage, owns startup/shutdown, signal handling |
-| `adapters.py` | the real ports — **the only module that starts a subprocess** |
+| `adapters.py` | the real ports — **every subprocess on the audio path starts here** (`recorder.py` and `doctor.py` are the two deliberate exceptions, neither on the audio path) |
 | `cli.py` / `__main__.py` | argparse, `doctor`/`devices`/`run` dispatch |
 
 ### Invariants

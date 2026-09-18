@@ -1,7 +1,13 @@
 """Real implementations of every port except Recognizer.
 
-This is the only module in the package that starts a subprocess. Keeping that
-in one place is what lets everything else be tested against fakes.
+Every subprocess on the *audio path* is started here, behind a port, which is
+what lets the rest of the package be tested against fakes with no hardware.
+
+Two modules deliberately step outside that: `recorder.py`, which owns the
+pw-record lifecycle it was split out to manage, and `doctor.py`, which probes
+the environment before any port exists to inject. Neither is on the audio path,
+and both are reached only from a command the user ran explicitly. Anything that
+moves audio belongs here.
 """
 
 from __future__ import annotations
