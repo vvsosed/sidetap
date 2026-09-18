@@ -217,3 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .superpowers/
+
+# sidetap session output: a run's .log, .jsonl and .md land here. These are
+# call transcripts - what was actually said, by both parties - so they are
+# never committed. Two were, once, by a `git add -A`, and reached the public
+# repository before anyone noticed.
+transcripts/
