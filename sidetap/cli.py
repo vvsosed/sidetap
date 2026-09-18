@@ -18,6 +18,7 @@ from .adapters import (
     SystemClock,
 )
 from .capture import CaptureError
+from .types import LAG_CAP_S
 from .tts import MAX_SPEAKING_RATE, MIN_SPEAKING_RATE
 from .graph import PLAYBACK_STREAM, SINK, SOURCE, PwGraph
 from .ports import Clock, GraphSource, Linker, ProcessLauncher
@@ -165,7 +166,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     out = run.add_argument_group("output")
     out.add_argument("--out", type=Path, default=Path("transcripts"))
-    out.add_argument("--lag-cap", type=float, default=None, help="seconds (default 12)")
+    # default=None, not LAG_CAP_S: it lets run.py tell "the user did not pass
+    # this" from "the user passed 12", so the constant stays the single source
+    # of the value rather than being shadowed by a copy here. The help text is
+    # derived from it for the same reason - written out by hand it would go on
+    # claiming 12 after someone changed the constant.
+    out.add_argument(
+        "--lag-cap",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="seconds of un-spoken translation to allow before dropping the "
+        f"oldest (default {LAG_CAP_S:g}). Raising it means hearing more while "
+        "falling further behind; it does not stop the backlog growing.",
+    )
     out.add_argument("--no-tui", action="store_true", help="plain console logging")
     out.add_argument("-v", "--verbose", action="store_true")
     return parser

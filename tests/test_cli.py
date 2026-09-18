@@ -300,3 +300,18 @@ def test_a_valid_rate_is_accepted():
     )
     assert args.speaking_rate_in == 1.3
     assert args.speaking_rate_out == 1.0, "one direction must not move the other"
+
+
+def test_the_lag_cap_help_does_not_hardcode_the_default():
+    """Written out by hand it goes on claiming 12 after the constant changes.
+
+    Documentation that lies, with nothing to catch it.
+    """
+    from sidetap.types import LAG_CAP_S
+
+    action = next(
+        a for a in build_parser()._subparsers._group_actions[0].choices["run"]._actions
+        if a.dest == "lag_cap"
+    )
+    assert f"{LAG_CAP_S:g}" in action.help
+    assert action.default is None, "None distinguishes unset from an explicit 12"
