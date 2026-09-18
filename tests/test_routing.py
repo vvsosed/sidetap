@@ -708,3 +708,30 @@ def test_a_failed_journal_write_leaves_no_temp_file_behind(tmp_path, monkeypatch
 
     assert Journal.load(path).broken == (LinkRef(1, "a", 2, "b"),)
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_has_routed_is_false_until_a_stream_is_actually_rewired(
+    tmp_path, idle_graph, routing_graph
+):
+    """It arms the no-audio alarm, so it must mean "the app is playing"."""
+    linker = FakeLinker()
+    router = Router(
+        graph=FakeGraphSource(idle_graph),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    router.engage(app_pattern="zoom")
+    assert router.has_routed is False, "nothing in the idle graph is playing"
+
+    linker2 = FakeLinker()
+    playing = Router(
+        graph=FakeGraphSource(routing_graph),
+        linker=linker2,
+        unlinker=linker2,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "k.json",
+    )
+    playing.engage(app_pattern="zoom")
+    assert playing.has_routed is True

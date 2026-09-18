@@ -106,10 +106,16 @@ class DroppingQueue:
     def __init__(self, maxsize: int = QUEUE_BLOCKS):
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self.dropped = 0
+        # Arrivals, not just losses. A track that has gone quiet because its
+        # capture node was unlinked delivers zero bytes, not silence, so
+        # nothing downstream can tell it apart from nobody talking - this
+        # counter is the only place that difference is visible.
+        self.accepted = 0
 
     def put(self, item) -> bool:
         try:
             self._queue.put_nowait(item)
+            self.accepted += 1
             return True
         except queue.Full:
             self.dropped += 1

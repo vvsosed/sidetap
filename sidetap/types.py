@@ -25,6 +25,13 @@ LAG_CAP_S = 12.0
 # before the dead-air alarm fires.
 DEAD_AIR_S = 6.0
 
+# No audio at all reaching a capture queue for this long. Distinct from
+# DEAD_AIR_S, which is about a finished utterance producing nothing: this is
+# the upstream failure, where an unlinked capture node delivers ZERO BYTES
+# rather than silence, so the silence gate sees nothing to gate and every
+# downstream stage sits idle looking healthy.
+NO_AUDIO_S = 15.0
+
 
 class Direction(StrEnum):
     """Which way a translation flows.

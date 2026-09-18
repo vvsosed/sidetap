@@ -261,6 +261,17 @@ class Router:
         self.duck_serial: int | None = None
         self.duck_id: int | None = None
 
+    @property
+    def has_routed(self) -> bool:
+        """Has any application stream actually been rewired through the duck?
+
+        This is what arms the IN direction's no-audio watch. Before it is true
+        the app simply is not playing anything, which is the ordinary state of
+        having started sidetap before the call - alarming on it would train the
+        user to ignore the one warning that matters.
+        """
+        return bool(self._routed)
+
     def engage(self, app_pattern: str) -> None:
         with self._lock:
             if self._loopback is not None:

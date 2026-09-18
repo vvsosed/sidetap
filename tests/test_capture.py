@@ -289,3 +289,20 @@ def test_shutdown_joins_a_pump_parked_on_read(idle_graph):
     capture.shutdown()
 
     assert all(not thread.is_alive() for thread in capture._threads)
+
+
+def test_the_queue_counts_arrivals_as_well_as_drops():
+    """An unlinked capture node delivers zero bytes, not silence.
+
+    Nothing downstream can tell that apart from nobody talking, so the arrival
+    counter is the only signal that distinguishes a dead track from a quiet
+    one.
+    """
+    q = DroppingQueue(maxsize=2)
+    assert q.accepted == 0
+    assert q.put(b"a") is True
+    assert q.put(b"b") is True
+    assert q.accepted == 2
+    assert q.put(b"c") is False, "the queue was meant to be full here"
+    assert q.accepted == 2, "a dropped block is not an arrival"
+    assert q.dropped == 1

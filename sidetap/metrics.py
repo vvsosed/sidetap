@@ -30,6 +30,7 @@ class DirectionState:
     dropped: int = 0
     capture_dropped: int = 0
     dead_air: bool = False
+    no_audio: bool = False
     asr: Health = Health.OK
     mt: Health = Health.OK
     tts: Health = Health.OK
@@ -84,6 +85,18 @@ class Metrics:
     def set_dead_air(self, direction: Direction, value: bool) -> None:
         with self._lock:
             self._states[direction].dead_air = value
+
+    def set_no_audio(self, direction: Direction, value: bool) -> None:
+        """No audio at all is reaching this direction's capture queue.
+
+        Separate from dead_air, which means an utterance finished and nothing
+        came out the other end. This one is upstream of everything: the track
+        itself has gone silent, and because an unlinked PipeWire capture
+        delivers zero bytes rather than silence, every stage downstream looks
+        healthy while doing nothing.
+        """
+        with self._lock:
+            self._states[direction].no_audio = value
 
     def set_capture_dropped(self, direction: Direction, count: int) -> None:
         """Blocks the CAPTURE queue discarded, as an absolute count.

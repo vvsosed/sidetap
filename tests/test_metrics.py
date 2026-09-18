@@ -130,3 +130,18 @@ def test_cost_accumulates_across_directions():
     metrics.add_cost(0.01)
     metrics.add_cost(0.02)
     assert metrics.snapshot().cost_usd == 0.03
+
+
+def test_no_audio_is_tracked_separately_from_dead_air():
+    """They are different failures with different causes.
+
+    dead_air means an utterance finished and nothing came out; no_audio means
+    nothing ever went in. Collapsing them would point the user at the wrong
+    half of the pipeline.
+    """
+    metrics = Metrics()
+    metrics.set_no_audio(Direction.IN, True)
+    snapshot = metrics.snapshot()
+    assert snapshot.directions[Direction.IN].no_audio is True
+    assert snapshot.directions[Direction.IN].dead_air is False
+    assert snapshot.directions[Direction.OUT].no_audio is False
