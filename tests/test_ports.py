@@ -14,12 +14,14 @@ from sidetap.ports import (
     ManagedProcess,
     ProcessLauncher,
     Recognizer,
+    Segmenter,
     Synthesizer,
     Translator,
     Unlinker,
     VolumeControl,
     WritableProcess,
 )
+from sidetap.segment import FinalsOnlySegmenter
 from tests.conftest import (
     FakeAudioSink,
     FakeClock,
@@ -35,10 +37,6 @@ from tests.conftest import (
     FakeWritableProcess,
 )
 
-# NOTE: the Segmenter protocol check lives in Task 15, which creates the only
-# implementation. Importing sidetap.segment here would break collection of the
-# whole suite for the eleven tasks in between.
-
 
 def test_fakes_satisfy_their_protocols(idle_graph):
     assert isinstance(FakeGraphSource(idle_graph), GraphSource)
@@ -52,6 +50,7 @@ def test_fakes_satisfy_their_protocols(idle_graph):
     assert isinstance(FakeTranslator(), Translator)
     assert isinstance(FakeSynthesizer(), Synthesizer)
     assert isinstance(FakeRecognizer([]), Recognizer)
+    assert isinstance(FinalsOnlySegmenter(), Segmenter)
 
 
 def test_fake_processes_satisfy_their_protocols():
