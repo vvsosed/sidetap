@@ -14,7 +14,7 @@ from collections import deque
 from typing import Callable
 
 from .ports import AudioSink, VolumeControl
-from .types import LAG_CAP_S, TTS_BYTES_PER_S, Direction, Translated
+from .types import LAG_CAP_S, TTS_BYTES_PER_S, TTS_RATE, Direction, Translated
 
 log = logging.getLogger(__name__)
 
@@ -213,3 +213,22 @@ class Playout:
             if self._duck is not None:
                 self._duck.open()
             self._sink.close()
+
+
+def earcon(duration_s: float = 0.25, frequency: float = 880.0, level: float = 0.25) -> bytes:
+    """A short tone for the dead-air alarm.
+
+    During a call you are looking at the other person, not at a dashboard, so
+    the OUT direction failing silently has to make a sound. Generated rather
+    than shipped as an asset, and with math.sin rather than numpy, because the
+    capture path deliberately has no numpy in it.
+    """
+    import math
+    import struct
+
+    samples = int(TTS_BYTES_PER_S * duration_s) // 2
+    amplitude = int(32767 * level)
+    return b"".join(
+        struct.pack("<h", int(amplitude * math.sin(2 * math.pi * frequency * i / TTS_RATE)))
+        for i in range(samples)
+    )
