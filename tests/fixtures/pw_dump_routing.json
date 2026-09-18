@@ -1,0 +1,52 @@
+[
+  {"id": 40, "type": "PipeWire:Interface:Node",
+   "info": {"props": {"media.class": "Audio/Sink", "object.serial": 1001,
+     "node.name": "alsa_output.default", "node.description": "Speakers"}}},
+  {"id": 401, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 40, "port.name": "playback_FL", "port.direction": "in"}}},
+  {"id": 402, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 40, "port.name": "playback_FR", "port.direction": "in"}}},
+
+  {"id": 42, "type": "PipeWire:Interface:Node",
+   "info": {"props": {"media.class": "Audio/Source", "object.serial": 1002,
+     "node.name": "alsa_input.default", "node.description": "USB Microphone"}}},
+  {"id": 421, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 42, "port.name": "capture_MONO", "port.direction": "out"}}},
+
+  {"id": 55, "type": "PipeWire:Interface:Node",
+   "info": {"props": {"media.class": "Stream/Output/Audio", "object.serial": 1204,
+     "node.name": "ZOOM VoiceEngine", "node.description": "ZOOM VoiceEngine",
+     "application.name": "zoom", "application.process.binary": "zoom",
+     "application.process.id": 3553}}},
+  {"id": 551, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 55, "port.name": "output_FL", "port.direction": "out"}}},
+  {"id": 552, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 55, "port.name": "output_FR", "port.direction": "out"}}},
+
+  {"id": 70, "type": "PipeWire:Interface:Node",
+   "info": {"props": {"media.class": "Audio/Sink", "object.serial": 1300,
+     "node.name": "sidetap_duck", "node.description": "sidetap duck"}}},
+  {"id": 701, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 70, "port.name": "playback_FL", "port.direction": "in"}}},
+  {"id": 702, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 70, "port.name": "playback_FR", "port.direction": "in"}}},
+
+  {"id": 80, "type": "PipeWire:Interface:Node",
+   "info": {"props": {"media.class": "Audio/Sink", "object.serial": 1400,
+     "node.name": "sidetap_tts_sink", "node.description": "sidetap Virtual Mic"}}},
+  {"id": 801, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 80, "port.name": "playback_MONO", "port.direction": "in"}}},
+
+  {"id": 81, "type": "PipeWire:Interface:Node",
+   "info": {"props": {"media.class": "Audio/Source", "object.serial": 1401,
+     "node.name": "sidetap_virtmic", "node.description": "sidetap Virtual Mic"}}},
+  {"id": 811, "type": "PipeWire:Interface:Port",
+   "info": {"props": {"node.id": 81, "port.name": "capture_MONO", "port.direction": "out"}}},
+
+  {"id": 10, "type": "PipeWire:Interface:Metadata",
+   "props": {"metadata.name": "default"},
+   "metadata": [
+     {"key": "default.audio.sink", "value": {"name": "alsa_output.default"}},
+     {"key": "default.audio.source", "value": {"name": "alsa_input.default"}}
+   ]}
+]

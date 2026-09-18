@@ -303,3 +303,8 @@ def idle_graph() -> PwGraph:
 @pytest.fixture
 def zoom_graph() -> PwGraph:
     return load_graph("pw_dump_zoom_active.json")
+
+
+@pytest.fixture
+def routing_graph() -> PwGraph:
+    return load_graph("pw_dump_routing.json")

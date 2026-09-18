@@ -1,8 +1,12 @@
 """Link a matching application's audio into our capture node.
 
-The link is additive. The application keeps its existing link to the
-speakers, so the user still hears the call, and PipeWire delivers an
-identical copy to us.
+The tap itself is additive and never steals the stream: it only ever adds a
+second link from the application's existing output ports into our capture
+node, so PipeWire delivers an identical copy to us no matter what else those
+ports are plugged into. Whether the application's original link to the
+speakers survives is routing.py's call, not this module's - once engaged,
+routing.py unlinks the application from the speakers and re-routes it through
+a duck it controls, and this tap keeps tapping the same ports either way.
 
 The watcher re-scans because applications create their audio streams late:
 Zoom does it when the meeting starts, not when the app launches. Anything
