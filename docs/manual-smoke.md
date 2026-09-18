@@ -6,18 +6,18 @@ trusting a change to capture, routing, playout or the duck.
 
 ## Setup
 
-- [ ] `sidetap doctor --install`, then
+- [+] `sidetap doctor --install`, then
       `systemctl --user restart pipewire pipewire-pulse`.
-- [ ] `sidetap doctor` reports all checks passing.
-- [ ] `wpctl status` shows both `sidetap_tts_sink` and `sidetap_virtmic`.
+- [+] `sidetap doctor` reports all checks passing.
+- [+] `wpctl status` shows both `sidetap_tts_sink` and `sidetap_virtmic`.
 
 ## Device visibility
 
-- [ ] Zoom's microphone list shows "sidetap Virtual Mic".
-- [ ] Select it, restart Zoom, and confirm the selection **survived**. This is
+- [+] Zoom's microphone list shows "sidetap Virtual Mic".
+- [+] Select it, restart Zoom, and confirm the selection **survived**. This is
       the failure the permanent config file exists to prevent, and its symptom
       is the remote party hearing your untranslated voice.
-- [ ] In Chrome or an Electron client, disable the browser's own echo
+- [?] In Chrome or an Electron client, disable the browser's own echo
       cancellation and noise suppression. They are applied to microphone input
       by default and can only gate or duck clean synthetic speech.
 
