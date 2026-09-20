@@ -918,7 +918,7 @@ def test_a_truncated_record_is_marked_in_the_markdown():
     unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
     record = Record(unit=unit, target_text="privet", truncated=True)
     text = render_markdown("s", [record])
-    assert "_(cut short: synthesis failed)_" in text
+    assert "_(cut short before the end)_" in text
 
 
 def test_the_jsonl_row_carries_truncation_and_full_synthesis_time():
@@ -1006,7 +1006,7 @@ with:
         if record.dropped:
             suffix = "  _(not spoken: backlog dropped)_"
         elif record.truncated:
-            suffix = "  _(cut short: synthesis failed)_"
+            suffix = "  _(cut short before the end)_"
         else:
             suffix = ""
 ```

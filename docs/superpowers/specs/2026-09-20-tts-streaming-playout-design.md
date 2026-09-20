@@ -177,7 +177,10 @@ Backlog becomes `(len(current.pcm) - offset) + sum(len(i.pcm) for i in queue)`.
   It carries full synthesis wall time to the jsonl and the debug log, so the
   throughput and cost signal is not lost.
 - `Record` gains `truncated: bool`; `render_markdown` marks it
-  `_(cut short: synthesis failed)_`, beside the existing dropped marker.
+  `_(cut short before the end)_`, beside the existing dropped marker. The
+  wording names no cause on purpose: truncation has two of them, a synthesis
+  exception and playout abandoning a stalled utterance at the starvation
+  bound, and the second involves nothing failing at all.
 
 ### Failure part-way through
 
