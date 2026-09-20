@@ -4,7 +4,7 @@ import time
 
 from sidetap.metrics import Health, Metrics
 from sidetap.pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
-from sidetap.playout import Playout, earcon
+from sidetap.playout import STARVE_LIMIT_TICKS, Playout, earcon
 from sidetap.segment import FinalsOnlySegmenter
 from sidetap.types import TTS_BYTES_PER_S, AsrResult, Direction
 from tests.conftest import FakeAudioSink, FakeClock, FakeSynthesizer, FakeTranslator
@@ -350,3 +350,109 @@ def test_a_synthesis_failure_before_any_audio_records_nothing():
 
     assert playout.backlog_s() == 0.0
     assert records == []
+
+
+# --- playout refusing mid-stream --------------------------------------------
+#
+# append() returning False - the `refused` path - has two causes: bypass
+# flushing the queue (dropped) and playout abandoning a stalled utterance at
+# the starvation bound (closed via _advance_locked, not via an exception).
+# Neither is reachable by raising in the fake synthesizer, so these drive the
+# real Playout instance directly, the same way the production consumer of
+# these APIs (the playout thread and Session.set_bypass) would.
+
+
+def test_a_refusal_mid_stream_does_not_paint_tts_health_ok():
+    """Only a generator that runs to completion is evidence TTS is healthy.
+
+    The first utterance fails outright (tts -> FAILED). The second succeeds
+    partway, then bypass flushes it mid-stream - a refusal, not an exception.
+    That must not repaint the health marker green: the TUI's tts indicator
+    exists to show the pipeline failing, and a refusal is exactly a case
+    where the listener did not hear the whole sentence.
+    """
+    metrics = Metrics()
+    playout = Playout(Direction.IN, FakeAudioSink())
+
+    class StatefulSynthesizer:
+        def __init__(self):
+            self.calls = 0
+
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom")
+                yield b""  # pragma: no cover - generator marker
+            yield b"\x01\x02" * 8000
+            playout.set_suppressed(True)  # bypass flushes the queued handle
+            yield b"\x03\x04" * 8000
+
+    pipeline = _pipeline(
+        synthesizer=StatefulSynthesizer(), playout=playout, metrics=metrics
+    )
+    pipeline.handle(_final("first", t_end=1.0))
+    pipeline.handle(_final("second", t_end=2.0))
+
+    assert metrics.snapshot().directions[Direction.IN].tts is Health.FAILED
+
+
+def test_a_playout_side_truncation_is_recorded_though_the_producer_finished_cleanly():
+    """finish()'s own truncated flag must survive into the Record.
+
+    Playout gives up on a queued utterance that sits under the 400ms start
+    threshold for STARVE_LIMIT_TICKS - closing it in place as truncated, with
+    no exception anywhere in the producer. The producer's own `truncated`
+    local stays False the whole time, so only re-reading it off the handle
+    after finish() reports what actually happened to the listener.
+    """
+    records = []
+    playout = Playout(Direction.IN, FakeAudioSink())
+
+    class StallingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 8000  # 0.33s of audio: under the 0.4s start buffer
+            for _ in range(STARVE_LIMIT_TICKS):
+                playout.tick()  # playout gives up on the still-queued head
+            yield b"\x03\x04" * 8000
+
+    pipeline = _pipeline(
+        synthesizer=StallingSynthesizer(), playout=playout, on_record=records.append
+    )
+    pipeline.handle(_final(t_end=1.0))
+
+    assert len(records) == 1
+    assert records[0].truncated is True
+
+
+def test_a_bypass_flushed_utterance_produces_no_record_and_no_cost():
+    """dropped must short-circuit before a record or a synthesis charge.
+
+    The parties are talking unmediated during bypass, so a transcript row -
+    or a bill - for a translation nobody heard would misrepresent the call.
+    """
+    from sidetap.cost import Rates
+
+    records = []
+    metrics = Metrics()
+    playout = Playout(Direction.IN, FakeAudioSink())
+
+    class FlushingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 8000
+            playout.set_suppressed(True)
+            yield b"\x03\x04" * 8000
+
+    pipeline = _pipeline(
+        translator=FakeTranslator({"привет": "hello"}),
+        synthesizer=FlushingSynthesizer(),
+        playout=playout,
+        metrics=metrics,
+        on_record=records.append,
+        rates=Rates(mt_per_million_chars=1_000_000.0, tts_per_million_chars=1_000_000.0),
+    )
+    pipeline.handle(_final("привет"))
+
+    assert records == []
+    # Only the 6-character source text is billed, at $1/char. A synthesis
+    # charge here would mean paying for audio nobody heard.
+    assert metrics.snapshot().cost_usd == 6.0
