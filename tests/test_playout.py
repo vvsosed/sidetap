@@ -360,21 +360,25 @@ def test_on_spoken_fires_once_when_a_streamed_utterance_drains():
     is a different code path from test_finished_items_are_reported_once,
     where the whole item is closed from the start and always retires
     mid-chunk, on the speech branch.
+
+    0.42 s, not some shorter, tidier number: it has to clear the 400 ms
+    start threshold while still open, or it never starts playing at all and
+    this never reaches the silence branch it exists to exercise.
     """
     spoken = []
     playout = Playout(Direction.IN, FakeAudioSink(), on_spoken=spoken.append)
     item = playout.begin(_unit(), "hi")
-    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.04 / 2))  # 2 chunks
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.42 / 2))  # 21 chunks
 
-    assert playout.tick() is True  # first chunk
-    assert playout.tick() is True  # second chunk; fully read, but still open
+    for _ in range(21):
+        assert playout.tick() is True
     assert spoken == []  # not closed yet - nothing to report
 
     playout.finish(item)
     assert playout.tick() is False  # silence tick: this is where it retires
     assert len(spoken) == 1
     assert spoken[0].text == "hi"
-    assert spoken[0].audio_s == pytest.approx(0.04)
+    assert spoken[0].audio_s == pytest.approx(0.42)
 
 
 def test_a_sub_chunk_append_does_not_get_padded_and_played():
@@ -431,15 +435,18 @@ def test_append_after_finish_is_refused():
 
 
 def test_an_utterance_that_never_produces_audio_reports_nothing():
-    """Closed with offset == 0: it was current, but nothing was ever read
-    from it, so on_spoken must not fire - nothing was actually spoken."""
+    """Empty and open, it never clears the start threshold, so this tick
+    does not promote it to _current - it stays queued. finish() then
+    unqueues it directly (it has no pcm and is not _current), so there is
+    nothing left for a second tick to retire; either way, nothing was ever
+    read from it, so on_spoken must not fire."""
     spoken = []
     playout = Playout(Direction.IN, FakeAudioSink(), on_spoken=spoken.append)
     item = playout.begin(_unit(), "hi")
 
-    assert playout.tick() is False  # promotes item to _current; still empty
+    assert playout.tick() is False  # nothing startable yet; still empty
     playout.finish(item, truncated=True)
-    assert playout.tick() is False  # retires it; nothing to report
+    assert playout.tick() is False  # nothing left to retire; still nothing to report
     assert spoken == []
 
 
@@ -473,3 +480,28 @@ def test_finish_on_an_already_dropped_item_does_not_raise():
 
     playout.finish(item, truncated=True)  # must not raise
     assert playout.backlog_s() == 0.0
+
+
+def test_an_utterance_waits_for_the_start_threshold():
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+
+    # 200 ms is under the 400 ms threshold: nothing plays yet.
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.2 / 2))
+    assert playout.tick() is False
+
+    # 400 ms total clears it.
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.2 / 2))
+    assert playout.tick() is True
+
+
+def test_a_short_utterance_plays_as_soon_as_it_is_closed():
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.05 / 2))
+
+    # 50 ms is far under the threshold, but the utterance is complete, so
+    # waiting for more would mean waiting forever.
+    assert playout.tick() is False
+    playout.finish(item)
+    assert playout.tick() is True

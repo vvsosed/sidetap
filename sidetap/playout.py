@@ -303,9 +303,21 @@ class Playout:
         if value:
             self.flush()
 
+    def _startable_locked(self, item: Utterance) -> bool:
+        """Hold a new utterance until it can absorb a stall.
+
+        `closed` comes first: an utterance shorter than the threshold is
+        complete, so waiting for more audio would wait forever.
+        """
+        return item.closed or item.audio_s >= START_BUFFER_S
+
     def _advance_locked(self) -> tuple[bytes | None, Translated | None]:
         """Pull, read and retire under the lock. Returns (chunk, finished)."""
-        if self._current is None and self._queue:
+        if (
+            self._current is None
+            and self._queue
+            and self._startable_locked(self._queue[0])
+        ):
             self._current = self._queue.popleft()
             self._offset = 0
 
