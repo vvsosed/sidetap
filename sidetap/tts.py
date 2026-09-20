@@ -3,22 +3,27 @@
 One fixed voice per direction - no cloning, which costs roughly 600 ms of
 time-to-first-audio for a v1 that does not need it.
 
-`synthesize` is a true incremental generator: 6.2 s of Russian arrives as 27
-separate chunks, the first within 186-267 ms warm (measured - see
-docs/experiments/04-tts-streaming.md). **The pipeline does not currently
-exploit that.** DirectionPipeline._speak does `b"".join(synthesize(...))`,
-because Playout's lag cap needs an utterance's duration up front to measure
-backlog in seconds. So the latency that actually applies is full synthesis
-wall time - 637 ms for 3.84 s of audio, 1390 ms for 6.2 s - not
-time-to-first-chunk.
+`synthesize` is a true incremental generator and the pipeline exploits it:
+DirectionPipeline._speak appends each chunk to a Playout utterance as it
+arrives, so speech starts at time-to-first-chunk rather than at full
+synthesis wall time. Measured (docs/experiments/04-tts-streaming.md), that
+is the difference between 194 ms and 465 ms on a short utterance, and
+between 230 ms and 2339 ms on a long one.
 
-Do not "fix" this docstring by claiming early playout. Fix the pipeline, and
-accept that the backlog becomes estimated rather than known; the trade-off is
-written up in the spec's latency section.
+The shape that makes it safe: the first chunk is always 200 ms of audio,
+every chunk after it is 240 ms arriving every ~30 ms, and production runs
+4.7-7.1x faster than playback - so simulated early playout never dipped
+below a 200 ms buffer margin across nine runs. Playout still waits for
+START_BUFFER_S before starting, which costs ~30 ms and doubles that margin.
 
-The first call after construction costs ~543 ms against a ~267 ms warm median,
-which is why Session.setup() performs a throwaway synthesis while the audio
-graph is being rewired.
+An earlier version of this docstring claimed early playout would force the
+lag cap to estimate the backlog rather than measure it. It does not: at
+those ratios, counting only bytes that have arrived understates the backlog
+by a fraction of one utterance and self-corrects within about a second.
+
+The first call after construction costs ~543 ms against a ~267 ms warm
+median, which is why Session.setup() performs a throwaway synthesis while
+the audio graph is being rewired.
 """
 
 from __future__ import annotations

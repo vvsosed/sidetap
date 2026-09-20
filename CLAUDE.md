@@ -154,7 +154,7 @@ second implementation.
 | `segment.py` | the `Segmenter` seam; `FinalsOnlySegmenter` for v1 |
 | `translate.py` | Cloud Translation v3 adapter, NMT fallback |
 | `tts.py` | Chirp 3 HD streaming synthesis adapter |
-| `playout.py` | lag-capped queue, `DuckControl`, PCM writer |
+| `playout.py` | lag-capped queue of growable utterances, `DuckControl`, PCM writer |
 | `routing.py` | duck loopback lifecycle, re-route, journal, restore |
 | `pipeline.py` | `DirectionPipeline` — wires one direction's stages end to end |
 | `metrics.py` | per-stage latency, queue depth, stage health, cost — the TUI's only input |
@@ -285,6 +285,19 @@ as a style preference and this is not one.
   through `on_audio_sent`, because Google bills them identically — counting
   only real speech would understate a quiet call left running unattended,
   which is the one a user is most likely to forget about.
+- **Playout starts an utterance before it has been fully synthesised.**
+  `DirectionPipeline._speak` appends chunks to a `playout.Utterance` as they
+  arrive rather than joining the generator, which is worth 271 ms on a short
+  sentence and 2109 ms on a long one. Three consequences that are easy to
+  break: an utterance that has *started* and then run dry holds the duck
+  **closed**, because opening it would let a burst of the untranslated
+  original through a mid-sentence gap — bounded by `STARVE_LIMIT_TICKS` so a
+  dead producer cannot silence the remote party for the rest of the call; the
+  lag cap never drops an utterance that is still arriving, since its duration
+  is unknown and it is always the newest thing queued; and every `begin()`
+  must be paired with a `finish()` on every exit path, or an orphaned open
+  utterance sits at the queue head where the trim loop breaks, switching the
+  lag cap off for that direction.
 
 ## Things that bite at runtime
 

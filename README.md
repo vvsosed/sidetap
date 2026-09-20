@@ -197,9 +197,12 @@ Ctrl-C stops the session and writes `transcripts/<session>.jsonl` and
 `transcripts/<session>.md` — a bilingual transcript, both directions in
 chronological order. The `.jsonl` is opened in append mode and flushed after
 every final unit, so an unclean exit still leaves everything up to that
-moment on disk; utterances the lag cap dropped are written too, marked
-`_(not spoken: backlog dropped)_` in the Markdown rather than silently
-missing.
+moment on disk; an utterance the listener did not fully hear is written too
+rather than silently missing, marked in the Markdown with why:
+`_(not spoken)_` when the lag cap or bypass discarded it,
+`_(not spoken: synthesis stalled)_` when the producer went quiet before a
+single chunk was played, and `_(cut short before the end)_` when it was
+playing and stopped.
 
 ## Cost
 

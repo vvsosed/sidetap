@@ -246,6 +246,12 @@ class DirectionPipeline:
             # - but the sentence was said, and was billed. Losing the row
             # would lose the source line with it, exactly as on the bypass
             # path above. No latency: there is nothing to report a wait for.
+            # Leave it that way - render_markdown (transcript.py) tells this
+            # case apart from a cut-short utterance by testing
+            # `latency.tts_ms == 0.0`, so attaching an asr/mt latency here
+            # for debugging, without also keeping tts_ms at 0.0, would
+            # silently reword every stalled utterance in the transcript as
+            # "cut short before the end" instead.
             #
             # `and handle.truncated` is redundant given the other two: every
             # playout-side close that leaves first_ms unset (the starvation

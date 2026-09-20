@@ -252,13 +252,16 @@ class Playout:
                 # oldest, so this is only ever reached when the open
                 # utterance is the queue's last entry.
                 #
-                # That holds VACUOUSLY today: pipeline.py's only caller uses
-                # submit(), which builds and closes an Utterance atomically
-                # under one lock, so no production path ever queues an open
-                # item at all. There is no begin()->finish() discipline yet
-                # to rely on - the streaming rewrite is what introduces one,
-                # and it has to keep that sequence serialized per direction
-                # for this guard to go on being reached only at the tail.
+                # That holds because DirectionPipeline._speak is the only
+                # production caller of begin()/append()/finish(), and it runs
+                # them from the one worker thread that serialises a
+                # direction's units - begin(), then one append() per
+                # synthesised chunk, then finish(), for one unit at a time -
+                # so at most one open Utterance exists per direction, and it
+                # is always the most recently queued one. submit() (used by
+                # tests, not by any production path) sidesteps the question
+                # entirely: it builds and closes an Utterance atomically
+                # under one lock, so it never queues an open item either.
                 #
                 # Nothing here enforces it. If it is ever broken, this fails
                 # in the safe direction - the cap under-trims and keeps audio
@@ -513,6 +516,20 @@ class Playout:
         thing pacing this loop and it would pin a CPU core until hangup. The
         fallback wait below is not belt-and-braces; it is the whole reason the
         `failed` flag is readable from here.
+
+        A sink that is alive but blocking - something stops draining the
+        deliberately-shrunk pipe pw-cat reads from - is the case the fallback
+        above does not reach: tick() sets the duck closed and then calls
+        self._sink.write(), which blocks with the duck already closed.
+        `_starved_ticks` is only incremented inside _advance_locked(), at the
+        top of the NEXT tick() - which cannot run until this write() call
+        returns - so the counter freezes and the starvation bound cannot
+        expire while this thread is parked here. Not new in kind: a blocking
+        write during ordinary speech already held the duck closed the same
+        way. But starvation adds another way to reach it, and this is the one
+        case the bound exists to close that it cannot. Bypass force-opens the
+        duck on every tick regardless (see tick()'s `suppressed` branch), so
+        there is a manual escape once the blocked write eventually returns.
 
         The try/finally is defense in depth: on_spoken/on_dropped are already
         isolated by _invoke, so in practice tick() should not raise, but if
