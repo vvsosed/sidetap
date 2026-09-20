@@ -832,3 +832,83 @@ def test_flushing_tells_the_producer_to_stop_synthesising():
 
     playout.set_suppressed(True)
     assert playout.append(item, b"\x01\x02" * 100) is False
+
+
+def test_on_dropped_runs_with_the_lock_released():
+    """_trim_locked used to invoke on_dropped itself, while holding
+    Playout._lock - so a callback that does real work (Session's transcript
+    write: json.dumps, a file write, a flush) ran with that lock held. If a
+    write ever blocked, tick() would stall waiting for the same lock, and
+    tick() sets the duck's state BEFORE writing to the sink - so the duck
+    would freeze wherever it last was, closed if speech was playing. That is
+    the unbounded stuck-closed failure CLAUDE.md calls silently cruel.
+
+    threading.Lock is not reentrant: if on_dropped still ran with the lock
+    held, re-acquiring that same lock from inside the callback - on this same
+    thread, which is already holding it - could never succeed, since nothing
+    else will ever release it. Bounded with a short timeout rather than a
+    bare acquire() so a regression times out and fails this one test instead
+    of hanging the whole suite.
+    """
+    results = []
+
+    def check_lock_is_free(item):
+        acquired = playout._lock.acquire(timeout=0.2)
+        if acquired:
+            playout._lock.release()
+        results.append(acquired)
+
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=5.0, on_dropped=check_lock_is_free
+    )
+    playout.submit(_translated(2.0, "first"))
+    playout.submit(_translated(2.0, "second"))
+    playout.submit(_translated(2.0, "third"))  # over the cap; drops "first"
+
+    assert results == [True]
+
+
+def test_the_reported_backlog_reflects_what_triggered_the_drop(caplog):
+    """_trim_locked used to read the backlog with self._backlog_locked()
+    AFTER popleft() had already removed the victim, so the number in a
+    "dropped an utterance" warning excluded the utterance it had just
+    dropped - a message whose entire point is explaining why something went,
+    printing a figure that no longer looks over the cap at all.
+
+    Concretely: cap 2.0s, two 2.0s utterances submitted back to back. The
+    drop happens because the backlog reached 4.0s; logging it after the pop
+    would report 2.0s instead - at the cap, not over it.
+    """
+    playout = Playout(Direction.IN, FakeAudioSink(), lag_cap_s=2.0)
+    with caplog.at_level("WARNING"):
+        playout.submit(_translated(2.0, "first"))
+        playout.submit(_translated(2.0, "second"))  # 4.0s total, over the 2.0s cap
+
+    behind = [r.getMessage() for r in caplog.records if "behind" in r.getMessage()]
+    assert behind == ["in playout 4.0s behind; dropped an utterance (1 total)"]
+
+
+def test_a_dropped_streamed_utterance_reports_exactly_the_pcm_that_had_arrived():
+    """Pins the deferred-snapshot guarantee for the streaming path this
+    branch added: _trim_locked() only ever pops from _queue, never from
+    _current, so a victim is out of the queue and marked dropped() before the
+    lock is released - and append() refuses to extend a dropped item's pcm -
+    so nothing can grow victim.pcm between the pop and the snapshot taken
+    after the lock is released. The reported audio must be exactly what had
+    arrived by drop time: not less (a snapshot taken too early) and not more
+    (one racing a producer that kept extending it).
+    """
+    dropped = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=2.0, on_dropped=dropped.append
+    )
+    victim = playout.begin(_unit(), "victim")
+    chunk = b"\x01\x02" * int(TTS_BYTES_PER_S * 1.5 / 2)  # 1.5s
+    playout.append(victim, chunk)
+    playout.finish(victim)  # closed, but alone in the queue: not yet trimmable
+
+    playout.submit(_translated(1.0, "second"))  # 2.5s total, over the 2.0s cap
+
+    assert [d.text for d in dropped] == ["victim"]
+    assert dropped[0].pcm == chunk
+    assert playout.backlog_s() == 1.0

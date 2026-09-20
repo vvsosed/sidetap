@@ -169,7 +169,8 @@ class Playout:
         item = Utterance(unit=unit, text=text)
         with self._lock:
             self._queue.append(item)
-            self._trim_locked()
+            victims = self._trim_locked()
+        self._report_dropped(victims)
         return item
 
     def append(self, item: Utterance, chunk: bytes) -> bool:
@@ -186,8 +187,10 @@ class Playout:
             if item.dropped or item.closed:
                 return False
             item.pcm.extend(chunk)
-            self._trim_locked()
-            return not item.dropped
+            victims = self._trim_locked()
+            accepted = not item.dropped
+        self._report_dropped(victims)
+        return accepted
 
     def finish(self, item: Utterance, *, truncated: bool = False) -> None:
         """No more audio is coming."""
@@ -223,7 +226,8 @@ class Playout:
         )
         with self._lock:
             self._queue.append(utterance)
-            self._trim_locked()
+            victims = self._trim_locked()
+        self._report_dropped(victims)
 
     def backlog_s(self) -> float:
         with self._lock:
@@ -256,7 +260,18 @@ class Playout:
             self._starved_ticks = 0
             return count
 
-    def _trim_locked(self) -> None:
+    def _trim_locked(self) -> list[tuple[Utterance, float, int]]:
+        """Drop the oldest utterances until the backlog fits the cap.
+
+        Returns (victim, backlog_at_drop, running_total) for the caller to
+        report once it has released the lock - nothing is reported from here.
+        on_dropped writes the transcript, and a write that blocks would stall
+        tick(), which sets the duck before writing to the sink; the duck would
+        then freeze wherever it was, closed if speech was playing. That is the
+        one unbounded stuck-closed path this module exists to avoid, and
+        Playout.run()'s finally cannot clear it because the thread is blocked
+        rather than dying.
+        """
         # A single item longer than the cap is kept: dropping it would make a
         # long sentence unsayable at any cap setting. That rule is about the
         # queue's sole survivor, not about _current - if something is already
@@ -265,6 +280,7 @@ class Playout:
         # len(self._queue) misses exactly the ordinary shape of a monologue
         # (one utterance playing, the next queued), where the cap would
         # otherwise never act.
+        victims: list[tuple[Utterance, float, int]] = []
         while (
             self._queue
             and (len(self._queue) > 1 or self._current is not None)
@@ -293,15 +309,24 @@ class Playout:
                 # closed - but the backlog then sits over cap with nothing
                 # saying why. Break rather than spin on an undroppable head.
                 break
+            # Captured before popleft(): the backlog that made this victim a
+            # victim, not the smaller figure left once it is already gone.
+            backlog_at_drop = self._backlog_locked()
             victim = self._queue.popleft()
             self.dropped += 1
+            victim.dropped = True
+            victims.append((victim, backlog_at_drop, self.dropped))
+        return victims
+
+    def _report_dropped(self, victims: list[tuple[Utterance, float, int]]) -> None:
+        """Log and report drops with no lock held. See _trim_locked."""
+        for victim, backlog_at_drop, total in victims:
             log.warning(
                 "%s playout %.1fs behind; dropped an utterance (%d total)",
                 self.direction.value,
-                self._backlog_locked(),
-                self.dropped,
+                backlog_at_drop,
+                total,
             )
-            victim.dropped = True
             self._invoke(self._on_dropped, victim.snapshot())
 
     def _invoke(
@@ -315,9 +340,10 @@ class Playout:
         the ordinary case finishes mid-chunk and is reported from the speech
         path, but one that is closed exactly on a chunk boundary, or that
         never produced any audio, retires from the silence path instead.
-        `on_dropped` fires from _trim_locked(), under the lock, wherever that
-        runs - begin(), append() or submit(), not only submit() as before
-        streaming. Either one raising - a transcript write hitting a full
+        `on_dropped` fires from _report_dropped(), after the lock _trim_locked()
+        ran under has already been released - called from begin(), append()
+        or submit(), not only submit() as before streaming. Either one
+        raising - a transcript write hitting a full
         disk, say (Task 25) - must not propagate: out of tick() it would
         kill the playout thread with the duck stuck closed, which is exactly
         the fail-safe this module exists to provide, inverted into silence;
