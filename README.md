@@ -144,6 +144,12 @@ your raw voice at all. Concretely —
   (via a loopback node sidetap owns, `wpctl set-volume`d to 0) and you hear
   only the translation. In the gaps between utterances their original plays
   normally.
+- **If synthesis stalls mid-sentence you hear nothing from anyone** until it
+  resumes, for at most two seconds. The duck stays shut across the gap
+  deliberately: letting the original back in for a moment mid-sentence is
+  more jarring than a short silence. Past two seconds sidetap gives the
+  sentence up and their voice returns, because a duck that stays shut leaves
+  you talking to someone who cannot hear you.
 - Your voice is recognised, translated and synthesised, and *only* the
   synthesised result reaches the messenger, through the virtual microphone.
   Your real microphone is never linked into the call outside of bypass.
@@ -185,9 +191,10 @@ suppressed, and unmuting does not play back what accumulated while muted, for
 the same reason.
 
 `f` (drop backlog) clears every queued-but-not-yet-started utterance on both
-directions. **It cannot cut the current sentence short.** Experiment 2
-measured 441 ms of audio still sitting in `pw-cat`'s own buffer at the moment
-the hotkey fires — that audio is already past this process's control and
+directions, **and cuts the one in progress short too**. What you still hear
+is the audio already past this process's control: experiment 2 measured
+441 ms of it sitting in `pw-cat`'s own buffer at the moment the hotkey fires,
+and that audio is already past this process's control and
 plays out regardless. `f` prevents the *next* sentence, not the one in
 progress; expect a short tail after pressing it.
 

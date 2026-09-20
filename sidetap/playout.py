@@ -29,10 +29,20 @@ SILENCE_CHUNK = b"\x00" * CHUNK_BYTES
 # ~30 ms and doubles the margin available to absorb a network stall.
 START_BUFFER_S = 0.4
 
-# Consecutive starved ticks before an in-progress utterance is abandoned.
-# 100 ticks x 20 ms = 2 s. Synthesis delivers 4.7-7.1x faster than playback,
-# so 2 s of nothing means the producer is gone, not slow. Counted in ticks
-# rather than seconds so playout needs no clock and the test is deterministic.
+# Consecutive starved ticks before an utterance is given up on.
+# 100 ticks x 20 ms = 2 s. Counted in ticks rather than seconds so playout
+# needs no clock and the test is deterministic.
+#
+# The 2 s is justified differently for the two cases that share it. For an
+# utterance already playing, the yardstick is steady-state throughput -
+# synthesis delivers 4.7-7.1x faster than playback, so 2 s of nothing means
+# the producer is gone rather than slow - and the cost of waiting is a duck
+# held shut. For a queued head that never started, the yardstick is
+# time-to-FIRST-chunk, measured at 182-337 ms warm and 543 ms cold, and the
+# cost of giving up is the whole sentence: a first chunk slower than 2 s
+# loses it outright, where before streaming it would merely have been late.
+# One constant covers both because 2 s is generous against either
+# distribution, not because the same argument applies twice.
 STARVE_LIMIT_TICKS = 100
 
 
@@ -97,9 +107,17 @@ class Utterance:
     on_dropped fires the audio is complete, so the immutable type is still
     honest there.
 
-    The producer (the translate-and-synthesise worker) holds this only as an
-    opaque handle to pass back into append()/finish() - it must not read or
-    write these fields itself. Only Playout, under its lock, may do that.
+    The producer holds this as a handle to pass back into append()/finish(),
+    and writes nothing on it. It may READ two fields, and only after finish()
+    has returned:
+
+    - `truncated`, which is safe because finish() sets closed=True and neither
+      starvation branch can fire on a closed utterance, so no writer remains;
+      finish()'s own lock release is the barrier.
+    - `dropped`, which is NOT synchronised - flush() can set it from the TUI
+      thread at any moment. The race is deliberate and benign: the window is
+      one tick and the audio is gone either way, so a reader that loses it
+      merely reports the utterance as truncated rather than dropped.
     """
 
     unit: Unit

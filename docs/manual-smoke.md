@@ -32,6 +32,13 @@ trusting a change to capture, routing, playout or the duck.
       silent for its **entire** length - no burst of it between synthesis
       chunks. `FakeAudioSink` never stalls, so this is the one regression the
       automated suite structurally cannot catch.
+- [ ] Kill the network **in the middle of a long translated sentence**, not
+      between them. Confirm you hear nothing at all briefly - that is the duck
+      holding shut across the gap - and then their raw voice returns within
+      about two seconds. Silence that does NOT end is the failure this whole
+      module exists to prevent: it leaves the other party talking to someone
+      who cannot hear them. Nothing in the automated suite can reach this,
+      because no fake sink stalls.
 - [ ] Kill the recogniser's network (disable wifi for 20 s). Confirm you start
       hearing their raw voice rather than silence. This is the IN direction's
       fail-safe and it must not regress.
@@ -82,9 +89,10 @@ underrun is audible where the old 1.3 s buffer was merely slow.
 - [ ] Listen for crackling or dropouts across a full call. Measured stable at
       16 KiB here, but that was one machine.
 - [ ] Press the drop-backlog hotkey mid-utterance. Confirm the current sentence
-      **finishes** rather than cutting off: experiment 2 measured 441 ms of
-      audio already past `pw-cat` that cannot be recalled. The hotkey prevents
-      the next sentence, it does not truncate this one.
+      **stops** within about half a second rather than playing to its end:
+      flush() clears the in-progress utterance as well as the queue, and what
+      you still hear is the 441 ms experiment 2 measured already sitting
+      inside pw-cat, which cannot be recalled.
 
 ## Lag and drops
 
