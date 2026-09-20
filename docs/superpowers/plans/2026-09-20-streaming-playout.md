@@ -1360,6 +1360,39 @@ In the **Non-obvious mechanics** section, add this bullet after the
   it is always the newest thing queued.
 ```
 
+- [ ] **Step 1b: Correct `README.md`'s transcript paragraph**
+
+`README.md` still quotes a string the code no longer produces, and describes
+a narrower situation than now exists:
+
+```
+utterances the lag cap dropped are written too, marked
+`_(not spoken: backlog dropped)_` in the Markdown rather than silently
+missing.
+```
+
+Three markers exist now, and three different things produce a row for an
+utterance the listener did not fully hear. Replace with:
+
+```
+an utterance the listener did not fully hear is written too rather than
+silently missing, marked in the Markdown with why: `_(not spoken)_` when the
+lag cap or bypass discarded it, `_(not spoken: synthesis stalled)_` when the
+producer went quiet before a single chunk was played, and `_(cut short
+before the end)_` when it was playing and stopped.
+```
+
+- [ ] **Step 1c: Cross-reference the latency coupling in `pipeline.py`**
+
+`render_markdown` now picks between "stalled" and "cut short" by testing
+`latency.tts_ms == 0.0`, so the starvation row's *absence* of a latency is
+load-bearing. `pipeline.py` says only "No latency: there is nothing to report
+a wait for" — true, but it does not warn that attaching an asr/mt latency for
+debugging would silently reword every stalled utterance. Add that clause.
+Both ends are mutation-covered, so this is documentation, not a fix — but on
+a branch that needed five comment-versus-code corrections it is cheap
+insurance against a sixth.
+
 - [ ] **Step 2b: Note the blocking-sink caveat in `run()`**
 
 Task 3's review found a path worth documenting rather than fixing here. If the
