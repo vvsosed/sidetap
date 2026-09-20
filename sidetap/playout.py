@@ -313,10 +313,11 @@ class Playout:
 
         A head held here, still open, whose producer dies before it clears
         the threshold blocks itself and everything queued behind it for the
-        rest of the call - nothing here bounds that wait, unlike a stalled
-        _current, which the starvation counter in _advance_locked already
-        covers. Task 3 extends that same bound to this un-started head;
-        until then this is simply "not yet".
+        rest of the call. Nothing bounds that wait yet. Neither does
+        anything bound a stalled _current - _starved_ticks and
+        STARVE_LIMIT_TICKS exist but are never incremented or compared, see
+        the "not yet" comment in _advance_locked. Task 3 has to bound BOTH:
+        the stalled _current and this un-started head.
         """
         return item.closed or item.audio_s >= START_BUFFER_S
 
