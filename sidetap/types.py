@@ -135,11 +135,10 @@ class Latency:
     # playout starts on the first chunk instead of waiting for the whole
     # utterance, what the listener waited for is tts_ms, and adding the rest
     # back would make the TUI overstate felt latency by exactly what
-    # streaming saves. Nothing populates this yet - _speak still joins the
-    # whole generator before playout sees any of it, and reports that entire
-    # wait as tts_ms - so today it holds its 0.0 default in every record.
-    # Kept because full synthesis time is still the throughput and cost
-    # signal once tts_ms stops carrying it.
+    # streaming saves. _speak populates both: tts_ms when the first chunk is
+    # handed to playout, this when the generator is exhausted. Kept because
+    # full synthesis time is still the throughput and cost signal, which
+    # tts_ms no longer carries.
     tts_total_ms: float = 0.0
 
     @property
