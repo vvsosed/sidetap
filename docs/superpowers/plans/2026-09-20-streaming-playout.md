@@ -1039,6 +1039,17 @@ MSG
 
 This is the task that actually delivers the latency win.
 
+**Note on truncation, from Task 3's review.** There are two independent ways
+an utterance ends early, and only one of them is visible from inside `_speak`:
+synthesis failing (producer side), and playout abandoning the utterance at the
+starvation bound (consumer side). An earlier draft of this step returned
+immediately when `append()` was refused, which emitted **no transcript row at
+all** for a sentence the listener had already partly heard, and charged
+nothing for a request that was billed. It also read a local `truncated`
+variable that could not see playout's decision. The code below breaks out of
+the loop instead and takes `handle.truncated` as the single source of truth
+after `finish()`.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_pipeline.py`:
@@ -1153,17 +1164,17 @@ guard) to the end of the method with:
                     first_ms = round((self._clock.monotonic() - started) * 1000, 1)
                 if not self._playout.append(handle, chunk):
                     # Playout will not take any more: either bypass flushed
-                    # the queue, or the utterance was already closed. Either
-                    # way, stop paying for audio nobody will hear, and end the
-                    # gRPC stream rather than leave it to garbage collection.
-                    # The Synthesizer port is typed as an Iterator, which need
-                    # not have close(), so this is a capability check and not
-                    # an assumption.
+                    # the queue, or playout gave the utterance up at the
+                    # starvation bound. Either way, stop paying for audio
+                    # nobody will hear, and end the gRPC stream rather than
+                    # leave it to garbage collection. The Synthesizer port is
+                    # typed as an Iterator, which need not have close(), so
+                    # this is a capability check and not an assumption.
                     closer = getattr(chunks, "close", None)
                     if closer is not None:
                         closer()
-                    self._playout.finish(handle, truncated=True)
-                    return
+                    truncated = True
+                    break
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)
             self._metrics.set_health(direction, tts=Health.FAILED)
@@ -1172,6 +1183,20 @@ guard) to the end of the method with:
             self._metrics.set_health(direction, tts=Health.OK)
 
         self._playout.finish(handle, truncated=truncated)
+
+        # After finish(), the handle is the single source of truth. Playout
+        # sets truncated itself when it abandons an utterance at the
+        # starvation bound, and finish() ORs rather than overwrites, so this
+        # picks up a cut-off the producer never saw. Reading the local
+        # variable instead would silently report a sentence the listener
+        # heard cut in half as a clean completion.
+        truncated = handle.truncated
+
+        if handle.dropped:
+            # Bypass threw the queue away. The parties are talking to each
+            # other unmediated, so a transcript row for a translation nobody
+            # is listening to would misrepresent the call.
+            return
 
         if first_ms is None:
             # Failed before producing anything, or produced nothing at all.
@@ -1315,6 +1340,20 @@ In the **Non-obvious mechanics** section, add this bullet after the
   drops an utterance that is still arriving, since its duration is unknown and
   it is always the newest thing queued.
 ```
+
+- [ ] **Step 2b: Note the blocking-sink caveat in `run()`**
+
+Task 3's review found a path worth documenting rather than fixing here. If the
+sink is alive but blocking — `pw-cat` stops draining the deliberately-shrunk
+pipe — `tick()` blocks *inside* `self._sink.write()` **after** the duck has
+been set closed, so `_starved_ticks` freezes and the duck stays closed for as
+long as the write blocks. This is not new in kind (a blocking write during
+ordinary speech already held the duck closed), but starvation adds another way
+to reach it, and the starvation bound cannot expire while the thread is parked
+in `write()`. Bypass force-opens the ducks, so there is a manual escape.
+
+Add a paragraph saying so to `Playout.run`'s docstring, beside the existing
+explanation of why a dead sink needs the `stop.wait` fallback.
 
 - [ ] **Step 3: Verify nothing else still describes the old behaviour**
 
