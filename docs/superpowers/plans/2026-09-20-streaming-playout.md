@@ -373,9 +373,13 @@ to name `_offset` instead:
 - [ ] **Step 4: Run the tests**
 
 Run: `uv run pytest tests/test_playout.py -q`
-Expected: PASS, all three new tests included. None of them depends on the
-400 ms start threshold Task 2 adds — they assert only that audio can be
-consumed from an utterance that is still growing.
+Expected: PASS, all three new tests included. As written here none of them
+depends on the 400 ms start threshold Task 2 adds — they assert only that
+audio can be consumed from an utterance that is still growing. (This stopped
+being true once Task 1's code-quality review rewrote
+`test_on_spoken_fires_once_when_a_streamed_utterance_drains` to cover
+silence-branch retirement, which needs an utterance playing *while open*.
+See Task 2's Step 4.)
 
 Then run the whole suite: `uv run pytest -q`
 Expected: PASS, same count as before plus the new tests.
@@ -492,6 +496,16 @@ Expected: PASS.
 Run: `uv run pytest -q`
 Expected: PASS. Existing `submit()` tests are unaffected because `submit()`
 closes the utterance, and closed utterances are startable at any size.
+
+**One test does need changing, and it is not a regression.**
+`test_on_spoken_fires_once_when_a_streamed_utterance_drains` was rewritten
+during Task 1's review to cover retirement from the *silence* branch, which
+can only be reached by an utterance that is playing while still open. It
+appends 40 ms, which no longer starts. Keep its intent and give it audio that
+clears the threshold: 0.42 s (exactly 21 chunks), tick 21 times asserting
+`True`, assert nothing has retired yet, then `finish()` and one more tick
+that retires it from the silence branch. Say so explicitly in the commit
+message rather than folding it in.
 
 - [ ] **Step 5: Commit**
 
