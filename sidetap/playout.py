@@ -11,16 +11,29 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .ports import AudioSink, VolumeControl
-from .types import LAG_CAP_S, TTS_BYTES_PER_S, TTS_RATE, Direction, Translated
+from .types import LAG_CAP_S, TTS_BYTES_PER_S, TTS_RATE, Direction, Translated, Unit
 
 log = logging.getLogger(__name__)
 
 CHUNK_MS = 20
 CHUNK_BYTES = TTS_BYTES_PER_S * CHUNK_MS // 1000
 SILENCE_CHUNK = b"\x00" * CHUNK_BYTES
+
+# An utterance does not start playing until it holds this much audio, or is
+# closed. Measured (docs/experiments/04-tts-streaming.md): the first chunk is
+# always 200 ms and the second lands ~30 ms later, so waiting for 400 ms costs
+# ~30 ms and doubles the margin available to absorb a network stall.
+START_BUFFER_S = 0.4
+
+# Consecutive starved ticks before an in-progress utterance is abandoned.
+# 100 ticks x 20 ms = 2 s. Synthesis delivers 4.7-7.1x faster than playback,
+# so 2 s of nothing means the producer is gone, not slow. Counted in ticks
+# rather than seconds so playout needs no clock and the test is deterministic.
+STARVE_LIMIT_TICKS = 100
 
 
 class DuckControl:
@@ -75,6 +88,31 @@ class DuckControl:
         return not self._closed
 
 
+@dataclass
+class Utterance:
+    """One sentence, possibly still being synthesised.
+
+    Mutated only under Playout._lock, like every other piece of Playout's
+    state. `Translated` stays the callback currency: by the time on_spoken or
+    on_dropped fires the audio is complete, so the immutable type is still
+    honest there.
+    """
+
+    unit: Unit
+    text: str
+    pcm: bytearray = field(default_factory=bytearray)
+    closed: bool = False      # synthesis finished, or failed
+    dropped: bool = False     # flushed; the producer must stop synthesising
+    truncated: bool = False   # closed by a failure, not by completion
+
+    @property
+    def audio_s(self) -> float:
+        return len(self.pcm) / TTS_BYTES_PER_S
+
+    def snapshot(self) -> Translated:
+        return Translated(unit=self.unit, text=self.text, pcm=bytes(self.pcm))
+
+
 class Playout:
     def __init__(
         self,
@@ -95,18 +133,52 @@ class Playout:
         self._on_spoken = on_spoken
         self._on_dropped = on_dropped
         self._lock = threading.Lock()
-        self._queue: deque[Translated] = deque()
-        self._current: Translated | None = None
-        self._pending = b""
+        self._queue: deque[Utterance] = deque()
+        self._current: Utterance | None = None
+        self._offset = 0
+        self._starved_ticks = 0
 
     @property
     def duck(self) -> DuckControl | None:
         return self._duck
 
-    def submit(self, item: Translated) -> None:
+    def begin(self, unit: Unit, text: str) -> Utterance:
+        """Queue an utterance that has not been synthesised yet."""
+        item = Utterance(unit=unit, text=text)
         with self._lock:
             self._queue.append(item)
             self._trim_locked()
+        return item
+
+    def append(self, item: Utterance, chunk: bytes) -> bool:
+        """Add synthesised audio. False means stop synthesising: the utterance
+        was flushed (bypass), and the rest of it will never be heard."""
+        with self._lock:
+            if item.dropped:
+                return False
+            item.pcm.extend(chunk)
+            self._trim_locked()
+            return not item.dropped
+
+    def finish(self, item: Utterance, *, truncated: bool = False) -> None:
+        """No more audio is coming."""
+        with self._lock:
+            item.closed = True
+            item.truncated = truncated
+            if truncated and not item.pcm and item is not self._current:
+                # Synthesis failed before producing anything. Unqueue it
+                # rather than leave an empty entry for tick() to step over.
+                try:
+                    self._queue.remove(item)
+                except ValueError:
+                    pass
+
+    def submit(self, item: Translated) -> None:
+        """A complete utterance is the degenerate streaming case."""
+        handle = self.begin(item.unit, item.text)
+        if item.pcm:
+            self.append(handle, item.pcm)
+        self.finish(handle)
 
     def backlog_s(self) -> float:
         with self._lock:
@@ -118,8 +190,8 @@ class Playout:
 
         The 20 ms chunk already passed to sink.write() cannot be recalled -
         pw-cat has it, and by the time flush() runs it is no longer part of
-        this object's state at all (self._pending has already been advanced
-        past it). Everything still inside Playout - the queue, and whatever
+        this object's state at all (self._offset has already moved past it).
+        Everything still inside Playout - the queue, and whatever
         of the in-progress item has not yet reached the sink - has NOT been
         handed off and is dropped here. Only whole, not-yet-started items are
         counted as dropped: the in-progress item is cut short, not "dropped",
@@ -129,9 +201,14 @@ class Playout:
         """
         with self._lock:
             count = len(self._queue)
+            for item in self._queue:
+                item.dropped = True
             self._queue.clear()
+            if self._current is not None:
+                self._current.dropped = True
             self._current = None
-            self._pending = b""
+            self._offset = 0
+            self._starved_ticks = 0
             return count
 
     def _trim_locked(self) -> None:
@@ -156,7 +233,8 @@ class Playout:
                 self._backlog_locked(),
                 self.dropped,
             )
-            self._invoke(self._on_dropped, victim)
+            victim.dropped = True
+            self._invoke(self._on_dropped, victim.snapshot())
 
     def _invoke(
         self, callback: Callable[[Translated], None] | None, item: Translated
@@ -180,7 +258,10 @@ class Playout:
             log.exception("playout callback raised; continuing")
 
     def _backlog_locked(self) -> float:
-        return sum(i.audio_s for i in self._queue) + len(self._pending) / TTS_BYTES_PER_S
+        unread = 0
+        if self._current is not None:
+            unread = len(self._current.pcm) - self._offset
+        return (unread + sum(len(i.pcm) for i in self._queue)) / TTS_BYTES_PER_S
 
     def set_suppressed(self, value: bool) -> None:
         """Entering bypass throws the queue away.
@@ -194,7 +275,8 @@ class Playout:
 
         The flag is set before the flush so a tick already in flight returns
         early rather than pulling a fresh item; the 20 ms chunk it may already
-        have written is gone, for the reason flush() documents.
+        have written is gone, since the reader position (self._offset) has
+        already moved past it, for the reason flush() documents.
         """
         self.suppressed = value
         if value:
@@ -213,25 +295,41 @@ class Playout:
 
         finished: Translated | None = None
         with self._lock:
-            if not self._pending and self._queue:
+            if self._current is None and self._queue:
                 self._current = self._queue.popleft()
-                self._pending = self._current.pcm
+                self._offset = 0
 
-            if self._pending:
-                chunk = self._pending[:CHUNK_BYTES]
-                self._pending = self._pending[CHUNK_BYTES:]
-                if not self._pending:
-                    finished = self._current
+            chunk = None
+            if self._current is not None:
+                unread = len(self._current.pcm) - self._offset
+                if unread > 0:
+                    chunk = bytes(
+                        self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
+                    )
+                    self._offset += len(chunk)
+                    if self._current.closed and self._offset >= len(self._current.pcm):
+                        finished = self._current.snapshot()
+                        self._current = None
+                        self._offset = 0
+                    if len(chunk) < CHUNK_BYTES:
+                        chunk = chunk + b"\x00" * (CHUNK_BYTES - len(chunk))
+                    self._starved_ticks = 0
+                elif self._current.closed:
+                    # Closed after its final byte had already been written, or
+                    # it never produced any audio at all. Only the first case
+                    # was spoken, so only it gets on_spoken.
+                    if self._offset > 0:
+                        finished = self._current.snapshot()
                     self._current = None
-                if len(chunk) < CHUNK_BYTES:
-                    chunk = chunk + b"\x00" * (CHUNK_BYTES - len(chunk))
-            else:
-                chunk = None
+                    self._offset = 0
+                    self._starved_ticks = 0
 
         if chunk is None:
             if self._duck is not None:
                 self._duck.open()
             self._sink.write(SILENCE_CHUNK)
+            if finished is not None:
+                self._invoke(self._on_spoken, finished)
             return False
 
         if self._duck is not None:

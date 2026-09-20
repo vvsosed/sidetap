@@ -1,3 +1,5 @@
+import pytest
+
 from sidetap.playout import CHUNK_MS, DuckControl, Playout
 from sidetap.types import TTS_BYTES_PER_S, Direction, Translated, Unit
 from tests.conftest import FakeAudioSink, FakeVolumeControl
@@ -310,3 +312,52 @@ def test_a_plain_integer_object_id_still_works():
     duck = DuckControl(volume, 42)
     duck.close()
     assert volume.calls == [(42, 0.0)]
+
+
+def _unit(text: str = "hi", seconds: float = 1.0) -> Unit:
+    return Unit(direction=Direction.IN, text=text, t_start=0.0, t_end=seconds)
+
+
+def test_an_utterance_can_be_played_while_it_is_still_arriving():
+    sink = FakeAudioSink()
+    playout = Playout(Direction.IN, sink)
+    item = playout.begin(_unit(), "hi")
+
+    # Nothing to play yet: the utterance is queued but empty.
+    assert playout.tick() is False
+
+    # 400 ms of audio arrives, which clears the start threshold.
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    assert playout.tick() is True
+
+    # More arrives while the first part is still playing.
+    playout.append(item, b"\x03\x04" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    playout.finish(item)
+    spoken = sum(1 for _ in range(60) if playout.tick())
+    assert spoken == 39  # 800 ms total, minus the one chunk already written
+
+
+def test_backlog_counts_only_bytes_that_have_arrived():
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    assert playout.backlog_s() == 0.0
+
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.5 / 2))
+    assert playout.backlog_s() == pytest.approx(0.5)
+
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.5 / 2))
+    assert playout.backlog_s() == pytest.approx(1.0)
+
+
+def test_on_spoken_fires_once_when_a_streamed_utterance_drains():
+    spoken = []
+    playout = Playout(Direction.IN, FakeAudioSink(), on_spoken=spoken.append)
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.04 / 2))
+    playout.finish(item)
+
+    for _ in range(5):
+        playout.tick()
+    assert len(spoken) == 1
+    assert spoken[0].text == "hi"
+    assert spoken[0].audio_s == pytest.approx(0.04)
