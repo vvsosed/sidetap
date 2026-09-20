@@ -23,7 +23,6 @@ from .types import (
     Direction,
     Latency,
     Record,
-    Translated,
     Unit,
 )
 
@@ -153,31 +152,91 @@ class DirectionPipeline:
             return
 
         started = self._clock.monotonic()
+        handle = self._playout.begin(unit, target_text)
+        chunks = self._synthesizer.synthesize(
+            target_text, self._config.voice, self._config.speaking_rate
+        )
+        first_ms: float | None = None
+        truncated = False
+        refused = False
         try:
-            pcm = b"".join(
-                self._synthesizer.synthesize(
-                    target_text, self._config.voice, self._config.speaking_rate
-                )
-            )
-            self._metrics.set_health(direction, tts=Health.OK)
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                if first_ms is None:
+                    first_ms = round((self._clock.monotonic() - started) * 1000, 1)
+                if not self._playout.append(handle, chunk):
+                    # Playout will not take any more: either bypass flushed
+                    # the queue, or playout gave the utterance up at the
+                    # starvation bound. Either way, stop paying for audio
+                    # nobody will hear, and end the gRPC stream rather than
+                    # leave it to garbage collection. The Synthesizer port is
+                    # typed as an Iterator, which need not have close(), so
+                    # this is a capability check and not an assumption.
+                    closer = getattr(chunks, "close", None)
+                    if closer is not None:
+                        closer()
+                    refused = True
+                    break
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)
             self._metrics.set_health(direction, tts=Health.FAILED)
+            truncated = True
+        else:
+            if not refused:
+                # Only a generator that ran to completion says TTS is well.
+                # Reaching here after a refusal means playout gave up on this
+                # utterance at the starvation bound, or bypass threw it away -
+                # neither is evidence of health, and painting the TUI green
+                # right after a stall cost the listener half a sentence is the
+                # opposite of what that indicator is for.
+                self._metrics.set_health(direction, tts=Health.OK)
+
+        self._playout.finish(handle, truncated=truncated)
+
+        # After finish(), the handle is the single source of truth. Playout
+        # sets truncated itself when it abandons an utterance at the
+        # starvation bound, and finish() ORs rather than overwrites, so this
+        # picks up a cut-off the producer never saw. Reading the local
+        # variable instead would silently report a sentence the listener
+        # heard cut in half as a clean completion.
+        truncated = handle.truncated
+
+        if handle.dropped:
+            # Bypass threw the queue away. The parties are talking to each
+            # other unmediated, so a transcript row for a translation nobody
+            # is listening to would misrepresent the call.
             return
-        tts_ms = round((self._clock.monotonic() - started) * 1000, 1)
+
+        if first_ms is None:
+            # Failed before producing anything, or produced nothing at all.
+            # Byte-for-byte the pre-streaming behaviour: nothing queued, no
+            # record, no cost.
+            return
+
+        tts_total_ms = round((self._clock.monotonic() - started) * 1000, 1)
+        # Charged even when truncated: the request went out and produced
+        # audio, and the listener heard it.
         self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
-        latency = Latency(asr_ms=asr_ms, mt_ms=mt_ms, tts_ms=tts_ms)
+        latency = Latency(
+            asr_ms=asr_ms, mt_ms=mt_ms, tts_ms=first_ms, tts_total_ms=tts_total_ms
+        )
         self._metrics.set_final(direction, unit.text, target_text, latency)
-
-        self._playout.submit(Translated(unit=unit, text=target_text, pcm=pcm))
         self._metrics.set_queue_s(direction, self._playout.backlog_s())
         if self._dead_air is not None:
             self._dead_air.spoke()
             self._metrics.set_dead_air(direction, False)
 
         if self._on_record is not None:
-            self._on_record(Record(unit=unit, target_text=target_text, latency=latency))
+            self._on_record(
+                Record(
+                    unit=unit,
+                    target_text=target_text,
+                    latency=latency,
+                    truncated=truncated,
+                )
+            )
 
     def consume(self, results_q: queue_module.Queue, stop: threading.Event) -> None:
         """Drain `results_q` until it is empty AND `stop` is set.

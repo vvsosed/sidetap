@@ -273,3 +273,80 @@ def test_a_failed_translation_bills_nothing():
     )
     pipeline.handle(_final("привет"))
     assert metrics.snapshot().cost_usd == 0.0
+
+
+# --- streaming synthesis ------------------------------------------------
+
+
+def test_audio_reaches_playout_before_synthesis_finishes():
+    seen = []
+
+    class SlowSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 8000
+            seen.append(playout.backlog_s())   # first chunk already queued
+            yield b"\x03\x04" * 8000
+
+    playout = Playout(Direction.IN, FakeAudioSink())
+    pipeline = _pipeline(synthesizer=SlowSynthesizer(), playout=playout)
+    pipeline.handle(_final(t_end=1.0))
+
+    assert seen and seen[0] > 0.0
+
+
+def test_tts_latency_is_time_to_the_first_chunk_not_the_whole_synthesis():
+    clock = FakeClock(start=10.0)
+
+    class TickingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            clock.advance(0.2)          # time to first chunk
+            yield b"\x01\x02" * 8000
+            clock.advance(2.0)          # the rest of the synthesis
+            yield b"\x03\x04" * 8000
+
+    metrics = Metrics()
+    pipeline = _pipeline(
+        synthesizer=TickingSynthesizer(), metrics=metrics, clock=clock
+    )
+    pipeline.handle(_final(t_end=1.0))
+
+    latency = metrics.snapshot().directions[Direction.IN].latency
+    assert latency.tts_ms == 200.0
+    assert latency.tts_total_ms == 2200.0
+
+
+def test_a_synthesis_failure_part_way_through_keeps_what_was_spoken():
+    records = []
+
+    class FailingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 8000
+            raise RuntimeError("stream died")
+
+    playout = Playout(Direction.IN, FakeAudioSink())
+    pipeline = _pipeline(
+        synthesizer=FailingSynthesizer(), playout=playout, on_record=records.append
+    )
+    pipeline.handle(_final(t_end=1.0))
+
+    assert playout.backlog_s() > 0.0        # the first chunk is still spoken
+    assert len(records) == 1
+    assert records[0].truncated is True
+
+
+def test_a_synthesis_failure_before_any_audio_records_nothing():
+    records = []
+
+    class FailingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            raise RuntimeError("stream died")
+            yield b""                        # pragma: no cover - generator marker
+
+    playout = Playout(Direction.IN, FakeAudioSink())
+    pipeline = _pipeline(
+        synthesizer=FailingSynthesizer(), playout=playout, on_record=records.append
+    )
+    pipeline.handle(_final(t_end=1.0))
+
+    assert playout.backlog_s() == 0.0
+    assert records == []
