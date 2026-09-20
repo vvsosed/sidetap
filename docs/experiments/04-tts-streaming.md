@@ -102,3 +102,47 @@ outruns consumption from that point on and the margin only grows.
    utterance and self-corrects within about a second. `tts.py`'s docstring
    claim that early playout forces an estimated backlog is wrong, and is
    corrected as part of that work.
+
+---
+
+## Addendum, 2026-09-20 — the win, measured through the real pipeline
+
+The table at the top of this file compares time-to-first-chunk against full
+synthesis wall time **at the API**. That is the size of the prize, not the
+size of the win: it does not account for the 400 ms start threshold playout
+waits out, nor for anything else `_speak` does between receiving a chunk and
+handing it over. This addendum measures what the pipeline actually delivers,
+so the branch's headline figure has a record that can be reproduced rather
+than only an argument.
+
+**Method.** Drive the real `DirectionPipeline` and the real `Playout` with a
+synthesizer shaped to this experiment's own measurements — first chunk 200 ms
+of audio arriving at 200 ms, every later chunk 240 ms arriving 30 ms apart —
+on a `FakeClock`, so the numbers are exact rather than sampled. Read
+`Latency.tts_ms` (the wait until playout accepted a chunk, i.e. when the
+listener hears the sentence begin) against `Latency.tts_total_ms` (the wait
+the listener would have had before streaming, when `_speak` joined the whole
+generator first).
+
+**Result.**
+
+| utterance | heard at | full synthesis | saved |
+|---|---|---|---|
+| short, 2.2 s | 200 ms | 470 ms | **270 ms** |
+| medium, 6.9 s | 200 ms | 1040 ms | **840 ms** |
+| long, 16.6 s | 200 ms | 2270 ms | **2070 ms** |
+
+**Consequence.**
+
+1. The delivered win matches the prize at the API almost exactly (270/840/2070
+   against 271/844/2109). The start threshold's ~30 ms is real but is absorbed
+   into the first chunk's own 200 ms, because chunk 2 lands 30 ms after chunk
+   1 and the threshold clears on it.
+2. **The listener hears every sentence at 200 ms regardless of its length.**
+   That is the part worth remembering: before streaming, the wait grew with
+   the sentence, so the longest sentences — the ones carrying the most — were
+   the ones that arrived latest.
+3. This is a simulation of measured timing, not a live call. It pins what the
+   pipeline does with a known input; it does not capture jitter, and the two
+   constants it exercises (`START_BUFFER_S`, `STARVE_LIMIT_TICKS`) have still
+   never been tested against a real conversation. See `docs/manual-smoke.md`.
