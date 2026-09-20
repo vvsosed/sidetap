@@ -96,6 +96,10 @@ class Utterance:
     state. `Translated` stays the callback currency: by the time on_spoken or
     on_dropped fires the audio is complete, so the immutable type is still
     honest there.
+
+    The producer (the translate-and-synthesise worker) holds this only as an
+    opaque handle to pass back into append()/finish() - it must not read or
+    write these fields itself. Only Playout, under its lock, may do that.
     """
 
     unit: Unit
@@ -152,9 +156,10 @@ class Playout:
 
     def append(self, item: Utterance, chunk: bytes) -> bool:
         """Add synthesised audio. False means stop synthesising: the utterance
-        was flushed (bypass), and the rest of it will never be heard."""
+        was flushed (bypass) or already closed, and the rest of it will never
+        be heard."""
         with self._lock:
-            if item.dropped:
+            if item.dropped or item.closed:
                 return False
             item.pcm.extend(chunk)
             self._trim_locked()
@@ -165,20 +170,30 @@ class Playout:
         with self._lock:
             item.closed = True
             item.truncated = truncated
-            if truncated and not item.pcm and item is not self._current:
-                # Synthesis failed before producing anything. Unqueue it
-                # rather than leave an empty entry for tick() to step over.
+            if not item.pcm and item is not self._current:
+                # Nothing ever arrived - whether synthesis failed
+                # (truncated) or simply produced no audio, there is no
+                # reason to leave an empty entry for tick() to step over.
+                # Not in the queue any more (already dropped by the lag cap,
+                # or flushed) is the same case: nothing to unqueue.
                 try:
                     self._queue.remove(item)
                 except ValueError:
                     pass
 
     def submit(self, item: Translated) -> None:
-        """A complete utterance is the degenerate streaming case."""
-        handle = self.begin(item.unit, item.text)
-        if item.pcm:
-            self.append(handle, item.pcm)
-        self.finish(handle)
+        """A complete utterance is the degenerate streaming case.
+
+        Built and queued under one lock: trimming between begin() and
+        append() would hand on_dropped an utterance whose pcm had not
+        arrived yet.
+        """
+        utterance = Utterance(
+            unit=item.unit, text=item.text, pcm=bytearray(item.pcm), closed=True
+        )
+        with self._lock:
+            self._queue.append(utterance)
+            self._trim_locked()
 
     def backlog_s(self) -> float:
         with self._lock:
@@ -241,14 +256,20 @@ class Playout:
     ) -> None:
         """Run a consumer callback without letting it take down this thread.
 
-        `on_spoken` fires on the playout thread, inside tick(), right after
-        the duck closes. `on_dropped` fires wherever submit() is called,
-        while the lock is held. Either one raising - a transcript write
-        hitting a full disk, say (Task 25) - must not propagate: out of
-        tick() it would kill the playout thread with the duck stuck closed,
-        which is exactly the fail-safe this module exists to provide,
-        inverted into silence; out of submit() it would silently stop the
-        producer thread from submitting anything further.
+        `on_spoken` fires on the playout thread, inside tick(), after the
+        duck has been set for this tick - closed if the tick carried speech,
+        open if it didn't. An utterance can retire on either kind of tick:
+        the ordinary case finishes mid-chunk and is reported from the speech
+        path, but one that is closed exactly on a chunk boundary, or that
+        never produced any audio, retires from the silence path instead.
+        `on_dropped` fires from _trim_locked(), under the lock, wherever that
+        runs - begin(), append() or submit(), not only submit() as before
+        streaming. Either one raising - a transcript write hitting a full
+        disk, say (Task 25) - must not propagate: out of tick() it would
+        kill the playout thread with the duck stuck closed, which is exactly
+        the fail-safe this module exists to provide, inverted into silence;
+        out of begin()/append()/submit() it would silently stop the producer
+        thread from submitting anything further.
         """
         if callback is None:
             return
@@ -282,6 +303,54 @@ class Playout:
         if value:
             self.flush()
 
+    def _advance_locked(self) -> tuple[bytearray | None, Translated | None]:
+        """Pull, read and retire under the lock. Returns (chunk, finished).
+
+        `chunk` is a bytearray slice of the utterance's pcm - already an
+        independent copy, so callers get their own buffer without a second
+        bytes() copy on top of it.
+        """
+        if self._current is None and self._queue:
+            self._current = self._queue.popleft()
+            self._offset = 0
+
+        chunk = None
+        finished = None
+        if self._current is not None:
+            unread = len(self._current.pcm) - self._offset
+            # A partial remainder under one chunk is only played once the
+            # utterance is closed - that is a genuine tail. While still
+            # open it is a producer that has not delivered a full chunk
+            # yet, and zero-padding it would splice silence into the middle
+            # of a word. It would also never let the starvation counter
+            # below increment, since that only counts unread == 0: a
+            # producer trickling sub-chunk fragments forever would hold the
+            # duck closed with no bound, which is the "stuck closed" failure
+            # CLAUDE.md calls silently cruel.
+            if unread >= CHUNK_BYTES or (unread > 0 and self._current.closed):
+                chunk = self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
+                self._offset += len(chunk)
+                if self._current.closed and self._offset >= len(self._current.pcm):
+                    finished = self._current.snapshot()
+                    self._current = None
+                    self._offset = 0
+                if len(chunk) < CHUNK_BYTES:
+                    chunk = chunk + b"\x00" * (CHUNK_BYTES - len(chunk))
+                self._starved_ticks = 0
+            elif self._current.closed:
+                # Closed after its final byte had already been written, or
+                # it never produced any audio at all. Only the first case
+                # was spoken, so only it gets on_spoken.
+                if self._offset > 0:
+                    finished = self._current.snapshot()
+                self._current = None
+                self._offset = 0
+                self._starved_ticks = 0
+            # else: 0 < unread < CHUNK_BYTES and still open - waiting for
+            # more. Task 3 fills this branch with starvation handling
+            # (STARVE_LIMIT_TICKS); until then this is simply "not yet".
+        return chunk, finished
+
     def tick(self) -> bool:
         """Write exactly one chunk. True if it carried speech."""
         if self.suppressed:
@@ -293,36 +362,8 @@ class Playout:
             self._sink.write(SILENCE_CHUNK)
             return False
 
-        finished: Translated | None = None
         with self._lock:
-            if self._current is None and self._queue:
-                self._current = self._queue.popleft()
-                self._offset = 0
-
-            chunk = None
-            if self._current is not None:
-                unread = len(self._current.pcm) - self._offset
-                if unread > 0:
-                    chunk = bytes(
-                        self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
-                    )
-                    self._offset += len(chunk)
-                    if self._current.closed and self._offset >= len(self._current.pcm):
-                        finished = self._current.snapshot()
-                        self._current = None
-                        self._offset = 0
-                    if len(chunk) < CHUNK_BYTES:
-                        chunk = chunk + b"\x00" * (CHUNK_BYTES - len(chunk))
-                    self._starved_ticks = 0
-                elif self._current.closed:
-                    # Closed after its final byte had already been written, or
-                    # it never produced any audio at all. Only the first case
-                    # was spoken, so only it gets on_spoken.
-                    if self._offset > 0:
-                        finished = self._current.snapshot()
-                    self._current = None
-                    self._offset = 0
-                    self._starved_ticks = 0
+            chunk, finished = self._advance_locked()
 
         if chunk is None:
             if self._duck is not None:

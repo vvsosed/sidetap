@@ -7,9 +7,14 @@ from tests.conftest import FakeAudioSink, FakeVolumeControl
 CHUNK_BYTES = TTS_BYTES_PER_S * CHUNK_MS // 1000
 
 
+def _unit(text: str = "hi") -> Unit:
+    return Unit(direction=Direction.IN, text=text, t_start=0.0, t_end=1.0)
+
+
 def _translated(seconds: float, text: str = "hi") -> Translated:
-    unit = Unit(direction=Direction.IN, text=text, t_start=0.0, t_end=seconds)
-    return Translated(unit=unit, text=text, pcm=b"\x01\x02" * int(TTS_BYTES_PER_S * seconds / 2))
+    return Translated(
+        unit=_unit(text), text=text, pcm=b"\x01\x02" * int(TTS_BYTES_PER_S * seconds / 2)
+    )
 
 
 def test_an_idle_playout_writes_silence():
@@ -314,24 +319,23 @@ def test_a_plain_integer_object_id_still_works():
     assert volume.calls == [(42, 0.0)]
 
 
-def _unit(text: str = "hi", seconds: float = 1.0) -> Unit:
-    return Unit(direction=Direction.IN, text=text, t_start=0.0, t_end=seconds)
-
-
 def test_an_utterance_can_be_played_while_it_is_still_arriving():
+    """The two appends straddle a chunk boundary (410 ms then 390 ms, not an
+    even 400/400) so the read that crosses from one append's tail into the
+    other's head is exercised, not just a clean join."""
     sink = FakeAudioSink()
     playout = Playout(Direction.IN, sink)
     item = playout.begin(_unit(), "hi")
 
-    # Nothing to play yet: the utterance is queued but empty.
+    # Nothing has arrived yet, so there is nothing to play.
     assert playout.tick() is False
 
-    # 400 ms of audio arrives, which clears the start threshold.
-    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    # Enough has arrived for a full 20 ms chunk to be read.
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.41 / 2))
     assert playout.tick() is True
 
     # More arrives while the first part is still playing.
-    playout.append(item, b"\x03\x04" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    playout.append(item, b"\x03\x04" * int(TTS_BYTES_PER_S * 0.39 / 2))
     playout.finish(item)
     spoken = sum(1 for _ in range(60) if playout.tick())
     assert spoken == 39  # 800 ms total, minus the one chunk already written
@@ -350,14 +354,103 @@ def test_backlog_counts_only_bytes_that_have_arrived():
 
 
 def test_on_spoken_fires_once_when_a_streamed_utterance_drains():
+    """The streaming case: finish() arrives only after tick() has already
+    read every byte that had arrived, so the utterance retires - and
+    on_spoken fires - from the silence branch, not the speech branch. That
+    is a different code path from test_finished_items_are_reported_once,
+    where the whole item is closed from the start and always retires
+    mid-chunk, on the speech branch.
+    """
     spoken = []
     playout = Playout(Direction.IN, FakeAudioSink(), on_spoken=spoken.append)
     item = playout.begin(_unit(), "hi")
-    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.04 / 2))
-    playout.finish(item)
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.04 / 2))  # 2 chunks
 
-    for _ in range(5):
-        playout.tick()
+    assert playout.tick() is True  # first chunk
+    assert playout.tick() is True  # second chunk; fully read, but still open
+    assert spoken == []  # not closed yet - nothing to report
+
+    playout.finish(item)
+    assert playout.tick() is False  # silence tick: this is where it retires
     assert len(spoken) == 1
     assert spoken[0].text == "hi"
     assert spoken[0].audio_s == pytest.approx(0.04)
+
+
+def test_a_sub_chunk_append_does_not_get_padded_and_played():
+    """0 < unread < CHUNK_BYTES on an utterance that is still open must wait
+    for more, not zero-pad the fragment into the sink - that would splice
+    silence into the middle of a word, and would also never let a future
+    starvation counter increment (it only counts unread == 0), holding the
+    duck closed with no bound while a trickling producer stalls.
+    """
+    sink = FakeAudioSink()
+    playout = Playout(Direction.IN, sink)
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * 10)  # far under one 20 ms chunk
+
+    assert playout.tick() is False
+    assert sink.written == b"\x00" * CHUNK_BYTES
+
+
+def test_the_final_partial_chunk_of_a_closed_utterance_is_padded():
+    """Unlike the sub-chunk case above, a partial remainder on a CLOSED
+    utterance is a genuine tail and must be padded and played."""
+    sink = FakeAudioSink()
+    playout = Playout(Direction.IN, sink)
+    item = playout.begin(_unit(), "hi")
+    audio = b"\x01\x02" * int(TTS_BYTES_PER_S * 0.03 / 2)  # one chunk + a tail
+    playout.append(item, audio)
+    playout.finish(item)
+
+    assert playout.tick() is True  # the full first chunk
+    assert playout.tick() is True  # the padded tail
+    assert playout.tick() is False  # drained
+
+    assert sink.written[: len(audio)] == audio
+    assert set(sink.written[len(audio) :]) == {0}
+
+
+def test_an_utterance_that_never_produces_audio_reports_nothing():
+    """Closed with offset == 0: it was current, but nothing was ever read
+    from it, so on_spoken must not fire - nothing was actually spoken."""
+    spoken = []
+    playout = Playout(Direction.IN, FakeAudioSink(), on_spoken=spoken.append)
+    item = playout.begin(_unit(), "hi")
+
+    assert playout.tick() is False  # promotes item to _current; still empty
+    playout.finish(item, truncated=True)
+    assert playout.tick() is False  # retires it; nothing to report
+    assert spoken == []
+
+
+def test_a_truncated_utterance_with_no_audio_is_unqueued():
+    """Synthesis failed before producing anything. tick() must not have to
+    step over an empty entry that will never grow."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.finish(item, truncated=True)
+
+    assert playout.flush() == 0
+
+
+def test_finish_with_no_audio_and_no_truncation_still_unqueues():
+    """A synthesis that simply produced nothing is not a failure, but there
+    is still no reason to leave a permanently-empty entry in the queue."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.finish(item)  # truncated defaults to False
+
+    assert playout.flush() == 0
+
+
+def test_finish_on_an_already_dropped_item_does_not_raise():
+    """The producer may call finish() for cleanup after append() told it to
+    stop; by then the item may already be gone from the queue entirely -
+    flush() (bypass) can empty it out from under a synthesis in progress."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.flush()
+
+    playout.finish(item, truncated=True)  # must not raise
+    assert playout.backlog_s() == 0.0
