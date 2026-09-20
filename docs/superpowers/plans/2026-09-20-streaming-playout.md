@@ -619,7 +619,12 @@ to:
 ```
 
 Then add the `else` branch to the `if self._current is not None:` block,
-after the existing `elif self._current.closed:` branch:
+after the existing `elif self._current.closed:` branch. Task 1 already
+narrowed the first branch to `unread >= CHUNK_BYTES or (unread > 0 and
+closed)` and left a comment marking where this goes, so the `else` now
+catches both "nothing at all arrived" and "less than one chunk arrived on an
+utterance still being synthesised" — the second is why that narrowing had to
+happen first:
 
 ```python
                 else:

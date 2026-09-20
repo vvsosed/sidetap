@@ -96,11 +96,22 @@ is `closed`, or it holds at least the start threshold below. Given that:
 
 | head state | action | duck |
 |---|---|---|
-| startable, bytes unread | write 20 ms | closed |
+| a full 20 ms unread | write 20 ms | closed |
+| a final partial chunk of a `closed` utterance | write it, zero-padded | closed |
 | no unread bytes, `closed` | fire `on_spoken`, pull next | — |
-| no unread bytes, open, started | write silence, do not advance | **held closed** |
+| under 20 ms unread, open, started | write silence, do not advance | **held closed** |
 | not yet startable (under threshold) | write silence | open |
 | nothing queued | write silence | open |
+
+The second and fourth rows are one distinction and it is load-bearing:
+**zero-padding is only ever correct at the genuine end of an utterance.**
+Padding a short remainder of an utterance that is still arriving splices
+silence into the middle of a word, and because that path writes a chunk it
+also resets the starvation counter and closes the duck — so the
+`STARVE_LIMIT_TICKS` bound below could never fire, and a trickling producer
+would pin the duck closed for the rest of the call. Real Chirp chunks happen
+to be exact multiples of 20 ms, which hides this; `FakeSynthesizer`'s are not,
+and neither is a clause-splitting producer.
 
 "Started" means `offset > 0` — the listener has already heard part of this
 sentence. That is the distinction the duck follows: an utterance that has
