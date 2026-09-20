@@ -487,7 +487,7 @@ to:
 - [ ] **Step 4: Run the tests**
 
 Run: `uv run pytest tests/test_playout.py -q`
-Expected: PASS, including the Task 1 test whose xfail was removed.
+Expected: PASS.
 
 Run: `uv run pytest -q`
 Expected: PASS. Existing `submit()` tests are unaffected because `submit()`
