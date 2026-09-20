@@ -250,16 +250,21 @@ class Playout:
                 # Still being synthesised: its duration is unknown, so
                 # dropping it cannot be shown to help. popleft() takes the
                 # oldest, so this is only ever reached when the open
-                # utterance is the queue's last entry - true because
-                # pipeline.py drives one begin()->finish() to completion per
-                # unit before starting the next, not because anything here
-                # enforces it. If that calling discipline is ever broken
-                # (Task 6 rewrites it), the failure is safe rather than
-                # silent-and-wrong in the dangerous direction: this guard
-                # would under-trim and keep audio around rather than drop a
-                # sentence or leave the duck stuck closed - but the backlog
-                # would then sit over cap with nothing to say why. Break
-                # rather than spin on an undroppable head.
+                # utterance is the queue's last entry.
+                #
+                # That holds VACUOUSLY today: pipeline.py's only caller uses
+                # submit(), which builds and closes an Utterance atomically
+                # under one lock, so no production path ever queues an open
+                # item at all. There is no begin()->finish() discipline yet
+                # to rely on - the streaming rewrite is what introduces one,
+                # and it has to keep that sequence serialized per direction
+                # for this guard to go on being reached only at the tail.
+                #
+                # Nothing here enforces it. If it is ever broken, this fails
+                # in the safe direction - the cap under-trims and keeps audio
+                # rather than dropping a sentence or leaving the duck stuck
+                # closed - but the backlog then sits over cap with nothing
+                # saying why. Break rather than spin on an undroppable head.
                 break
             victim = self._queue.popleft()
             self.dropped += 1

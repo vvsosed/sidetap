@@ -789,10 +789,13 @@ def test_the_cap_does_not_drop_an_utterance_that_is_still_arriving():
 def test_the_cap_exempts_the_head_not_merely_some_queued_utterance():
     """The guard exempts the queue HEAD specifically.
 
-    Production keeps the open utterance at the tail - one begin->finish at a
-    time per direction - so this shape should not arise. If it ever does, the
-    cap must still not drop the open item; reading the tail instead would pop
-    the wrong utterance entirely.
+    No production caller can build this shape today, because submit() closes
+    an Utterance before queueing it - so nothing open is ever queued at all.
+    Once the pipeline streams, an open utterance exists and stays at the
+    tail only as long as one begin->finish runs at a time per direction.
+    This constructs the inverted shape on purpose: if that ever slips, the
+    cap must still spare the open item. Reading the tail instead pops the
+    wrong utterance entirely.
     """
     dropped = []
     playout = Playout(
