@@ -1,6 +1,6 @@
 import pytest
 
-from sidetap.playout import CHUNK_MS, DuckControl, Playout
+from sidetap.playout import CHUNK_MS, STARVE_LIMIT_TICKS, DuckControl, Playout
 from sidetap.types import TTS_BYTES_PER_S, Direction, Translated, Unit
 from tests.conftest import FakeAudioSink, FakeVolumeControl
 
@@ -525,3 +525,78 @@ def test_a_short_utterance_plays_as_soon_as_it_is_closed():
     assert playout.tick() is False
     playout.finish(item)
     assert playout.tick() is True
+
+
+def test_a_starved_utterance_holds_the_duck_closed():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    for _ in range(20):  # play all 400 ms
+        playout.tick()
+    assert duck.is_open is False
+
+    # Synthesis stalls. The duck must NOT flap open mid-sentence.
+    for _ in range(10):
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+    # More audio arrives and playback resumes where it left off.
+    playout.append(item, b"\x03\x04" * int(TTS_BYTES_PER_S * 0.1 / 2))
+    assert playout.tick() is True
+
+
+def test_a_long_stall_abandons_the_utterance_and_reopens_the_duck():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    spoken = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), duck=duck, on_spoken=spoken.append
+    )
+
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    for _ in range(20):
+        playout.tick()
+    assert duck.is_open is False
+
+    for _ in range(STARVE_LIMIT_TICKS + 1):
+        playout.tick()
+
+    assert duck.is_open is True
+    assert item.truncated is True
+    assert len(spoken) == 1  # what did play is still reported
+
+
+def test_a_producer_that_dies_under_the_threshold_does_not_block_the_queue():
+    playout = Playout(Direction.IN, FakeAudioSink())
+    stalled = playout.begin(_unit(), "stalled")
+    playout.append(stalled, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+    playout.submit(_translated(0.1, text="behind"))
+
+    # Under the 400 ms threshold and never closed: nothing plays, and the
+    # utterance queued behind it is stuck too.
+    assert playout.tick() is False
+
+    for _ in range(STARVE_LIMIT_TICKS + 2):
+        playout.tick()
+
+    # The fragment that did arrive is spoken, and the queue moves again.
+    assert stalled.truncated is True
+    assert stalled.closed is True
+
+
+def test_an_utterance_that_has_not_started_leaves_the_duck_open():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    # Queued and under the threshold: nothing has been heard, so the original
+    # must stay audible.
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+    for _ in range(10):
+        playout.tick()
+    assert duck.is_open is True

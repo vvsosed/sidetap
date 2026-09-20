@@ -312,17 +312,21 @@ class Playout:
         becomes unplayable and is silently lost, closed or not.
 
         A head held here, still open, whose producer dies before it clears
-        the threshold blocks itself and everything queued behind it for the
-        rest of the call. Nothing bounds that wait yet. Neither does
-        anything bound a stalled _current - _starved_ticks and
-        STARVE_LIMIT_TICKS exist but are never incremented or compared, see
-        the "not yet" comment in _advance_locked. Task 3 has to bound BOTH:
-        the stalled _current and this un-started head.
+        the threshold would otherwise block itself and everything queued
+        behind it for the rest of the call. `_advance_locked` bounds that
+        wait with the same `_starved_ticks`/`STARVE_LIMIT_TICKS` counter it
+        uses for a stalled `_current`, closing the head where it stands once
+        the limit is reached so the fragment that did arrive gets spoken.
         """
         return item.closed or item.audio_s >= START_BUFFER_S
 
-    def _advance_locked(self) -> tuple[bytes | None, Translated | None]:
-        """Pull, read and retire under the lock. Returns (chunk, finished)."""
+    def _advance_locked(self) -> tuple[bytes | None, Translated | None, bool]:
+        """Pull, read and retire under the lock.
+
+        Returns (chunk, finished, starved). `starved` means an utterance the
+        listener is already part-way through has nothing to play - the duck
+        must stay closed across that gap.
+        """
         if (
             self._current is None
             and self._queue
@@ -333,6 +337,7 @@ class Playout:
 
         chunk = None
         finished = None
+        starved = False
         if self._current is not None:
             unread = len(self._current.pcm) - self._offset
             # A partial remainder under one chunk is only played once the
@@ -365,10 +370,46 @@ class Playout:
                 self._current = None
                 self._offset = 0
                 self._starved_ticks = 0
-            # else: 0 < unread < CHUNK_BYTES and still open - waiting for
-            # more. Task 3 fills this branch with starvation handling
-            # (STARVE_LIMIT_TICKS); until then this is simply "not yet".
-        return chunk, finished
+            else:
+                # Started but nothing to read: synthesis has not kept up.
+                # `offset > 0` means the listener is mid-sentence, which is
+                # what the duck follows - an utterance that has begun and
+                # then starved is still in progress.
+                starved = self._offset > 0
+                self._starved_ticks += 1
+                if self._starved_ticks >= STARVE_LIMIT_TICKS:
+                    # The producer is gone, not slow. Give the utterance
+                    # up rather than hold the duck closed for the rest of
+                    # the call, which would silence the remote party -
+                    # the one failure worse than sidetap not working.
+                    self._current.closed = True
+                    self._current.truncated = True
+                    if self._offset > 0:
+                        finished = self._current.snapshot()
+                    self._current = None
+                    self._offset = 0
+                    self._starved_ticks = 0
+                    starved = False
+        elif self._queue:
+            # Nothing is playable because the head is still under the start
+            # threshold. The same bound applies, for the same reason: a
+            # producer that died mid-fragment must not block the queue.
+            # Nothing has been heard yet, so the duck stays open and this is
+            # not the stuck-closed failure - it is the whole direction going
+            # quiet with nothing on screen explaining why.
+            self._starved_ticks += 1
+            if self._starved_ticks >= STARVE_LIMIT_TICKS:
+                # Close it where it stands rather than discard it: `closed`
+                # makes it startable, so the next tick speaks the fragment
+                # that did arrive. That is the same rule the spec applies to
+                # a synthesis that fails part way through - play what
+                # arrived - and it unblocks everything queued behind it.
+                self._queue[0].closed = True
+                self._queue[0].truncated = True
+                self._starved_ticks = 0
+        else:
+            self._starved_ticks = 0
+        return chunk, finished, starved
 
     def tick(self) -> bool:
         """Write exactly one chunk. True if it carried speech."""
@@ -382,11 +423,16 @@ class Playout:
             return False
 
         with self._lock:
-            chunk, finished = self._advance_locked()
+            chunk, finished, starved = self._advance_locked()
 
         if chunk is None:
             if self._duck is not None:
-                self._duck.open()
+                if starved:
+                    # Mid-sentence gap. close() is idempotent, so this is not
+                    # a wpctl call per tick.
+                    self._duck.close()
+                else:
+                    self._duck.open()
             self._sink.write(SILENCE_CHUNK)
             if finished is not None:
                 self._invoke(self._on_spoken, finished)
