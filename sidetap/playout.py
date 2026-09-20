@@ -303,13 +303,8 @@ class Playout:
         if value:
             self.flush()
 
-    def _advance_locked(self) -> tuple[bytearray | None, Translated | None]:
-        """Pull, read and retire under the lock. Returns (chunk, finished).
-
-        `chunk` is a bytearray slice of the utterance's pcm - already an
-        independent copy, so callers get their own buffer without a second
-        bytes() copy on top of it.
-        """
+    def _advance_locked(self) -> tuple[bytes | None, Translated | None]:
+        """Pull, read and retire under the lock. Returns (chunk, finished)."""
         if self._current is None and self._queue:
             self._current = self._queue.popleft()
             self._offset = 0
@@ -328,7 +323,9 @@ class Playout:
             # duck closed with no bound, which is the "stuck closed" failure
             # CLAUDE.md calls silently cruel.
             if unread >= CHUNK_BYTES or (unread > 0 and self._current.closed):
-                chunk = self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
+                chunk = bytes(
+                    self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
+                )
                 self._offset += len(chunk)
                 if self._current.closed and self._offset >= len(self._current.pcm):
                     finished = self._current.snapshot()

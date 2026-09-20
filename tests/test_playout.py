@@ -247,7 +247,7 @@ def test_the_cap_drops_a_queued_item_even_while_the_current_one_still_plays():
         Direction.IN, FakeAudioSink(), lag_cap_s=5.0, on_dropped=dropped.append
     )
     playout.submit(_translated(10.0, "long"))
-    playout.tick()  # moves "long" into _current/_pending; _queue is now empty
+    playout.tick()  # moves "long" into _current; _queue is now empty
     playout.submit(_translated(3.0, "short"))  # _queue is len 1, but backlog is ~13s
 
     assert [d.unit.text for d in dropped] == ["short"]
@@ -409,6 +409,25 @@ def test_the_final_partial_chunk_of_a_closed_utterance_is_padded():
 
     assert sink.written[: len(audio)] == audio
     assert set(sink.written[len(audio) :]) == {0}
+
+
+def test_append_after_finish_is_refused():
+    """closed is what makes the zero-pad's premise sound: a partial tail is
+    only played because closed means no more audio is coming. That is only
+    true if append() actually refuses audio once closed - otherwise a late
+    chunk could arrive after the tail was already played and padded.
+
+    (The dropped half of append()'s refusal is bypass's job, covered
+    elsewhere; this is specifically about closed.)
+    """
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * 100)
+    playout.finish(item)
+
+    before = bytes(item.pcm)
+    assert playout.append(item, b"\x03\x04" * 100) is False
+    assert bytes(item.pcm) == before
 
 
 def test_an_utterance_that_never_produces_audio_reports_nothing():
