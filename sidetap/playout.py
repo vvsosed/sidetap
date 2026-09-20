@@ -246,6 +246,13 @@ class Playout:
             and (len(self._queue) > 1 or self._current is not None)
             and self._backlog_locked() > self._lag_cap_s
         ):
+            if not self._queue[0].closed:
+                # Still being synthesised: its duration is unknown, so
+                # dropping it cannot be shown to help, and it is always the
+                # newest content - popleft() takes the oldest, so an open
+                # utterance is only ever reached when it is the last one
+                # left. Break rather than spin on an undroppable head.
+                break
             victim = self._queue.popleft()
             self.dropped += 1
             log.warning(

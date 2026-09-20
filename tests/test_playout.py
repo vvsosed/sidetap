@@ -755,3 +755,36 @@ def test_an_emptied_queue_does_not_carry_the_counter_to_the_next_head():
         playout.tick()
     assert healthy.truncated is False
     assert healthy.closed is False
+
+
+def test_the_cap_does_not_drop_an_utterance_that_is_still_arriving():
+    dropped = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=1.0, on_dropped=dropped.append
+    )
+    playout.submit(_translated(2.0))     # becomes _current
+    playout.tick()
+
+    item = playout.begin(_unit(), "new")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 3.0 / 2))
+
+    # Well over the 1 s cap, but the only queued item is still open.
+    assert playout.backlog_s() > 1.0
+    assert dropped == []
+    assert item.dropped is False
+
+    # Once closed it becomes droppable like anything else. Assert on the item
+    # itself, not on len(dropped): closing it lets the cap drain the whole
+    # queue in one pass, so the count here is 2, not 1.
+    playout.finish(item)
+    playout.submit(_translated(0.1))
+    assert item.dropped is True
+
+
+def test_flushing_tells_the_producer_to_stop_synthesising():
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    assert playout.append(item, b"\x01\x02" * 100) is True
+
+    playout.set_suppressed(True)
+    assert playout.append(item, b"\x01\x02" * 100) is False
