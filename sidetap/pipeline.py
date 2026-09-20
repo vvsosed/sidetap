@@ -222,12 +222,12 @@ class DirectionPipeline:
         truncated = handle.truncated
 
         if produced:
-            # Billed on the request, not on what was heard: Chirp 3 HD sends
-            # the whole input string before the first chunk comes back, so
-            # Google bills it the moment the request goes out regardless of
-            # which refusal follows. Charging only the starvation-close case
-            # and not the bypass-flush case - or vice versa - would
-            # understate the call's real cost.
+            # Billed once the synthesizer has produced audio, not on what was
+            # heard afterward: Chirp 3 HD sends the whole input string before
+            # the first chunk comes back, so Google bills the request as soon
+            # as it has produced anything, regardless of which refusal (or
+            # none) follows. A synthesis that raises before producing any
+            # audio at all is not billed - see the exception path above.
             self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
         if handle.dropped:
@@ -237,6 +237,24 @@ class DirectionPipeline:
             if self._on_record is not None:
                 self._on_record(
                     Record(unit=unit, target_text=target_text, dropped=True)
+                )
+            return
+
+        if produced and handle.truncated and first_ms is None:
+            # Playout gave up on this utterance at the starvation bound
+            # before it ever accepted anything from it, so nothing was heard
+            # - but the sentence was said, and was billed. Losing the row
+            # would lose the source line with it, exactly as on the bypass
+            # path above. No latency: there is nothing to report a wait for.
+            #
+            # `first_ms is None` is what scopes this to that case alone: a
+            # synthesis that fails after some audio was already accepted
+            # also produces and also ends up truncated, but first_ms is set
+            # by then, and that case belongs to the full record below, with
+            # the latency the listener actually experienced attached to it.
+            if self._on_record is not None:
+                self._on_record(
+                    Record(unit=unit, target_text=target_text, truncated=True)
                 )
             return
 

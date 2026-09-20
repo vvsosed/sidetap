@@ -6,7 +6,7 @@ from sidetap.metrics import Health, Metrics
 from sidetap.pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
 from sidetap.playout import STARVE_LIMIT_TICKS, Playout, earcon
 from sidetap.segment import FinalsOnlySegmenter
-from sidetap.types import TTS_BYTES_PER_S, AsrResult, Direction
+from sidetap.types import TTS_BYTES_PER_S, AsrResult, Direction, Latency
 from tests.conftest import FakeAudioSink, FakeClock, FakeSynthesizer, FakeTranslator
 
 
@@ -335,7 +335,10 @@ def test_a_synthesis_failure_part_way_through_keeps_what_was_spoken():
 
 
 def test_a_synthesis_failure_before_any_audio_records_nothing():
+    from sidetap.cost import Rates
+
     records = []
+    metrics = Metrics()
 
     class FailingSynthesizer:
         def synthesize(self, text, voice, speaking_rate=1.0):
@@ -344,12 +347,21 @@ def test_a_synthesis_failure_before_any_audio_records_nothing():
 
     playout = Playout(Direction.IN, FakeAudioSink())
     pipeline = _pipeline(
-        synthesizer=FailingSynthesizer(), playout=playout, on_record=records.append
+        synthesizer=FailingSynthesizer(),
+        playout=playout,
+        on_record=records.append,
+        metrics=metrics,
+        rates=Rates(mt_per_million_chars=1_000_000.0, tts_per_million_chars=1_000_000.0),
     )
     pipeline.handle(_final(t_end=1.0))
 
     assert playout.backlog_s() == 0.0
     assert records == []
+    # Only the 6-character source text is billed, at $1/char - nothing was
+    # ever produced, so the synthesis request must not be charged. This is
+    # exactly what `if produced:` guards, and a bare `if True:` there used
+    # to sail straight through this test undetected.
+    assert metrics.snapshot().cost_usd == 6.0
 
 
 # --- playout refusing mid-stream --------------------------------------------
@@ -497,7 +509,7 @@ def test_synthesize_raising_before_any_iteration_still_closes_the_utterance():
     assert playout.backlog_s() == 0.0
 
 
-def test_a_chunk_refused_on_arrival_produces_no_latency_no_record_and_leaves_dead_air_armed():
+def test_a_chunk_refused_on_arrival_produces_a_truncated_row_with_no_latency_and_leaves_dead_air_armed():
     """first_ms means playout ACCEPTED a chunk, not that the synthesizer
     produced one.
 
@@ -505,8 +517,10 @@ def test_a_chunk_refused_on_arrival_produces_no_latency_no_record_and_leaves_dea
     empty, still-queued utterance after STARVE_LIMIT_TICKS, and only then
     does the one and only chunk arrive - too late, refused on item.closed.
     Nothing ever reached playout, so nothing was heard: first_ms must stay
-    unset, no transcript row should appear, and dead air must stay armed
-    rather than being told the direction spoke.
+    unset and dead air must stay armed rather than being told the direction
+    spoke. But the sentence was said, and was billed, so it still needs a
+    transcript row - just one with no latency to report, since there is
+    nothing playout ever queued to time.
     """
     clock = FakeClock()
     watch = DeadAirWatch(clock, threshold_s=6.0)
@@ -531,7 +545,10 @@ def test_a_chunk_refused_on_arrival_produces_no_latency_no_record_and_leaves_dea
     pipeline.handle(_final(t_end=0.0))
 
     assert playout.backlog_s() == 0.0
-    assert records == []
+    assert len(records) == 1
+    assert records[0].truncated is True
+    assert records[0].dropped is False
+    assert records[0].latency == Latency()
     clock.advance(7.0)
     assert watch.alarming() is True
 
@@ -766,3 +783,93 @@ def test_speaking_disarms_the_dead_air_alarm():
     pipeline.handle(_final(t_end=clock.monotonic()))
 
     assert watch.alarming() is False
+
+
+# --- the empty-chunk skip ----------------------------------------------------
+#
+# `if not chunk: continue` is unreachable with the real ChirpSynthesizer -
+# Chirp 3 HD never yields an empty chunk - but the Synthesizer port's type
+# does not forbid one, and three different mutations of that one line survive
+# every test above: never skipping it, breaking instead of skipping it, and
+# billing it as if it were real audio.
+
+
+def test_an_empty_chunk_is_skipped_without_stopping_the_real_chunk_behind_it():
+    """An empty chunk must be skipped outright: not billed, not treated as
+    the request having produced anything, and not allowed to end the loop
+    before the real audio behind it ever gets a chance to arrive."""
+    clock = FakeClock(start=0.0)
+
+    class EmptyThenRealSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b""            # must be skipped, not counted, not billed
+            clock.advance(0.2)   # only the real chunk's wait should show up
+            yield b"\x01\x02" * 8000
+
+    metrics = Metrics()
+    pipeline = _pipeline(
+        synthesizer=EmptyThenRealSynthesizer(), metrics=metrics, clock=clock
+    )
+    pipeline.handle(_final("привет", t_end=0.0))
+
+    latency = metrics.snapshot().directions[Direction.IN].latency
+    assert latency.tts_ms == 200.0
+
+
+def test_a_synthesis_that_yields_only_empty_chunks_is_not_billed():
+    """Skipping an empty chunk must happen before `produced` is set for it -
+    a synthesis that never yields anything real must not be billed as if it
+    had."""
+    from sidetap.cost import Rates
+
+    metrics = Metrics()
+
+    class OnlyEmptyChunksSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b""
+            yield b""
+
+    pipeline = _pipeline(
+        synthesizer=OnlyEmptyChunksSynthesizer(),
+        metrics=metrics,
+        rates=Rates(mt_per_million_chars=1_000_000.0, tts_per_million_chars=1_000_000.0),
+    )
+    pipeline.handle(_final("привет"))
+
+    # Only the 6-character source text is billed, at $1/char - two empty
+    # chunks are not a synthesis that produced anything.
+    assert metrics.snapshot().cost_usd == 6.0
+
+
+# --- other pre-existing lines this file did not defend -----------------------
+
+
+def test_a_successful_utterance_updates_the_queue_depth_metric():
+    """set_queue_s must actually run - it is the TUI's only view of playout
+    backlog for this direction."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    metrics = Metrics()
+    pipeline = _pipeline(playout=playout, metrics=metrics)
+    pipeline.handle(_final(t_end=1.0))
+
+    backlog = playout.backlog_s()
+    assert backlog > 0.0
+    assert metrics.snapshot().directions[Direction.IN].queue_s == backlog
+
+
+def test_speaking_rate_is_passed_through_to_the_synthesizer():
+    """The two directions' useful speaking rates are inverses (ports.py), so
+    dropping this argument would make one direction silently wrong rather
+    than loudly broken."""
+    synthesizer = FakeSynthesizer()
+    config = DirectionConfig(
+        direction=Direction.IN,
+        source_lang="ru-RU",
+        target_lang="en-US",
+        voice="en-US-Chirp3-HD-Charon",
+        speaking_rate=1.3,
+    )
+    pipeline = _pipeline(config=config, synthesizer=synthesizer)
+    pipeline.handle(_final(t_end=1.0))
+
+    assert synthesizer.rates == [1.3]
