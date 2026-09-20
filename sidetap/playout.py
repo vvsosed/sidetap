@@ -248,10 +248,18 @@ class Playout:
         ):
             if not self._queue[0].closed:
                 # Still being synthesised: its duration is unknown, so
-                # dropping it cannot be shown to help, and it is always the
-                # newest content - popleft() takes the oldest, so an open
-                # utterance is only ever reached when it is the last one
-                # left. Break rather than spin on an undroppable head.
+                # dropping it cannot be shown to help. popleft() takes the
+                # oldest, so this is only ever reached when the open
+                # utterance is the queue's last entry - true because
+                # pipeline.py drives one begin()->finish() to completion per
+                # unit before starting the next, not because anything here
+                # enforces it. If that calling discipline is ever broken
+                # (Task 6 rewrites it), the failure is safe rather than
+                # silent-and-wrong in the dangerous direction: this guard
+                # would under-trim and keep audio around rather than drop a
+                # sentence or leave the duck stuck closed - but the backlog
+                # would then sit over cap with nothing to say why. Break
+                # rather than spin on an undroppable head.
                 break
             victim = self._queue.popleft()
             self.dropped += 1

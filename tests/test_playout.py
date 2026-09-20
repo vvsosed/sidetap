@@ -774,11 +774,52 @@ def test_the_cap_does_not_drop_an_utterance_that_is_still_arriving():
     assert item.dropped is False
 
     # Once closed it becomes droppable like anything else. Assert on the item
-    # itself, not on len(dropped): closing it lets the cap drain the whole
-    # queue in one pass, so the count here is 2, not 1.
+    # itself, not only on len(dropped): closing it lets the cap drain the
+    # whole queue in one pass, so the count below is 2, not 1 - _trim_locked
+    # must keep going after one victim, since it runs only from
+    # begin()/append()/submit(), never from tick(), so an under-draining
+    # trim would leave the backlog over cap indefinitely once the producer
+    # goes quiet.
     playout.finish(item)
     playout.submit(_translated(0.1))
     assert item.dropped is True
+    assert len(dropped) == 2
+
+
+def test_the_cap_exempts_the_head_not_merely_some_queued_utterance():
+    """The guard exempts the queue HEAD specifically.
+
+    Production keeps the open utterance at the tail - one begin->finish at a
+    time per direction - so this shape should not arise. If it ever does, the
+    cap must still not drop the open item; reading the tail instead would pop
+    the wrong utterance entirely.
+    """
+    dropped = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=1.0, on_dropped=dropped.append
+    )
+    playout.submit(_translated(2.0))
+    playout.tick()
+
+    open_head = playout.begin(_unit(), "arriving")
+    playout.append(open_head, b"\x01\x02" * int(TTS_BYTES_PER_S * 2.0 / 2))
+    playout.submit(_translated(0.5, text="behind"))
+
+    assert open_head.dropped is False
+    assert dropped == []
+
+
+def test_a_backlog_exactly_at_the_cap_drops_nothing():
+    """The comparison is strictly greater-than: sitting exactly at the cap
+    is not yet over it."""
+    dropped = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), lag_cap_s=2.0, on_dropped=dropped.append
+    )
+    playout.submit(_translated(1.0, "first"))
+    playout.submit(_translated(1.0, "second"))  # backlog == 2.0s, exactly the cap
+    assert playout.backlog_s() == 2.0
+    assert dropped == []
 
 
 def test_flushing_tells_the_producer_to_stop_synthesising():
