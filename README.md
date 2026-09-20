@@ -258,13 +258,15 @@ aspirational TODOs.
   over its own latency budget, in exchange for a real but modest quality gain
   that shows up on idiom rather than plain sentences — it falls back to NMT
   automatically on error, and `--mt-model general/nmt` switches it by hand.
-- **TTS streaming isn't exploited yet.** Chirp 3 HD synthesis is genuinely
-  incremental (Experiment 4 measured 6.2 s of audio arriving as 27 separate
-  chunks, the first one at a 186–267 ms warm median across the two voices
-  tested), but the pipeline currently joins a whole utterance's audio before
-  handing it to playout, because the lag cap needs an utterance's total
-  duration up front. The latency that actually applies today is full
-  synthesis wall time, not time-to-first-chunk.
+- **Recognition finality, not synthesis, is now the latency floor.** TTS
+  streaming is exploited — `DirectionPipeline._speak` starts playout at
+  time-to-first-chunk instead of waiting for the whole utterance to
+  synthesise, saving 271 ms on a short sentence and 2109 ms on a long one
+  (Experiment 4) — but Chirp 3 must still declare a result final before
+  translation or synthesis starts at all, so felt latency is now dominated by
+  ASR and MT. `segment.py`'s `FinalsOnlySegmenter` is the placeholder seam
+  for LocalAgreement-2, which would commit a shared prefix early instead;
+  that seam exists and is unused.
 - **`aggressiveness = 2`** in the silence gate is applied identically to both
   directions, but it is tuned (per its own docstring) for a raw room
   microphone; the remote direction arrives already compressed, AGC'd and
