@@ -3,22 +3,27 @@
 One fixed voice per direction - no cloning, which costs roughly 600 ms of
 time-to-first-audio for a v1 that does not need it.
 
-`synthesize` is a true incremental generator: 6.2 s of Russian arrives as 27
-separate chunks, the first within 186-267 ms warm (measured - see
-docs/experiments/04-tts-streaming.md). **The pipeline does not currently
-exploit that.** DirectionPipeline._speak does `b"".join(synthesize(...))`,
-because Playout's lag cap needs an utterance's duration up front to measure
-backlog in seconds. So the latency that actually applies is full synthesis
-wall time - 637 ms for 3.84 s of audio, 1390 ms for 6.2 s - not
-time-to-first-chunk.
+`synthesize` is a true incremental generator and the pipeline exploits it:
+DirectionPipeline._speak appends each chunk to a Playout utterance as it
+arrives, so speech starts at time-to-first-chunk rather than at full
+synthesis wall time. Measured (docs/experiments/04-tts-streaming.md), that
+is the difference between 194 ms and 465 ms on a short utterance, and
+between 230 ms and 2339 ms on a long one.
 
-Do not "fix" this docstring by claiming early playout. Fix the pipeline, and
-accept that the backlog becomes estimated rather than known; the trade-off is
-written up in the spec's latency section.
+The shape that makes it safe: the first chunk is always 200 ms of audio,
+every chunk after it is 240 ms arriving every ~30 ms, and production runs
+4.7-7.1x faster than playback - so simulated early playout never dipped
+below a 200 ms buffer margin across nine runs. Playout still waits for
+START_BUFFER_S before starting, which costs ~30 ms and doubles that margin.
 
-The first call after construction costs ~543 ms against a ~267 ms warm median,
-which is why Session.setup() performs a throwaway synthesis while the audio
-graph is being rewired.
+An earlier version of this docstring claimed early playout would force the
+lag cap to estimate the backlog rather than measure it. It does not: at
+those ratios, counting only bytes that have arrived understates the backlog
+by a fraction of one utterance and self-corrects within about a second.
+
+The first call after construction costs ~543 ms against a ~267 ms warm
+median, which is why Session.setup() performs a throwaway synthesis while
+the duck's loopback node is still registering.
 """
 
 from __future__ import annotations
@@ -55,6 +60,27 @@ def voice_language(voice_name: str) -> str:
 # what the service does, not what it claims.
 MIN_SPEAKING_RATE = 0.25
 MAX_SPEAKING_RATE = 2.0
+
+# gRPC sets no deadline of its own, so a hung streaming_synthesize call parks
+# DirectionPipeline._speak inside `for chunk in chunks` forever: the results
+# queue behind it grows unbounded, and the tts health marker stays green
+# because Health is only set on the loop's exit paths, none of which run
+# while parked. asr.py guards its own streaming call the identical way
+# (STREAM_TIMEOUT_S there); this is that same guard for tts.py.
+#
+# 30s, not a tight fit to real synthesis time: the slowest run measured
+# (docs/experiments/04-tts-streaming.md) was 2339 ms for 16.6 s of audio, so
+# 30s is roughly 13x that worst case. It stays generous even at
+# MIN_SPEAKING_RATE (0.25, the setting that produces the *longest* audio):
+# scaling that same 16.6s utterance to a ~4x longer output (~66s of audio)
+# and dividing by the slowest observed synthesis-to-audio ratio (4.7x, not
+# the 7.1x this particular run hit) still lands at ~14s, under half the
+# budget. This is a stuck-RPC backstop, not a latency control - playout's own
+# STARVE_LIMIT_TICKS already gives up on an utterance after 2s of no chunks,
+# so a synthesis still running at 30s has long since stopped being useful to
+# anyone. The timeout exists to free the worker thread and surface the
+# failure, not to salvage the sentence.
+STREAM_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -106,7 +132,9 @@ class ChirpSynthesizer:
                 input=tts.StreamingSynthesisInput(text=text)
             )
 
-        for response in self._client.streaming_synthesize(requests()):
+        for response in self._client.streaming_synthesize(
+            requests(), timeout=STREAM_TIMEOUT_S
+        ):
             if response.audio_content:
                 yield response.audio_content
 

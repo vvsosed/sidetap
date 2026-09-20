@@ -20,7 +20,18 @@ REMOTE = "remote"
 MIC = "mic"
 
 # Seconds of un-spoken audio past which playout starts dropping the oldest.
-LAG_CAP_S = 12.0
+#
+# A dropped utterance is a sentence the user never hears, which is a harder
+# failure than briefly trailing the conversation, so the cap errs toward
+# holding audio rather than discarding it. It is a ceiling on transient
+# spikes, not a cure for a backlog that grows: if the translated language
+# runs longer than its source, only --speaking-rate-in can make it drain, and
+# a higher cap merely postpones the first drop.
+#
+# Not measured against a real two-way call - at this setting a reply arrives
+# up to 20 s after what it answers, which is past conversational. Lower it
+# with --lag-cap when keeping pace matters more than hearing every sentence.
+LAG_CAP_S = 20.0
 # Seconds of continuous outbound speech with nothing reaching the virtual mic
 # before the dead-air alarm fires.
 DEAD_AIR_S = 6.0
@@ -119,10 +130,27 @@ class Translated:
 class Latency:
     asr_ms: float = 0.0
     mt_ms: float = 0.0
+    # This CHANGED MEANING when playout started streaming: it used to be the
+    # full synthesis wall time, and is now the wait until playout accepted
+    # the first chunk. A transcript recorded before that change and one
+    # recorded after are not comparable on this field, and nothing in a
+    # .jsonl says which era it came from - the presence of a non-zero
+    # tts_total_ms beside it is the only hint.
     tts_ms: float = 0.0
+    # Full synthesis wall time. Deliberately NOT part of total_ms: once
+    # playout starts on the first chunk instead of waiting for the whole
+    # utterance, what the listener waited for is tts_ms, and adding the rest
+    # back would make the TUI overstate felt latency by exactly what
+    # streaming saves. _speak populates both: tts_ms when playout ACCEPTS
+    # the first chunk - not merely when one arrives, since playout can refuse
+    # it - and this when the loop ends, by exhaustion or by that refusal.
+    # Kept because full synthesis time is still the throughput and cost
+    # signal, which tts_ms no longer carries.
+    tts_total_ms: float = 0.0
 
     @property
     def total_ms(self) -> float:
+        # Excludes tts_total_ms on purpose - see its field comment above.
         return self.asr_ms + self.mt_ms + self.tts_ms
 
 
@@ -134,6 +162,7 @@ class Record:
     target_text: str
     latency: Latency = field(default_factory=Latency)
     dropped: bool = False
+    truncated: bool = False
 
     @property
     def direction(self) -> Direction:

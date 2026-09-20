@@ -23,7 +23,6 @@ from .types import (
     Direction,
     Latency,
     Record,
-    Translated,
     Unit,
 )
 
@@ -50,6 +49,12 @@ class DeadAirWatch:
     dead is a different failure, already surfaced by Metrics.set_health from
     RecognitionWorker - keeping that out of here is what stops this reaching
     into the ported audio path.
+
+    Not wired to the IN direction, deliberately: on IN a stalled pipeline is
+    not silent the way OUT's is. Playout there just goes idle, the duck
+    opens back up, and you start hearing the remote party's untranslated
+    voice coming through - a louder, faster signal than any alarm this watch
+    could raise, and one that needs no wiring to notice.
     """
 
     def __init__(self, clock: Clock, threshold_s: float = DEAD_AIR_S):
@@ -153,31 +158,157 @@ class DirectionPipeline:
             return
 
         started = self._clock.monotonic()
+        handle = self._playout.begin(unit, target_text)
+        first_ms: float | None = None  # time to the first chunk PLAYOUT ACCEPTED
+        produced = False  # the synthesizer yielded at least one chunk: billed
+        truncated = False
+        refused = False
         try:
-            pcm = b"".join(
-                self._synthesizer.synthesize(
-                    target_text, self._config.voice, self._config.speaking_rate
-                )
+            # Inside the try, not before it: the Synthesizer port is typed as
+            # an Iterator, which permits a non-generator implementation whose
+            # call itself can raise before any iteration happens. A raise
+            # anywhere in here - at call time or mid-iteration - must still
+            # reach finally below, or the utterance it opened is orphaned:
+            # open forever, blocking the queue head and switching the lag cap
+            # off for this direction until the starvation bound closes it.
+            chunks = self._synthesizer.synthesize(
+                target_text, self._config.voice, self._config.speaking_rate
             )
-            self._metrics.set_health(direction, tts=Health.OK)
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                produced = True
+                if not self._playout.append(handle, chunk):
+                    # Playout will not take any more: either something
+                    # flushed the queue - bypass engaging, or the
+                    # drop-backlog hotkey called directly, both funnel
+                    # through flush() - or playout gave the utterance up at
+                    # the starvation bound. Either way, stop paying for audio
+                    # nobody will hear, and end the gRPC stream rather than
+                    # leave it to garbage collection. The Synthesizer port is
+                    # typed as an Iterator, which need not have close(), so
+                    # this is a capability check and not an assumption.
+                    closer = getattr(chunks, "close", None)
+                    if closer is not None:
+                        closer()
+                    refused = True
+                    break
+                if first_ms is None:
+                    # Set only once playout has actually taken the chunk -
+                    # not when the synthesizer produced it. Setting it
+                    # earlier would call a chunk playout immediately refused
+                    # "heard", which flows into a latency figure, a
+                    # transcript row and dead_air.spoke() for audio nobody
+                    # was ever played.
+                    first_ms = round((self._clock.monotonic() - started) * 1000, 1)
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)
             self._metrics.set_health(direction, tts=Health.FAILED)
+            truncated = True
+        else:
+            if not refused:
+                # Only a generator that ran to completion says TTS is well.
+                # Reaching here after a refusal means playout gave up on this
+                # utterance at the starvation bound, or flush() threw it away
+                # - bypass engaging, or the drop-backlog hotkey called
+                # directly - neither is evidence of health, and painting the
+                # TUI green right after a stall cost the listener half a
+                # sentence is the opposite of what that indicator is for.
+                self._metrics.set_health(direction, tts=Health.OK)
+        finally:
+            # Pairs with begin() on every path, including the raise-at-call
+            # exception above. An utterance left open blocks the queue head
+            # and switches the lag cap off for this direction until the
+            # starvation bound closes it.
+            self._playout.finish(handle, truncated=truncated)
+
+        # After finish(), the handle is the single source of truth. Playout
+        # sets truncated itself when it abandons an utterance at the
+        # starvation bound, and finish() ORs rather than overwrites, so this
+        # picks up a cut-off the producer never saw. Reading the local
+        # variable instead would silently report a sentence the listener
+        # heard cut in half as a clean completion.
+        truncated = handle.truncated
+
+        if produced:
+            # Billed once the synthesizer has produced audio, not on what was
+            # heard afterward: Chirp 3 HD sends the whole input string before
+            # the first chunk comes back, so Google bills the request as soon
+            # as it has produced anything, regardless of which refusal (or
+            # none) follows. A synthesis that raises before producing any
+            # audio at all is not billed - see the exception path above.
+            self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
+
+        if handle.dropped:
+            # flush() threw the queue away - bypass engaging, or the
+            # drop-backlog hotkey called directly. Record it as dropped
+            # rather than returning silently - losing the row loses the
+            # SOURCE line too, and the remote party's sentence would read as
+            # if never spoken.
+            if self._on_record is not None:
+                self._on_record(
+                    Record(unit=unit, target_text=target_text, dropped=True)
+                )
             return
-        tts_ms = round((self._clock.monotonic() - started) * 1000, 1)
-        self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
-        latency = Latency(asr_ms=asr_ms, mt_ms=mt_ms, tts_ms=tts_ms)
+        if produced and handle.truncated and first_ms is None:
+            # Playout gave up on this utterance at the starvation bound
+            # before it ever accepted anything from it, so nothing was heard
+            # - but the sentence was said, and was billed. Losing the row
+            # would lose the source line with it, exactly as on the
+            # handle.dropped path above. No latency: there is nothing to
+            # report a wait for.
+            # Leave it that way - render_markdown (transcript.py) tells this
+            # case apart from a cut-short utterance by testing
+            # `latency.tts_ms == 0.0`, so attaching an asr/mt latency here
+            # for debugging, without also keeping tts_ms at 0.0, would
+            # silently reword every stalled utterance in the transcript as
+            # "cut short before the end" instead.
+            #
+            # `and handle.truncated` is redundant given the other two: every
+            # playout-side close that leaves first_ms unset (the starvation
+            # bound on a still-queued, never-started utterance) sets
+            # truncated in the same breath, so `produced and first_ms is
+            # None and not handle.dropped` already implies it. Kept anyway,
+            # spelled out, as defence against a future playout path that
+            # closes an utterance without setting the flag.
+            #
+            # `first_ms is None` is what scopes this to that case alone: a
+            # synthesis that fails after some audio was already accepted
+            # also produces and also ends up truncated, but first_ms is set
+            # by then, and that case belongs to the full record below, with
+            # the latency the listener actually experienced attached to it.
+            if self._on_record is not None:
+                self._on_record(
+                    Record(unit=unit, target_text=target_text, truncated=True)
+                )
+            return
+
+        if first_ms is None:
+            # Nothing playout accepted, so nothing was heard: no latency, no
+            # record, and dead-air stays armed.
+            return
+
+        tts_total_ms = round((self._clock.monotonic() - started) * 1000, 1)
+
+        latency = Latency(
+            asr_ms=asr_ms, mt_ms=mt_ms, tts_ms=first_ms, tts_total_ms=tts_total_ms
+        )
         self._metrics.set_final(direction, unit.text, target_text, latency)
-
-        self._playout.submit(Translated(unit=unit, text=target_text, pcm=pcm))
         self._metrics.set_queue_s(direction, self._playout.backlog_s())
         if self._dead_air is not None:
             self._dead_air.spoke()
             self._metrics.set_dead_air(direction, False)
 
         if self._on_record is not None:
-            self._on_record(Record(unit=unit, target_text=target_text, latency=latency))
+            self._on_record(
+                Record(
+                    unit=unit,
+                    target_text=target_text,
+                    latency=latency,
+                    truncated=truncated,
+                )
+            )
 
     def consume(self, results_q: queue_module.Queue, stop: threading.Event) -> None:
         """Drain `results_q` until it is empty AND `stop` is set.

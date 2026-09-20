@@ -50,3 +50,99 @@ against a 267 ms warm median — roughly 280 ms of connection setup paid once.
    Translation LLM already costs — and the first utterance is the one where a
    user is deciding whether the tool works at all. Cheap to fix: one throwaway
    synthesis at startup, while the graph is being rewired anyway.
+
+---
+
+## Addendum, 2026-09-20 — chunk shape, and whether early playout can underrun
+
+The original run measured time-to-first-audio and counted chunks. It never
+measured chunk *sizes* or the gaps between them, which is what decides whether
+starting playback on the first chunk risks a gap in the middle of a sentence.
+
+**Method.** Three Russian utterances (2.2 s, 6.9 s, 16.6 s of audio), three
+runs each, one warm-up discarded, `ru-RU-Chirp3-HD-Kore` on the `eu` endpoint.
+Recorded every chunk's arrival time and byte count, then simulated playing
+from the first chunk to find the smallest the buffer ever gets.
+
+**Result.**
+
+| utterance | audio | chunks | full synthesis | first chunk | ratio |
+|---|---|---|---|---|---|
+| short | 2200 ms | 10 | 465 ms | 194 ms | 4.7x realtime |
+| medium | 6880 ms | 29 | 1052 ms | 208 ms | 6.5x realtime |
+| long | 16560 ms | 70 | 2339 ms | 230 ms | 7.1x realtime |
+
+Time-to-first-audio across all nine runs: 182-337 ms, consistent with the
+186-267 ms medians above.
+
+The shape is strikingly regular:
+
+- the **first chunk is always exactly 200 ms of audio**
+- every chunk after it is **240 ms of audio, arriving every ~30 ms**
+- longer text synthesises *faster* relative to real time, not slower
+
+**The buffer never gets tighter than the first chunk.** Simulating playback
+from the moment chunk 1 arrives, the minimum buffer margin was **200 ms in all
+nine runs** — identical to the first chunk's own duration, because production
+outruns consumption from that point on and the margin only grows.
+
+**Consequence.**
+
+1. **Early playout cannot underrun on a healthy connection.** Pacing is not a
+   risk; only a network stall is. This removes the main objection to
+   exploiting the streaming generator.
+2. **The win scales with sentence length** — 271 ms short, 844 ms medium,
+   2109 ms long — so it is largest exactly where the current
+   `b"".join(...)` hurts most.
+3. **A 400 ms start threshold costs ~30 ms** and doubles the stall margin to
+   440 ms, because chunk 2 arrives ~30 ms after chunk 1. Adopted in the
+   streaming-playout design.
+4. **The lag cap does not need to become an estimate.** At 4.7-7.1x realtime,
+   counting only arrived bytes understates backlog by a fraction of one
+   utterance and self-corrects within about a second. `tts.py`'s docstring
+   claim that early playout forces an estimated backlog is wrong, and is
+   corrected as part of that work.
+
+---
+
+## Addendum, 2026-09-20 — the win, measured through the real pipeline
+
+The table at the top of this file compares time-to-first-chunk against full
+synthesis wall time **at the API**. That is the size of the prize, not the
+size of the win: it does not account for the 400 ms start threshold playout
+waits out, nor for anything else `_speak` does between receiving a chunk and
+handing it over. This addendum measures what the pipeline actually delivers,
+so the branch's headline figure has a record that can be reproduced rather
+than only an argument.
+
+**Method.** Drive the real `DirectionPipeline` and the real `Playout` with a
+synthesizer shaped to this experiment's own measurements — first chunk 200 ms
+of audio arriving at 200 ms, every later chunk 240 ms arriving 30 ms apart —
+on a `FakeClock`, so the numbers are exact rather than sampled. Read
+`Latency.tts_ms` (the wait until playout accepted a chunk, i.e. when the
+listener hears the sentence begin) against `Latency.tts_total_ms` (the wait
+the listener would have had before streaming, when `_speak` joined the whole
+generator first).
+
+**Result.**
+
+| utterance | heard at | full synthesis | saved |
+|---|---|---|---|
+| short, 2.2 s | 200 ms | 470 ms | **270 ms** |
+| medium, 6.9 s | 200 ms | 1040 ms | **840 ms** |
+| long, 16.6 s | 200 ms | 2270 ms | **2070 ms** |
+
+**Consequence.**
+
+1. The delivered win matches the prize at the API almost exactly (270/840/2070
+   against 271/844/2109). The start threshold's ~30 ms is real but is absorbed
+   into the first chunk's own 200 ms, because chunk 2 lands 30 ms after chunk
+   1 and the threshold clears on it.
+2. **The listener hears every sentence at 200 ms regardless of its length.**
+   That is the part worth remembering: before streaming, the wait grew with
+   the sentence, so the longest sentences — the ones carrying the most — were
+   the ones that arrived latest.
+3. This is a simulation of measured timing, not a live call. It pins what the
+   pipeline does with a known input; it does not capture jitter, and the two
+   constants it exercises (`START_BUFFER_S`, `STARVE_LIMIT_TICKS`) have still
+   never been tested against a real conversation. See `docs/manual-smoke.md`.

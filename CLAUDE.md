@@ -24,7 +24,7 @@ imported. The two repositories share no runtime dependency.
 `sidetap/` is the application; see **Architecture** below for the module
 table.
 
-`tests/` holds 349 tests that run with no audio hardware, no network and no
+`tests/` holds 435 tests that run with no audio hardware, no network and no
 credentials — every subprocess, socket and clock the package touches sits
 behind a `Protocol` in `ports.py`, with a real implementation in
 `adapters.py` and a fake in `tests/conftest.py`.
@@ -63,7 +63,7 @@ pw-cli --version                   # needs >= 0.3.60
 pw-dump | head                     # graph as JSON
 wpctl status                       # sinks/sources, incl. sidetap's own nodes
 
-uv run pytest -q                                   # 349 tests, no audio/network/creds needed
+uv run pytest -q                                   # 435 tests, no audio/network/creds needed
 uv run sidetap devices                              # run this MID-CALL, not before
 uv run sidetap doctor                               # environment checks
 uv run sidetap doctor --install                     # write the virtual-mic config (once)
@@ -154,7 +154,7 @@ second implementation.
 | `segment.py` | the `Segmenter` seam; `FinalsOnlySegmenter` for v1 |
 | `translate.py` | Cloud Translation v3 adapter, NMT fallback |
 | `tts.py` | Chirp 3 HD streaming synthesis adapter |
-| `playout.py` | lag-capped queue, `DuckControl`, PCM writer |
+| `playout.py` | lag-capped queue of growable utterances, `DuckControl`, PCM writer |
 | `routing.py` | duck loopback lifecycle, re-route, journal, restore |
 | `pipeline.py` | `DirectionPipeline` — wires one direction's stages end to end |
 | `metrics.py` | per-stage latency, queue depth, stage health, cost — the TUI's only input |
@@ -195,7 +195,7 @@ as a style preference and this is not one.
   `google.cloud.translate` client — its `google.api_core.exceptions` import
   stays at module level, since it needs no network or credentials), not at
   module level. `webrtcvad` the same way (`vad.py:webrtc_detector`), with a
-  fallback to a no-op gate if it is missing. This is what lets 349 tests
+  fallback to a no-op gate if it is missing. This is what lets 435 tests
   import the package and run with no credentials configured at all — a
   top-level `from google.cloud import X` would make every test that merely
   imports the module require live credentials to collect.
@@ -285,6 +285,21 @@ as a style preference and this is not one.
   through `on_audio_sent`, because Google bills them identically — counting
   only real speech would understate a quiet call left running unattended,
   which is the one a user is most likely to forget about.
+- **Playout starts an utterance before it has been fully synthesised.**
+  `DirectionPipeline._speak` appends chunks to a `playout.Utterance` as they
+  arrive rather than joining the generator, which is worth 271 ms on a short
+  sentence and 2109 ms on a long one. Three consequences that are easy to
+  break: an utterance that has *started* and then run dry holds the duck
+  **closed**, because opening it would let a burst of the untranslated
+  original through a mid-sentence gap — bounded by `STARVE_LIMIT_TICKS` so a
+  dead producer cannot silence the remote party for the rest of the call; the
+  lag cap never drops an utterance that is still arriving, since its duration
+  is unknown and it is always the newest thing queued; and every `begin()`
+  must be paired with a `finish()` on every exit path, or an orphaned open
+  utterance sits at the queue head where the trim loop breaks, switching the
+  lag cap off for that direction — bounded by the same `STARVE_LIMIT_TICKS`,
+  since a head stuck unstartable for that long gets force-closed in place
+  regardless of what left it open.
 
 ## Things that bite at runtime
 

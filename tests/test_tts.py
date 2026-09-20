@@ -1,4 +1,5 @@
 import pytest
+from google.api_core import exceptions as gexc
 
 from sidetap.tts import ChirpSynthesizer, TtsConfig, tts_endpoint, voice_language
 
@@ -8,9 +9,11 @@ class FakeTtsClient:
         self.chunks = list(chunks)
         self.error = error
         self.requests = None
+        self.timeout = None
 
-    def streaming_synthesize(self, requests):
+    def streaming_synthesize(self, requests, timeout=None):
         self.requests = list(requests)
+        self.timeout = timeout
         if self.error is not None:
             raise self.error
         for chunk in self.chunks:
@@ -96,7 +99,7 @@ def test_the_speaking_rate_reaches_the_streaming_config():
     sent = {}
 
     class Client:
-        def streaming_synthesize(self, requests):
+        def streaming_synthesize(self, requests, timeout=None):
             first = next(iter(requests))
             sent["rate"] = first.streaming_config.streaming_audio_config.speaking_rate
             return iter(())
@@ -104,3 +107,50 @@ def test_the_speaking_rate_reaches_the_streaming_config():
     synth = ChirpSynthesizer(TtsConfig(speaking_rate=1.3), Client())
     list(synth.synthesize("привет", "ru-RU-Chirp3-HD-Kore"))
     assert sent["rate"] == pytest.approx(1.3)
+
+
+# --- deadline on the streaming call -----------------------------------------
+#
+# Without a deadline, a hung streaming_synthesize call parks
+# DirectionPipeline._speak's `for chunk in chunks` loop forever: the direction's
+# results queue backs up unbounded and the tts health marker stays green,
+# because Health is only set on the loop's exit paths, none of which run while
+# parked. asr.py already guards its own streaming call the identical way
+# (STREAM_TIMEOUT_S there); this is tts.py's copy of that guard.
+
+
+def test_a_deadline_is_passed_to_streaming_synthesize():
+    from sidetap.tts import STREAM_TIMEOUT_S
+
+    client = FakeTtsClient()
+    synth = ChirpSynthesizer(_config(), client)
+    list(synth.synthesize("hi", "en-US-Chirp3-HD-Charon"))
+
+    assert client.timeout == STREAM_TIMEOUT_S
+
+
+def test_a_deadline_exceeded_mid_stream_still_yields_the_chunks_already_received():
+    """The exception must propagate out of the generator, not be swallowed -
+    and whatever arrived before it must still come out first.
+
+    This is what lets DirectionPipeline._speak keep audio already accepted by
+    playout: it appends each chunk as it is yielded, so a generator that
+    forwards the earlier chunk before raising is what makes "what had already
+    arrived is still spoken" true up in the pipeline, rather than an
+    assumption about a layer this test does not touch.
+    """
+
+    class Client:
+        def streaming_synthesize(self, requests, timeout=None):
+            class Response:
+                audio_content = b"\x01\x02"
+
+            yield Response()
+            raise gexc.DeadlineExceeded("synthesis stalled")
+
+    synth = ChirpSynthesizer(_config(), Client())
+    chunks = synth.synthesize("hi", "en-US-Chirp3-HD-Charon")
+
+    assert next(chunks) == b"\x01\x02"
+    with pytest.raises(gexc.DeadlineExceeded):
+        next(chunks)

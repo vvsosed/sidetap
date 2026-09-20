@@ -144,6 +144,12 @@ your raw voice at all. Concretely —
   (via a loopback node sidetap owns, `wpctl set-volume`d to 0) and you hear
   only the translation. In the gaps between utterances their original plays
   normally.
+- **If synthesis stalls mid-sentence you hear nothing from anyone** until it
+  resumes, for at most two seconds. The duck stays shut across the gap
+  deliberately: letting the original back in for a moment mid-sentence is
+  more jarring than a short silence. Past two seconds sidetap gives the
+  sentence up and their voice returns, because a duck that stays shut leaves
+  you talking to someone who cannot hear you.
 - Your voice is recognised, translated and synthesised, and *only* the
   synthesised result reaches the messenger, through the virtual microphone.
   Your real microphone is never linked into the call outside of bypass.
@@ -185,9 +191,10 @@ suppressed, and unmuting does not play back what accumulated while muted, for
 the same reason.
 
 `f` (drop backlog) clears every queued-but-not-yet-started utterance on both
-directions. **It cannot cut the current sentence short.** Experiment 2
-measured 441 ms of audio still sitting in `pw-cat`'s own buffer at the moment
-the hotkey fires — that audio is already past this process's control and
+directions, **and cuts the one in progress short too**. What you still hear
+is the audio already past this process's control: experiment 2 measured
+441 ms of it sitting in `pw-cat`'s own buffer at the moment the hotkey fires,
+and that audio is already past this process's control and
 plays out regardless. `f` prevents the *next* sentence, not the one in
 progress; expect a short tail after pressing it.
 
@@ -197,9 +204,12 @@ Ctrl-C stops the session and writes `transcripts/<session>.jsonl` and
 `transcripts/<session>.md` — a bilingual transcript, both directions in
 chronological order. The `.jsonl` is opened in append mode and flushed after
 every final unit, so an unclean exit still leaves everything up to that
-moment on disk; utterances the lag cap dropped are written too, marked
-`_(not spoken: backlog dropped)_` in the Markdown rather than silently
-missing.
+moment on disk; an utterance the listener did not fully hear is written too
+rather than silently missing, marked in the Markdown with why:
+`_(not spoken)_` when the lag cap or bypass discarded it,
+`_(not spoken: synthesis stalled)_` when the producer went quiet before a
+single chunk was played, and `_(cut short before the end)_` when it was
+playing and stopped.
 
 ## Cost
 
@@ -246,7 +256,7 @@ aspirational TODOs.
   means there is no overlay to fall back on, and v1 only translates complete,
   finalised utterances (no incremental commit yet) — so both parties talking
   continuously without pausing pushes the translation further and further
-  behind rather than keeping pace, until the lag cap (default 12 s) starts
+  behind rather than keeping pace, until the lag cap (default 20 s) starts
   dropping the oldest queued utterances.
 - **Cloud Translation cannot be pinned to `europe-west3`.** Unlike
   Speech-to-Text, Translation only accepts `global` or `us-central1`
@@ -255,13 +265,16 @@ aspirational TODOs.
   over its own latency budget, in exchange for a real but modest quality gain
   that shows up on idiom rather than plain sentences — it falls back to NMT
   automatically on error, and `--mt-model general/nmt` switches it by hand.
-- **TTS streaming isn't exploited yet.** Chirp 3 HD synthesis is genuinely
-  incremental (Experiment 4 measured 6.2 s of audio arriving as 27 separate
-  chunks, the first one at a 186–267 ms warm median across the two voices
-  tested), but the pipeline currently joins a whole utterance's audio before
-  handing it to playout, because the lag cap needs an utterance's total
-  duration up front. The latency that actually applies today is full
-  synthesis wall time, not time-to-first-chunk.
+- **Felt latency is dominated by ASR and MT, not synthesis.** The same wait
+  for a finalised result that sets the cadence above also sets the latency
+  floor: nothing downstream of recognition starts until Chirp 3 declares a
+  result final. Synthesis itself is not the bottleneck —
+  `DirectionPipeline._speak` already starts playout at time-to-first-chunk
+  rather than the whole utterance (271 ms saved on a short sentence, 2109 ms
+  on a long one, Experiment 4) — but that gain sits downstream of the wait
+  above. `segment.py`'s `FinalsOnlySegmenter` is the placeholder seam for
+  LocalAgreement-2, which would cut the wait itself; that seam exists and is
+  unused.
 - **`aggressiveness = 2`** in the silence gate is applied identically to both
   directions, but it is tuned (per its own docstring) for a raw room
   microphone; the remote direction arrives already compressed, AGC'd and

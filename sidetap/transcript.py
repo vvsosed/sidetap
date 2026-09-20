@@ -37,10 +37,12 @@ def record_to_dict(record: Record) -> dict:
         "source": record.unit.text,
         "target": record.target_text,
         "dropped": record.dropped,
+        "truncated": record.truncated,
         "latency": {
             "asr_ms": record.latency.asr_ms,
             "mt_ms": record.latency.mt_ms,
             "tts_ms": record.latency.tts_ms,
+            "tts_total_ms": record.latency.tts_total_ms,
             "total_ms": record.latency.total_ms,
         },
         "wall_clock": datetime.now(timezone.utc).isoformat(),
@@ -56,7 +58,23 @@ def render_markdown(session: str, records: list[Record]) -> str:
             lines.append("")
             lines.append(f"**{label}** _{hhmmss(record.unit.t_start)}_")
             last_label = label
-        suffix = "  _(not spoken: backlog dropped)_" if record.dropped else ""
+        if record.dropped:
+            # Bypass and the lag cap both produce a dropped record, so this
+            # must not name either mechanism specifically - "backlog
+            # dropped" used to read as the lag cap even when the user had
+            # pressed bypass and the backlog never fired.
+            suffix = "  _(not spoken)_"
+        elif record.truncated and record.latency.tts_ms == 0.0:
+            # Playout gave up before it ever accepted anything: nothing was
+            # heard. "Cut short" implies a beginning this utterance never
+            # had - tts_ms == 0.0 is exactly the signal that distinguishes
+            # it from the case below, since the jsonl already carries that
+            # distinction and the markdown otherwise renders both the same.
+            suffix = "  _(not spoken: synthesis stalled)_"
+        elif record.truncated:
+            suffix = "  _(cut short before the end)_"
+        else:
+            suffix = ""
         lines.append(f"{record.target_text}{suffix}")
         lines.append(f"> {record.unit.text}")
     return "\n".join(lines) + "\n"

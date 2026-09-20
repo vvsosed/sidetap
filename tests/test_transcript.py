@@ -1,6 +1,12 @@
 import json
 
-from sidetap.transcript import LABELS, BilingualTranscript, hhmmss, render_markdown
+from sidetap.transcript import (
+    LABELS,
+    BilingualTranscript,
+    hhmmss,
+    record_to_dict,
+    render_markdown,
+)
 from sidetap.types import Direction, Latency, Record, Unit
 
 
@@ -86,7 +92,10 @@ def test_markdown_shows_both_languages():
 
 def test_markdown_marks_a_dropped_utterance():
     markdown = render_markdown("s", [_record(dropped=True)])
-    assert "not spoken" in markdown.lower()
+    assert "_(not spoken)_" in markdown
+    # Bypass and the lag cap both produce a dropped record - naming either
+    # mechanism here would be wrong for the other one.
+    assert "backlog" not in markdown.lower()
 
 
 def test_a_write_after_close_is_ignored_rather_than_raising(tmp_path):
@@ -119,3 +128,54 @@ def test_the_session_name_has_sub_second_resolution(tmp_path):
     a = BilingualTranscript(tmp_path).session
     b = BilingualTranscript(tmp_path).session
     assert a != b
+
+
+def test_a_truncated_record_with_some_audio_heard_is_marked_cut_short():
+    """Some audio was queued before the cutoff - tts_ms says so - so the
+    listener heard the beginning of the sentence before it stopped."""
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(
+        unit=unit,
+        target_text="privet",
+        latency=Latency(tts_ms=200.0),
+        truncated=True,
+    )
+    text = render_markdown("s", [record])
+    assert "_(cut short before the end)_" in text
+
+
+def test_a_truncated_record_with_no_audio_heard_is_marked_stalled():
+    """Playout never accepted anything from this utterance - tts_ms stayed
+    at its 0.0 default - so nothing was heard at all. "Cut short" would
+    wrongly imply a beginning it never had."""
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(unit=unit, target_text="privet", truncated=True)
+    text = render_markdown("s", [record])
+    assert "_(not spoken: synthesis stalled)_" in text
+
+
+def test_a_normal_record_carries_no_suffix_in_the_markdown():
+    # Neither dropped nor truncated - nothing prevented it from being fully
+    # spoken, so the line should read as plain text with no annotation.
+    text = render_markdown("s", [_record()])
+    assert "_(" not in text
+
+
+def test_the_jsonl_row_carries_truncation_and_full_synthesis_time():
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(
+        unit=unit,
+        target_text="privet",
+        latency=Latency(tts_ms=200.0, tts_total_ms=2339.0),
+        truncated=True,
+    )
+    row = record_to_dict(record)
+    assert row["truncated"] is True
+    assert row["latency"]["tts_total_ms"] == 2339.0
+
+
+def test_the_jsonl_row_defaults_truncated_to_false():
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(unit=unit, target_text="privet")
+    row = record_to_dict(record)
+    assert row["truncated"] is False
