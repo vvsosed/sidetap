@@ -126,6 +126,17 @@ def test_finished_items_are_reported_once():
     assert len(spoken) == 1
 
 
+def test_a_submitted_utterance_with_no_audio_reports_nothing():
+    """A real TTS response can return zero bytes for non-empty text - unlike
+    finish()'s empty-pcm case, submit() never unqueues it, so this is the
+    only way the closed/offset==0 branch in _advance_locked is reached."""
+    spoken = []
+    playout = Playout(Direction.IN, FakeAudioSink(), on_spoken=spoken.append)
+    playout.submit(_translated(0))
+    assert playout.tick() is False
+    assert spoken == []
+
+
 def test_flush_drops_the_queue_but_not_the_chunk_in_flight():
     """pw-cat cannot unplay bytes already in the pipe.
 
@@ -387,14 +398,23 @@ def test_a_sub_chunk_append_does_not_get_padded_and_played():
     silence into the middle of a word, and would also never let a future
     starvation counter increment (it only counts unread == 0), holding the
     duck closed with no bound while a trickling producer stalls.
+
+    The item must first clear the 400 ms start threshold and become
+    _current, or it is never promoted at all and this exercises nothing -
+    a fragment sitting untouched in _queue looks identical to one that was
+    correctly withheld from an open _current.
     """
     sink = FakeAudioSink()
     playout = Playout(Direction.IN, sink)
     item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))  # 20 chunks
+    for _ in range(20):
+        assert playout.tick() is True  # promotes it, then drains it - still open
+
     playout.append(item, b"\x01\x02" * 10)  # far under one 20 ms chunk
 
     assert playout.tick() is False
-    assert sink.written == b"\x00" * CHUNK_BYTES
+    assert sink.chunks[-1] == b"\x00" * CHUNK_BYTES
 
 
 def test_the_final_partial_chunk_of_a_closed_utterance_is_padded():

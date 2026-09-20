@@ -307,7 +307,16 @@ class Playout:
         """Hold a new utterance until it can absorb a stall.
 
         `closed` comes first: an utterance shorter than the threshold is
-        complete, so waiting for more audio would wait forever.
+        complete, so waiting for more audio would wait forever. It must
+        stay `or`, not `and` - swap it and every utterance under 400ms
+        becomes unplayable and is silently lost, closed or not.
+
+        A head held here, still open, whose producer dies before it clears
+        the threshold blocks itself and everything queued behind it for the
+        rest of the call - nothing here bounds that wait, unlike a stalled
+        _current, which the starvation counter in _advance_locked already
+        covers. Task 3 extends that same bound to this un-started head;
+        until then this is simply "not yet".
         """
         return item.closed or item.audio_s >= START_BUFFER_S
 
