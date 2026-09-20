@@ -683,3 +683,75 @@ def test_finish_does_not_downgrade_a_truncation_playout_already_recorded():
 
     playout.finish(item)  # producer's generator exhausts normally, after the fact
     assert item.truncated is True  # still true - not overwritten by the default
+
+
+def test_finish_without_truncation_leaves_the_utterance_unmarked():
+    """The sibling of the sticky-truncated test above: nothing pins the
+    default. Mutating `item.truncated = item.truncated or truncated` to an
+    unconditional `True` would mark every normally-completed utterance
+    truncated, and no existing assertion catches it - the suite's other two
+    `truncated is False` checks are both on items that were never
+    finish()ed at all."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    playout.finish(item)
+    assert item.truncated is False
+
+
+def test_retiring_a_starved_utterance_does_not_carry_the_counter_to_the_next_head():
+    """Same failure shape as the abandon-path counter leak, reached by a
+    different route: the producer itself calls finish() while _current is
+    starved but before the bound fires, so the next tick takes the retire
+    branch (`elif self._current.closed`) instead of the abandon branch.
+    Without that branch's own reset, N leftover ticks would cost the next
+    queued utterance N of its own 100-tick budget - illustrated here with
+    N=90, a 1.8s stall followed by the producer erroring out."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    stalling = playout.begin(_unit(), "stalling")
+    playout.append(stalling, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    for _ in range(20):
+        playout.tick()  # clears the threshold; stalling becomes _current
+
+    for _ in range(90):
+        assert playout.tick() is False  # starved, well under the bound
+
+    playout.finish(stalling, truncated=True)  # the producer itself gives up
+    assert playout.tick() is False  # retires here - the retire branch, not abandon
+
+    # Begun after the retirement, with its own live producer - just not
+    # enough audio yet to clear the start threshold on its own.
+    healthy = playout.begin(_unit(), "healthy")
+    playout.append(healthy, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+
+    # `healthy` gets its own full budget rather than inheriting the 90
+    # leftover ticks from `stalling`'s retirement.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        playout.tick()
+    assert healthy.truncated is False
+    assert healthy.closed is False
+
+
+def test_an_emptied_queue_does_not_carry_the_counter_to_the_next_head():
+    """finish() unqueues a never-started, empty-audio head immediately, with
+    no length guard - so the queue can empty out from under the un-started-
+    head branch while it is mid-count. Only the idle branch's own reset
+    clears that count before the next utterance begins."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    empty = playout.begin(_unit(), "empty")  # no append: audio_s stays 0
+
+    for _ in range(10):
+        assert playout.tick() is False  # under threshold, counted in case 2
+
+    playout.finish(empty)  # no audio ever arrived: unqueued immediately
+    assert playout.tick() is False  # queue and _current both empty: idle path
+
+    healthy = playout.begin(_unit(), "healthy")
+    playout.append(healthy, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+
+    # `healthy` gets its own full budget rather than inheriting the 10
+    # leftover ticks from the cleared head.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        playout.tick()
+    assert healthy.truncated is False
+    assert healthy.closed is False
