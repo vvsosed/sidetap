@@ -61,7 +61,7 @@ def render_markdown(session: str, records: list[Record]) -> str:
         if record.dropped:
             suffix = "  _(not spoken: backlog dropped)_"
         elif record.truncated:
-            suffix = "  _(cut short: synthesis failed)_"
+            suffix = "  _(cut short before the end)_"
         else:
             suffix = ""
         lines.append(f"{record.target_text}{suffix}")

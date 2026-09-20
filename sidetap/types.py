@@ -131,15 +131,18 @@ class Latency:
     asr_ms: float = 0.0
     mt_ms: float = 0.0
     tts_ms: float = 0.0
-    # Full synthesis wall time. Deliberately NOT part of total_ms: playout
-    # starts on the first chunk, so what the listener waited for is tts_ms,
-    # and adding the rest back would make the TUI overstate felt latency by
-    # exactly the amount streaming saved. Kept because it is still the
-    # throughput and cost signal.
+    # Full synthesis wall time. Deliberately NOT part of total_ms: once
+    # playout starts on the first chunk instead of waiting for the whole
+    # utterance, what the listener waited for is tts_ms, and adding the rest
+    # back would make the TUI overstate felt latency by exactly what
+    # streaming saves. Until the pipeline streams, _speak still joins the
+    # whole generator, so tts_ms and tts_total_ms measure the same thing.
+    # Kept because it is still the throughput and cost signal.
     tts_total_ms: float = 0.0
 
     @property
     def total_ms(self) -> float:
+        # Excludes tts_total_ms on purpose - see its field comment above.
         return self.asr_ms + self.mt_ms + self.tts_ms
 
 

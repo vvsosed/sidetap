@@ -131,7 +131,14 @@ def test_a_truncated_record_is_marked_in_the_markdown():
     unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
     record = Record(unit=unit, target_text="privet", truncated=True)
     text = render_markdown("s", [record])
-    assert "_(cut short: synthesis failed)_" in text
+    assert "_(cut short before the end)_" in text
+
+
+def test_a_normal_record_carries_no_suffix_in_the_markdown():
+    # Neither dropped nor truncated - nothing prevented it from being fully
+    # spoken, so the line should read as plain text with no annotation.
+    text = render_markdown("s", [_record()])
+    assert "_(" not in text
 
 
 def test_the_jsonl_row_carries_truncation_and_full_synthesis_time():
@@ -145,3 +152,10 @@ def test_the_jsonl_row_carries_truncation_and_full_synthesis_time():
     row = record_to_dict(record)
     assert row["truncated"] is True
     assert row["latency"]["tts_total_ms"] == 2339.0
+
+
+def test_the_jsonl_row_defaults_truncated_to_false():
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(unit=unit, target_text="privet")
+    row = record_to_dict(record)
+    assert row["truncated"] is False
