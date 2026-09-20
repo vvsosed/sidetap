@@ -157,8 +157,19 @@ when it is the sole queued item. The trim loop breaks on it rather than
 spinning.
 
 This rests on an invariant worth stating explicitly: **at most one utterance
-per direction is open at a time**, because `_speak` runs sequentially on that
-direction's consume thread and exhausts its generator before returning.
+per direction is open at a time**. `_speak` runs sequentially on that
+direction's consume thread, so it cannot begin a second utterance while one
+is in flight — but sequencing alone is not what upholds this. The
+load-bearing property is that **every `begin()` is paired with a `finish()`
+on every exit path**, which is why `_speak` wraps that window in
+`try/finally`.
+
+Exhausting the generator is *not* the guarantee: `_speak` can return without
+one ever being created, since `Synthesizer` is typed as returning an
+`Iterator` and a non-generator implementation may raise at call time. An
+orphaned open utterance does not merely linger — it sits at the queue head,
+where the trim loop breaks on it, so the lag cap is off for that direction
+until the starvation bound closes it two seconds later.
 
 Cancellation (`append() -> False`) is therefore driven by `flush()`, not by
 the cap — that is, by bypass, which is the case that matters: entering bypass
