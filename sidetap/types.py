@@ -131,6 +131,12 @@ class Latency:
     asr_ms: float = 0.0
     mt_ms: float = 0.0
     tts_ms: float = 0.0
+    # Full synthesis wall time. Deliberately NOT part of total_ms: playout
+    # starts on the first chunk, so what the listener waited for is tts_ms,
+    # and adding the rest back would make the TUI overstate felt latency by
+    # exactly the amount streaming saved. Kept because it is still the
+    # throughput and cost signal.
+    tts_total_ms: float = 0.0
 
     @property
     def total_ms(self) -> float:
@@ -145,6 +151,7 @@ class Record:
     target_text: str
     latency: Latency = field(default_factory=Latency)
     dropped: bool = False
+    truncated: bool = False
 
     @property
     def direction(self) -> Direction:

@@ -37,10 +37,12 @@ def record_to_dict(record: Record) -> dict:
         "source": record.unit.text,
         "target": record.target_text,
         "dropped": record.dropped,
+        "truncated": record.truncated,
         "latency": {
             "asr_ms": record.latency.asr_ms,
             "mt_ms": record.latency.mt_ms,
             "tts_ms": record.latency.tts_ms,
+            "tts_total_ms": record.latency.tts_total_ms,
             "total_ms": record.latency.total_ms,
         },
         "wall_clock": datetime.now(timezone.utc).isoformat(),
@@ -56,7 +58,12 @@ def render_markdown(session: str, records: list[Record]) -> str:
             lines.append("")
             lines.append(f"**{label}** _{hhmmss(record.unit.t_start)}_")
             last_label = label
-        suffix = "  _(not spoken: backlog dropped)_" if record.dropped else ""
+        if record.dropped:
+            suffix = "  _(not spoken: backlog dropped)_"
+        elif record.truncated:
+            suffix = "  _(cut short: synthesis failed)_"
+        else:
+            suffix = ""
         lines.append(f"{record.target_text}{suffix}")
         lines.append(f"> {record.unit.text}")
     return "\n".join(lines) + "\n"

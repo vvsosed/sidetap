@@ -1,6 +1,12 @@
 import json
 
-from sidetap.transcript import LABELS, BilingualTranscript, hhmmss, render_markdown
+from sidetap.transcript import (
+    LABELS,
+    BilingualTranscript,
+    hhmmss,
+    record_to_dict,
+    render_markdown,
+)
 from sidetap.types import Direction, Latency, Record, Unit
 
 
@@ -119,3 +125,23 @@ def test_the_session_name_has_sub_second_resolution(tmp_path):
     a = BilingualTranscript(tmp_path).session
     b = BilingualTranscript(tmp_path).session
     assert a != b
+
+
+def test_a_truncated_record_is_marked_in_the_markdown():
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(unit=unit, target_text="privet", truncated=True)
+    text = render_markdown("s", [record])
+    assert "_(cut short: synthesis failed)_" in text
+
+
+def test_the_jsonl_row_carries_truncation_and_full_synthesis_time():
+    unit = Unit(direction=Direction.IN, text="hello", t_start=1.0, t_end=1.0)
+    record = Record(
+        unit=unit,
+        target_text="privet",
+        latency=Latency(tts_ms=200.0, tts_total_ms=2339.0),
+        truncated=True,
+    )
+    row = record_to_dict(record)
+    assert row["truncated"] is True
+    assert row["latency"]["tts_total_ms"] == 2339.0

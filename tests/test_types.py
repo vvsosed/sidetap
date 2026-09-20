@@ -82,3 +82,9 @@ def test_record_defaults_to_not_dropped():
     unit = Unit(direction=Direction.IN, text="a", t_start=0.0, t_end=1.0)
     record = Record(unit=unit, target_text="b", latency=Latency())
     assert record.dropped is False
+
+
+def test_full_synthesis_time_is_recorded_but_not_counted_as_felt_latency():
+    latency = Latency(asr_ms=100.0, mt_ms=50.0, tts_ms=200.0, tts_total_ms=2339.0)
+    # total_ms is what the listener waited, not what synthesis cost.
+    assert latency.total_ms == 350.0
