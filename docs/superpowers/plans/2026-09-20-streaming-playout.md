@@ -1031,8 +1031,10 @@ needs its own field. tts_total_ms is deliberately not part of total_ms:
 playout starts on the first chunk, and adding the rest back would make the
 TUI overstate felt latency by exactly what streaming saved.
 
-Record gains truncated, so a sentence cut short by a synthesis failure
-reads differently in the transcript from one the lag cap never spoke.
+Record gains truncated, so a sentence cut short reads differently in the
+transcript from one the lag cap never spoke. The marker names no cause,
+because truncation has two: a synthesis exception, and playout abandoning
+a stalled utterance.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 MSG
