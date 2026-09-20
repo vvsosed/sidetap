@@ -153,18 +153,25 @@ class DirectionPipeline:
 
         started = self._clock.monotonic()
         handle = self._playout.begin(unit, target_text)
-        chunks = self._synthesizer.synthesize(
-            target_text, self._config.voice, self._config.speaking_rate
-        )
-        first_ms: float | None = None
+        first_ms: float | None = None  # time to the first chunk PLAYOUT ACCEPTED
+        produced = False  # the synthesizer yielded at least one chunk: billed
         truncated = False
         refused = False
         try:
+            # Inside the try, not before it: the Synthesizer port is typed as
+            # an Iterator, which permits a non-generator implementation whose
+            # call itself can raise before any iteration happens. A raise
+            # anywhere in here - at call time or mid-iteration - must still
+            # reach finally below, or the utterance it opened is orphaned:
+            # open forever, blocking the queue head and switching the lag cap
+            # off for this direction until the starvation bound closes it.
+            chunks = self._synthesizer.synthesize(
+                target_text, self._config.voice, self._config.speaking_rate
+            )
             for chunk in chunks:
                 if not chunk:
                     continue
-                if first_ms is None:
-                    first_ms = round((self._clock.monotonic() - started) * 1000, 1)
+                produced = True
                 if not self._playout.append(handle, chunk):
                     # Playout will not take any more: either bypass flushed
                     # the queue, or playout gave the utterance up at the
@@ -178,6 +185,14 @@ class DirectionPipeline:
                         closer()
                     refused = True
                     break
+                if first_ms is None:
+                    # Set only once playout has actually taken the chunk -
+                    # not when the synthesizer produced it. Setting it
+                    # earlier would call a chunk playout immediately refused
+                    # "heard", which flows into a latency figure, a
+                    # transcript row and dead_air.spoke() for audio nobody
+                    # was ever played.
+                    first_ms = round((self._clock.monotonic() - started) * 1000, 1)
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)
             self._metrics.set_health(direction, tts=Health.FAILED)
@@ -191,8 +206,12 @@ class DirectionPipeline:
                 # right after a stall cost the listener half a sentence is the
                 # opposite of what that indicator is for.
                 self._metrics.set_health(direction, tts=Health.OK)
-
-        self._playout.finish(handle, truncated=truncated)
+        finally:
+            # Pairs with begin() on every path, including the raise-at-call
+            # exception above. An utterance left open blocks the queue head
+            # and switches the lag cap off for this direction until the
+            # starvation bound closes it.
+            self._playout.finish(handle, truncated=truncated)
 
         # After finish(), the handle is the single source of truth. Playout
         # sets truncated itself when it abandons an utterance at the
@@ -202,22 +221,31 @@ class DirectionPipeline:
         # heard cut in half as a clean completion.
         truncated = handle.truncated
 
+        if produced:
+            # Billed on the request, not on what was heard: Chirp 3 HD sends
+            # the whole input string before the first chunk comes back, so
+            # Google bills it the moment the request goes out regardless of
+            # which refusal follows. Charging only the starvation-close case
+            # and not the bypass-flush case - or vice versa - would
+            # understate the call's real cost.
+            self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
+
         if handle.dropped:
-            # Bypass threw the queue away. The parties are talking to each
-            # other unmediated, so a transcript row for a translation nobody
-            # is listening to would misrepresent the call.
+            # Bypass threw the queue away. Record it as dropped rather than
+            # returning silently - losing the row loses the SOURCE line too,
+            # and the remote party's sentence would read as if never spoken.
+            if self._on_record is not None:
+                self._on_record(
+                    Record(unit=unit, target_text=target_text, dropped=True)
+                )
             return
 
         if first_ms is None:
-            # Failed before producing anything, or produced nothing at all.
-            # Byte-for-byte the pre-streaming behaviour: nothing queued, no
-            # record, no cost.
+            # Nothing playout accepted, so nothing was heard: no latency, no
+            # record, and dead-air stays armed.
             return
 
         tts_total_ms = round((self._clock.monotonic() - started) * 1000, 1)
-        # Charged even when truncated: the request went out and produced
-        # audio, and the listener heard it.
-        self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
         latency = Latency(
             asr_ms=asr_ms, mt_ms=mt_ms, tts_ms=first_ms, tts_total_ms=tts_total_ms

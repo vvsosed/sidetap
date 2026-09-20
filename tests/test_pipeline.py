@@ -424,11 +424,19 @@ def test_a_playout_side_truncation_is_recorded_though_the_producer_finished_clea
     assert records[0].truncated is True
 
 
-def test_a_bypass_flushed_utterance_produces_no_record_and_no_cost():
-    """dropped must short-circuit before a record or a synthesis charge.
+def test_a_bypass_flushed_utterance_still_gets_a_transcript_row_and_a_bill():
+    """dropped is a marker on the row, not a reason to omit it - or the bill.
 
-    The parties are talking unmediated during bypass, so a transcript row -
-    or a bill - for a translation nobody heard would misrepresent the call.
+    Returning silently on a bypass flush loses the SOURCE line too: the
+    bilingual transcript would read as if the remote party never said
+    anything during that stretch. And Chirp 3 HD sends the whole input
+    string before its first chunk comes back, so the request was already
+    billed regardless of what playout did with the audio afterward.
+
+    (Supersedes this suite's earlier version of this test, which asserted
+    the opposite - that bypass produced no record and no cost. Quality
+    review found that was itself the bug: CLAUDE.md's own drop handler in
+    run.py exists specifically to record a drop rather than lose the row.)
     """
     from sidetap.cost import Rates
 
@@ -452,7 +460,309 @@ def test_a_bypass_flushed_utterance_produces_no_record_and_no_cost():
     )
     pipeline.handle(_final("привет"))
 
+    assert len(records) == 1
+    assert records[0].dropped is True
+    assert records[0].unit.text == "привет"
+    assert records[0].target_text == "hello"
+    # 6 source characters + 5 target characters, at $1 each: bypass still
+    # bills the synthesis request that had already gone out.
+    assert metrics.snapshot().cost_usd == 11.0
+
+
+# --- defects found by quality review, reproduced and fixed here ------------
+
+
+def test_synthesize_raising_before_any_iteration_still_closes_the_utterance():
+    """begin() must always be paired with finish(), even when synthesize()
+    itself raises before yielding - not just when a generator raises during
+    iteration.
+
+    ports.py types Synthesizer as a bare Iterator, which permits a
+    non-generator implementation whose call can raise immediately, unlike
+    every fake elsewhere in this file (all generator functions, whose body
+    cannot execute - let alone raise - before the first iteration). Missing
+    this orphans the utterance open in the queue: blocking the queue head
+    and switching the lag cap off for this direction until the 2s starvation
+    bound eventually closes it.
+    """
+
+    class RaisesAtCallTime:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            raise RuntimeError("boom")
+
+    playout = Playout(Direction.IN, FakeAudioSink())
+    pipeline = _pipeline(synthesizer=RaisesAtCallTime(), playout=playout)
+    pipeline.handle(_final(t_end=1.0))  # must not raise, and must not orphan
+
+    assert playout.backlog_s() == 0.0
+
+
+def test_a_chunk_refused_on_arrival_produces_no_latency_no_record_and_leaves_dead_air_armed():
+    """first_ms means playout ACCEPTED a chunk, not that the synthesizer
+    produced one.
+
+    Reproduces the review's scenario exactly: the starvation bound closes an
+    empty, still-queued utterance after STARVE_LIMIT_TICKS, and only then
+    does the one and only chunk arrive - too late, refused on item.closed.
+    Nothing ever reached playout, so nothing was heard: first_ms must stay
+    unset, no transcript row should appear, and dead air must stay armed
+    rather than being told the direction spoke.
+    """
+    clock = FakeClock()
+    watch = DeadAirWatch(clock, threshold_s=6.0)
+    watch.heard_speech()
+
+    records = []
+    playout = Playout(Direction.IN, FakeAudioSink())
+
+    class DelayedSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            for _ in range(STARVE_LIMIT_TICKS):
+                playout.tick()  # the still-empty queued head starves and closes
+            yield b"\x01\x02" * 8000  # arrives too late: refused on item.closed
+
+    pipeline = _pipeline(
+        synthesizer=DelayedSynthesizer(),
+        playout=playout,
+        clock=clock,
+        dead_air=watch,
+        on_record=records.append,
+    )
+    pipeline.handle(_final(t_end=0.0))
+
+    assert playout.backlog_s() == 0.0
     assert records == []
-    # Only the 6-character source text is billed, at $1/char. A synthesis
-    # charge here would mean paying for audio nobody heard.
-    assert metrics.snapshot().cost_usd == 6.0
+    clock.advance(7.0)
+    assert watch.alarming() is True
+
+
+def test_a_lag_cap_drop_reports_the_translation_not_the_source():
+    """begin() must queue the TARGET text, not the unit's source text.
+
+    Playout only ever sees what begin() hands it, and a lag-cap drop reports
+    that text straight to the transcript via run.py's drop handler. Filing
+    the source text there would print the remote party's own sentence back
+    as if it were the translation.
+    """
+    dropped = []
+    playout = Playout(
+        Direction.IN, FakeAudioSink(), on_dropped=dropped.append, lag_cap_s=0.3
+    )
+
+    class FixedChunkSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 10000  # 20000 bytes ~= 0.417s: over the 0.3s cap alone
+
+    translator = FakeTranslator({"первый": "first", "второй": "second"})
+    pipeline = _pipeline(
+        translator=translator, synthesizer=FixedChunkSynthesizer(), playout=playout
+    )
+    pipeline.handle(_final("первый", t_end=1.0))
+    pipeline.handle(_final("второй", t_end=2.0))
+
+    assert len(dropped) == 1
+    assert dropped[0].text == "first"
+
+
+def test_both_refusal_causes_bill_the_same():
+    """Bypass-flush and starvation-close must cost the same.
+
+    Chirp 3 HD sends the whole input string before its first chunk comes
+    back, so Google bills the request the moment it goes out, regardless of
+    which refusal follows. Billing one cause and not the other would
+    understate - or overstate - the call's real cost depending on which
+    kind of refusal happened to occur.
+    """
+    from sidetap.cost import Rates
+
+    rates = Rates(mt_per_million_chars=1_000_000.0, tts_per_million_chars=1_000_000.0)
+
+    bypass_metrics = Metrics()
+    bypass_playout = Playout(Direction.IN, FakeAudioSink())
+
+    class FlushingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 8000
+            bypass_playout.set_suppressed(True)
+            yield b"\x03\x04" * 8000
+
+    bypass_pipeline = _pipeline(
+        translator=FakeTranslator({"привет": "hello"}),
+        synthesizer=FlushingSynthesizer(),
+        playout=bypass_playout,
+        metrics=bypass_metrics,
+        rates=rates,
+    )
+    bypass_pipeline.handle(_final("привет"))
+
+    starve_metrics = Metrics()
+    starve_playout = Playout(Direction.IN, FakeAudioSink())
+
+    class DelayedSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            for _ in range(STARVE_LIMIT_TICKS):
+                starve_playout.tick()
+            yield b"\x01\x02" * 8000
+
+    starve_pipeline = _pipeline(
+        translator=FakeTranslator({"привет": "hello"}),
+        synthesizer=DelayedSynthesizer(),
+        playout=starve_playout,
+        metrics=starve_metrics,
+        rates=rates,
+    )
+    starve_pipeline.handle(_final("привет"))
+
+    assert bypass_metrics.snapshot().cost_usd == 11.0
+    assert starve_metrics.snapshot().cost_usd == 11.0
+
+
+def test_a_refusal_stops_pulling_more_chunks_from_the_synthesizer():
+    """break, not continue: once playout refuses a chunk, the loop must stop
+    pulling more out of the iterator rather than keep draining it - that is
+    exactly the audio nobody will hear that this guard exists to stop paying
+    for.
+
+    Uses a plain iterator with no close() (the Synthesizer port is typed as
+    a bare Iterator, which need not have one - unlike every generator-backed
+    fake elsewhere in this file). With a closeable generator, closing it
+    would itself end iteration regardless of break vs. continue, masking
+    this exact mutation.
+    """
+
+    class SuppressingIterator:
+        def __init__(self, playout):
+            self._playout = playout
+            self._remaining = 5
+            self.pulled = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._remaining <= 0:
+                raise StopIteration
+            self._remaining -= 1
+            self.pulled += 1
+            if self.pulled == 2:
+                self._playout.set_suppressed(True)
+            return b"\x01\x02" * 8000
+
+    playout = Playout(Direction.IN, FakeAudioSink())
+    iterator = SuppressingIterator(playout)
+
+    class OnceSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            return iterator
+
+    pipeline = _pipeline(synthesizer=OnceSynthesizer(), playout=playout)
+    pipeline.handle(_final(t_end=1.0))
+
+    assert iterator.pulled == 2
+
+
+def test_a_refusal_closes_the_synthesis_stream():
+    """The gRPC stream must be closed explicitly on refusal, not left to
+    garbage collection - it is what ends a request Google is still billing
+    and holding open."""
+    closed = []
+    playout = Playout(Direction.IN, FakeAudioSink())
+
+    class ClosableAfterOne:
+        def __init__(self):
+            self._chunks = iter([b"\x01\x02" * 8000, b"\x03\x04" * 8000])
+            self._pulled = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            chunk = next(self._chunks)
+            self._pulled += 1
+            if self._pulled == 1:
+                playout.set_suppressed(True)
+            return chunk
+
+        def close(self):
+            closed.append(True)
+
+    class OnceSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            return ClosableAfterOne()
+
+    pipeline = _pipeline(synthesizer=OnceSynthesizer(), playout=playout)
+    pipeline.handle(_final(t_end=1.0))
+
+    assert closed == [True]
+
+
+def test_a_successful_synthesis_recovers_tts_health_after_a_prior_failure():
+    """DirectionState.tts defaults to OK, so only a FAILED -> OK sequence can
+    tell a real recovery from a health update that was never made at all."""
+    metrics = Metrics()
+    playout = Playout(Direction.IN, FakeAudioSink())
+
+    class OnceFailingSynthesizer:
+        def __init__(self):
+            self.calls = 0
+
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom")
+                yield b""  # pragma: no cover - generator marker
+            yield b"\x01\x02" * 8000
+
+    pipeline = _pipeline(
+        synthesizer=OnceFailingSynthesizer(), playout=playout, metrics=metrics
+    )
+    pipeline.handle(_final("first", t_end=1.0))
+    assert metrics.snapshot().directions[Direction.IN].tts is Health.FAILED
+
+    pipeline.handle(_final("second", t_end=2.0))
+    assert metrics.snapshot().directions[Direction.IN].tts is Health.OK
+
+
+def test_translation_time_does_not_leak_into_tts_ms():
+    """The synthesis section's own `started` must be re-taken after
+    translation, not inherited from before it - or slow translation shows up
+    as synthesis latency."""
+    clock = FakeClock(start=0.0)
+
+    class TickingTranslator(FakeTranslator):
+        def translate(self, text, src, tgt):
+            clock.advance(0.5)
+            return super().translate(text, src, tgt)
+
+    class TickingSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            clock.advance(0.2)
+            yield b"\x01\x02" * 8000
+
+    metrics = Metrics()
+    pipeline = _pipeline(
+        translator=TickingTranslator({"привет": "hello"}),
+        synthesizer=TickingSynthesizer(),
+        metrics=metrics,
+        clock=clock,
+    )
+    pipeline.handle(_final("привет", t_end=0.0))
+
+    latency = metrics.snapshot().directions[Direction.IN].latency
+    assert latency.mt_ms == 500.0
+    assert latency.tts_ms == 200.0
+
+
+def test_speaking_disarms_the_dead_air_alarm():
+    """dead_air.spoke() must actually run on a clean, accepted utterance -
+    it is the only thing that disarms the earcon once armed."""
+    clock = FakeClock()
+    watch = DeadAirWatch(clock, threshold_s=6.0)
+    watch.heard_speech()
+    clock.advance(7.0)
+    assert watch.alarming() is True  # armed and past threshold, before speaking
+
+    pipeline = _pipeline(clock=clock, dead_air=watch)
+    pipeline.handle(_final(t_end=clock.monotonic()))
+
+    assert watch.alarming() is False
