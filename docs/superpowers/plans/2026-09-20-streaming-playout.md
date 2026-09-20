@@ -568,6 +568,24 @@ def test_a_long_stall_abandons_the_utterance_and_reopens_the_duck():
     assert len(spoken) == 1  # what did play is still reported
 
 
+def test_a_producer_that_dies_under_the_threshold_does_not_block_the_queue():
+    playout = Playout(Direction.IN, FakeAudioSink())
+    stalled = playout.begin(_unit(), "stalled")
+    playout.append(stalled, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+    playout.submit(_translated(0.1, text="behind"))
+
+    # Under the 400 ms threshold and never closed: nothing plays, and the
+    # utterance queued behind it is stuck too.
+    assert playout.tick() is False
+
+    for _ in range(STARVE_LIMIT_TICKS + 2):
+        playout.tick()
+
+    # The fragment that did arrive is spoken, and the queue moves again.
+    assert stalled.truncated is True
+    assert stalled.closed is True
+
+
 def test_an_utterance_that_has_not_started_leaves_the_duck_open():
     volume = FakeVolumeControl()
     duck = DuckControl(volume, 42)
@@ -602,29 +620,30 @@ test, because `tick()` currently opens the duck on every silent tick. The
 
 - [ ] **Step 3: Implement starvation**
 
-In `sidetap/playout.py`, add a `starved` flag to `tick()`. Change the opening
-of the locked section from:
+**Note:** Task 1's review caused `tick()`'s locked body to be extracted into
+`_advance_locked()`, so the patch targets differ from an earlier draft of this
+plan. Work against the real file, not from memory. `_advance_locked` currently
+returns `tuple[bytes | None, Translated | None]` and must become a 3-tuple.
+
+Change its signature and the `starved` initialiser:
 
 ```python
-        finished: Translated | None = None
-        with self._lock:
+    def _advance_locked(self) -> tuple[bytes | None, Translated | None, bool]:
+        """Pull, read and retire under the lock.
+
+        Returns (chunk, finished, starved). `starved` means an utterance the
+        listener is already part-way through has nothing to play - the duck
+        must stay closed across that gap.
+        """
 ```
 
-to:
+Initialise `starved = False` beside `chunk` and `finished`, and change the
+single `return` to `return chunk, finished, starved`.
 
-```python
-        finished: Translated | None = None
-        starved = False
-        with self._lock:
-```
-
-Then add the `else` branch to the `if self._current is not None:` block,
-after the existing `elif self._current.closed:` branch. Task 1 already
-narrowed the first branch to `unread >= CHUNK_BYTES or (unread > 0 and
-closed)` and left a comment marking where this goes, so the `else` now
+Task 1 narrowed the first branch to `unread >= CHUNK_BYTES or (unread > 0 and
+closed)` and left a comment marking where the `else` goes, so the `else` now
 catches both "nothing at all arrived" and "less than one chunk arrived on an
-utterance still being synthesised" — the second is why that narrowing had to
-happen first:
+utterance still being synthesised". Replace that comment with:
 
 ```python
                 else:
@@ -647,6 +666,43 @@ happen first:
                         self._offset = 0
                         self._starved_ticks = 0
                         starved = False
+```
+
+Then add the second half of the bound, as an `elif`/`else` on the outer
+`if self._current is not None:`. Without this, Task 2's start threshold opens
+a hole: a head utterance holding under `START_BUFFER_S` that is never closed
+is never pulled into `_current`, so the counter above never sees it, and
+Task 4 stops the lag cap dropping it. A producer that dies after delivering a
+fragment would block that head — and every utterance queued behind it — for
+the rest of the call.
+
+```python
+        elif self._queue:
+            # Nothing is playable because the head is still under the start
+            # threshold. The same bound applies, for the same reason: a
+            # producer that died mid-fragment must not block the queue.
+            # Nothing has been heard yet, so the duck stays open and this is
+            # not the stuck-closed failure - it is the whole direction going
+            # quiet with nothing on screen explaining why.
+            self._starved_ticks += 1
+            if self._starved_ticks >= STARVE_LIMIT_TICKS:
+                # Close it where it stands rather than discard it: `closed`
+                # makes it startable, so the next tick speaks the fragment
+                # that did arrive. That is the same rule the spec applies to
+                # a synthesis that fails part way through - play what
+                # arrived - and it unblocks everything queued behind it.
+                self._queue[0].closed = True
+                self._queue[0].truncated = True
+                self._starved_ticks = 0
+        else:
+            self._starved_ticks = 0
+```
+
+Finally, update `tick()`'s call site to unpack three values:
+
+```python
+        with self._lock:
+            chunk, finished, starved = self._advance_locked()
 ```
 
 Change the silence branch to respect `starved`:
@@ -1077,11 +1133,13 @@ guard) to the end of the method with:
                 if first_ms is None:
                     first_ms = round((self._clock.monotonic() - started) * 1000, 1)
                 if not self._playout.append(handle, chunk):
-                    # Bypass flushed the queue. Stop paying for audio nobody
-                    # will hear, and end the gRPC stream rather than leave it
-                    # to garbage collection. The Synthesizer port is typed as
-                    # an Iterator, which need not have close(), so this is a
-                    # capability check and not an assumption.
+                    # Playout will not take any more: either bypass flushed
+                    # the queue, or the utterance was already closed. Either
+                    # way, stop paying for audio nobody will hear, and end the
+                    # gRPC stream rather than leave it to garbage collection.
+                    # The Synthesizer port is typed as an Iterator, which need
+                    # not have close(), so this is a capability check and not
+                    # an assumption.
                     closer = getattr(chunks, "close", None)
                     if closer is not None:
                         closer()

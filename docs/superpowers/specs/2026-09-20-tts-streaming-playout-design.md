@@ -124,7 +124,16 @@ lets a burst of the untranslated original through, which is worse than the
 gap itself.
 
 That row needs a fail-safe: **100 consecutive starved ticks (2 s)** abandons
-the utterance as truncated and opens the duck. Ticks rather than seconds
+the utterance as truncated and opens the duck.
+
+The same bound has to cover the row above it, for a reason the start
+threshold creates: a head utterance holding less than the threshold and never
+closed is never started, so a counter that only watches the in-progress
+utterance never sees it, and the lag cap will not drop it either. A producer
+that dies mid-fragment would block that head and everything queued behind it
+for the rest of the call. On the bound it is closed where it stands, which
+makes it startable, so the fragment that did arrive is spoken — the same
+"play what arrived" rule the partial-failure section applies. Ticks rather than seconds
 because it needs no clock port in `playout.py`, is deterministic under test,
 and counts the quantity that actually matters — silence written. Without it a
 producer thread dying mid-utterance leaves the duck closed for the rest of the
