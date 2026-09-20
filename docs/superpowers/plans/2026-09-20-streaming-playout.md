@@ -804,11 +804,14 @@ def test_the_cap_does_not_drop_an_utterance_that_is_still_arriving():
     # Well over the 1 s cap, but the only queued item is still open.
     assert playout.backlog_s() > 1.0
     assert dropped == []
+    assert item.dropped is False
 
-    # Once closed it becomes droppable like anything else.
+    # Once closed it becomes droppable like anything else. Assert on the item
+    # itself, not on len(dropped): closing it lets the cap drain the whole
+    # queue in one pass, so the count here is 2, not 1.
     playout.finish(item)
     playout.submit(_translated(0.1))
-    assert len(dropped) == 1
+    assert item.dropped is True
 
 
 def test_flushing_tells_the_producer_to_stop_synthesising():
@@ -823,10 +826,16 @@ def test_flushing_tells_the_producer_to_stop_synthesising():
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `uv run pytest tests/test_playout.py -q -k "still_arriving or stop_synthesising"`
-Expected: FAIL — the first with `assert [] == [<Translated...>]` because the
-cap drops the open utterance; the second with `assert True is False` because
-`flush()` does not yet mark `_current` dropped in a way `append` sees for an
-item it already removed.
+Expected: the first FAILS on `assert dropped == []`, because the cap drops
+the open utterance during `append()`. Verified against the real code before
+dispatch: `dropped` is 1 at that point.
+
+The second most likely **passes already** — Task 1 made `flush()` mark both
+the queued items and `_current` as dropped, and Task 3 made `append()` refuse
+a closed item, so the behaviour it asserts is in place. That is fine and
+expected; keep it as a regression guard, the same call made for
+`test_an_utterance_that_has_not_started_leaves_the_duck_open` in Task 3. Say
+so in the report rather than treating it as a problem.
 
 - [ ] **Step 3: Implement**
 
