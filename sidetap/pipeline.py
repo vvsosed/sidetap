@@ -173,9 +173,11 @@ class DirectionPipeline:
                     continue
                 produced = True
                 if not self._playout.append(handle, chunk):
-                    # Playout will not take any more: either bypass flushed
-                    # the queue, or playout gave the utterance up at the
-                    # starvation bound. Either way, stop paying for audio
+                    # Playout will not take any more: either something
+                    # flushed the queue - bypass engaging, or the
+                    # drop-backlog hotkey called directly, both funnel
+                    # through flush() - or playout gave the utterance up at
+                    # the starvation bound. Either way, stop paying for audio
                     # nobody will hear, and end the gRPC stream rather than
                     # leave it to garbage collection. The Synthesizer port is
                     # typed as an Iterator, which need not have close(), so
@@ -201,10 +203,11 @@ class DirectionPipeline:
             if not refused:
                 # Only a generator that ran to completion says TTS is well.
                 # Reaching here after a refusal means playout gave up on this
-                # utterance at the starvation bound, or bypass threw it away -
-                # neither is evidence of health, and painting the TUI green
-                # right after a stall cost the listener half a sentence is the
-                # opposite of what that indicator is for.
+                # utterance at the starvation bound, or flush() threw it away
+                # - bypass engaging, or the drop-backlog hotkey called
+                # directly - neither is evidence of health, and painting the
+                # TUI green right after a stall cost the listener half a
+                # sentence is the opposite of what that indicator is for.
                 self._metrics.set_health(direction, tts=Health.OK)
         finally:
             # Pairs with begin() on every path, including the raise-at-call
@@ -231,9 +234,11 @@ class DirectionPipeline:
             self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
         if handle.dropped:
-            # Bypass threw the queue away. Record it as dropped rather than
-            # returning silently - losing the row loses the SOURCE line too,
-            # and the remote party's sentence would read as if never spoken.
+            # flush() threw the queue away - bypass engaging, or the
+            # drop-backlog hotkey called directly. Record it as dropped
+            # rather than returning silently - losing the row loses the
+            # SOURCE line too, and the remote party's sentence would read as
+            # if never spoken.
             if self._on_record is not None:
                 self._on_record(
                     Record(unit=unit, target_text=target_text, dropped=True)
@@ -244,8 +249,9 @@ class DirectionPipeline:
             # Playout gave up on this utterance at the starvation bound
             # before it ever accepted anything from it, so nothing was heard
             # - but the sentence was said, and was billed. Losing the row
-            # would lose the source line with it, exactly as on the bypass
-            # path above. No latency: there is nothing to report a wait for.
+            # would lose the source line with it, exactly as on the
+            # handle.dropped path above. No latency: there is nothing to
+            # report a wait for.
             # Leave it that way - render_markdown (transcript.py) tells this
             # case apart from a cut-short utterance by testing
             # `latency.tts_ms == 0.0`, so attaching an asr/mt latency here

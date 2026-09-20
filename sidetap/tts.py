@@ -23,7 +23,7 @@ by a fraction of one utterance and self-corrects within about a second.
 
 The first call after construction costs ~543 ms against a ~267 ms warm
 median, which is why Session.setup() performs a throwaway synthesis while
-the audio graph is being rewired.
+the duck's loopback node is still registering.
 """
 
 from __future__ import annotations

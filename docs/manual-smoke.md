@@ -28,6 +28,10 @@ trusting a change to capture, routing, playout or the duck.
       **not** their original voice.
 - [ ] In the gaps between translations, confirm their original is audible
       again.
+- [ ] During one long translated sentence, confirm their original stays
+      silent for its **entire** length - no burst of it between synthesis
+      chunks. `FakeAudioSink` never stalls, so this is the one regression the
+      automated suite structurally cannot catch.
 - [ ] Kill the recogniser's network (disable wifi for 20 s). Confirm you start
       hearing their raw voice rather than silence. This is the IN direction's
       fail-safe and it must not regress.
@@ -122,6 +126,12 @@ signals. Record numbers, not opinions.
 
 ## Timing
 
+- [ ] Speak one long sentence, then open that call's `.jsonl` transcript and
+      find the utterance's `latency` block. Confirm `tts_ms` reads close to
+      200 ms while `tts_total_ms` is much larger - the TUI pane only ever
+      shows `tts_ms`, so the jsonl is the one place both are visible
+      together. A small gap between them means streaming did not happen for
+      that utterance.
 - [ ] Measure glass-to-glass: have the remote party say a short sentence and
       time from the end of their speech to the start of the translation.
       Target is under 2.5 s per direction.
