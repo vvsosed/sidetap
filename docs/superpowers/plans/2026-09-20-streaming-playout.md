@@ -1156,6 +1156,7 @@ guard) to the end of the method with:
         )
         first_ms: float | None = None
         truncated = False
+        refused = False
         try:
             for chunk in chunks:
                 if not chunk:
@@ -1173,14 +1174,21 @@ guard) to the end of the method with:
                     closer = getattr(chunks, "close", None)
                     if closer is not None:
                         closer()
-                    truncated = True
+                    refused = True
                     break
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)
             self._metrics.set_health(direction, tts=Health.FAILED)
             truncated = True
         else:
-            self._metrics.set_health(direction, tts=Health.OK)
+            if not refused:
+                # Only a generator that ran to completion says TTS is well.
+                # Reaching here after a refusal means playout gave up on this
+                # utterance at the starvation bound, or bypass threw it away -
+                # neither is evidence of health, and painting the TUI green
+                # right after a stall cost the listener half a sentence is the
+                # opposite of what that indicator is for.
+                self._metrics.set_health(direction, tts=Health.OK)
 
         self._playout.finish(handle, truncated=truncated)
 
