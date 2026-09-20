@@ -72,9 +72,9 @@ arguments, and `on_dropped` still receives a `Translated`.
 - Modify: `sidetap/playout.py`
 - Test: `tests/test_playout.py`
 
-This task changes Playout's internals and adds the streaming API. All 23
-existing `submit()`-based tests in `tests/test_playout.py` must still pass
-unchanged — that is the main safety check.
+This task changes Playout's internals and adds the streaming API. All 21
+existing tests in `tests/test_playout.py` must still pass unchanged — that
+is the main safety check.
 
 - [ ] **Step 1: Write the failing tests**
 
