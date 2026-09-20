@@ -395,9 +395,9 @@ def test_on_spoken_fires_once_when_a_streamed_utterance_drains():
 def test_a_sub_chunk_append_does_not_get_padded_and_played():
     """0 < unread < CHUNK_BYTES on an utterance that is still open must wait
     for more, not zero-pad the fragment into the sink - that would splice
-    silence into the middle of a word, and would also never let a future
-    starvation counter increment (it only counts unread == 0), holding the
-    duck closed with no bound while a trickling producer stalls.
+    silence into the middle of a word, and would also skip the starvation
+    counter's increment for this tick, holding the duck closed with no bound
+    while a trickling producer stalls.
 
     The item must first clear the 400 ms start threshold and become
     _current, or it is never promoted at all and this exercises nothing -
@@ -562,7 +562,9 @@ def test_a_long_stall_abandons_the_utterance_and_reopens_the_duck():
         playout.tick()
     assert duck.is_open is False
 
-    for _ in range(STARVE_LIMIT_TICKS + 1):
+    # Exactly STARVE_LIMIT_TICKS: the abandonment happens on this tick, not
+    # some tick after it - a bound off by one either way is a real bug here.
+    for _ in range(STARVE_LIMIT_TICKS):
         playout.tick()
 
     assert duck.is_open is True
@@ -571,21 +573,34 @@ def test_a_long_stall_abandons_the_utterance_and_reopens_the_duck():
 
 
 def test_a_producer_that_dies_under_the_threshold_does_not_block_the_queue():
-    playout = Playout(Direction.IN, FakeAudioSink())
+    sink = FakeAudioSink()
+    playout = Playout(Direction.IN, sink)
     stalled = playout.begin(_unit(), "stalled")
-    playout.append(stalled, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+    stalled_pcm = b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2)
+    playout.append(stalled, stalled_pcm)
     playout.submit(_translated(0.1, text="behind"))
 
     # Under the 400 ms threshold and never closed: nothing plays, and the
     # utterance queued behind it is stuck too.
     assert playout.tick() is False
 
-    for _ in range(STARVE_LIMIT_TICKS + 2):
+    # Exactly STARVE_LIMIT_TICKS total (the one above plus these): the head
+    # is closed in place on this tick, not some tick after it.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
         playout.tick()
-
-    # The fragment that did arrive is spoken, and the queue moves again.
     assert stalled.truncated is True
     assert stalled.closed is True
+
+    # The fragment that did arrive is actually spoken - not discarded by a
+    # mutant that closes the head and then pops it - and playback resumes
+    # exactly where the fragment left off.
+    before = len(sink.written)
+    for _ in range(5):  # 0.1s / 20ms chunks
+        assert playout.tick() is True
+    assert sink.written[before:] == stalled_pcm
+
+    # The queue moves again: the utterance queued behind it gets its turn.
+    assert playout.tick() is True
 
 
 def test_an_utterance_that_has_not_started_leaves_the_duck_open():
@@ -600,3 +615,71 @@ def test_an_utterance_that_has_not_started_leaves_the_duck_open():
     for _ in range(10):
         playout.tick()
     assert duck.is_open is True
+
+
+def test_the_starve_bound_is_consecutive_not_cumulative():
+    """100 total starved ticks spread across many short hiccups must never
+    truncate the utterance - only 100 in an unbroken row does. Deleting the
+    counter reset on the successful-chunk path turns the bound cumulative;
+    this is the test that would catch it."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    for _ in range(20):  # clear the start threshold
+        playout.tick()
+
+    one_chunk = b"\x01\x02" * (CHUNK_BYTES // 2)
+    for _ in range(30):  # 30 x 10 = 300 starved ticks total, well over the bound
+        for _ in range(10):
+            assert playout.tick() is False  # starved, nowhere near the bound
+        playout.append(item, one_chunk)
+        assert playout.tick() is True  # delivery resumes; the run is broken
+
+    assert item.truncated is False
+    assert item.closed is False
+
+
+def test_abandoning_does_not_carry_the_counter_to_the_next_head():
+    """One dead producer must cost exactly one sentence, not two. The
+    existing single-utterance abandon test can't see this: it needs a
+    second, healthy utterance queued behind the one that stalls."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    stalling = playout.begin(_unit(), "stalling")
+    playout.append(stalling, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    for _ in range(20):
+        playout.tick()  # clears the threshold; stalling becomes _current
+
+    # Begun moments later, with its own live producer - just not enough
+    # audio yet to clear the start threshold on its own.
+    healthy = playout.begin(_unit(), "healthy")
+    playout.append(healthy, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+
+    for _ in range(STARVE_LIMIT_TICKS):
+        playout.tick()
+    assert stalling.truncated is True  # abandoned on this exact tick
+
+    # `healthy` gets its own full STARVE_LIMIT_TICKS budget rather than
+    # inheriting the counter that just abandoned `stalling`.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        playout.tick()
+    assert healthy.truncated is False
+    assert healthy.closed is False
+
+
+def test_finish_does_not_downgrade_a_truncation_playout_already_recorded():
+    """playout can truncate an utterance itself (the starvation bound)
+    before the producer's own generator exhausts normally and calls
+    finish(truncated=False). That later call must not erase the fact that
+    the listener heard a cut-off sentence."""
+    playout = Playout(Direction.IN, FakeAudioSink())
+    item = playout.begin(_unit(), "hi")
+    playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2))
+    for _ in range(20):
+        playout.tick()
+
+    for _ in range(STARVE_LIMIT_TICKS):
+        playout.tick()
+    assert item.truncated is True  # abandoned by the bound
+
+    playout.finish(item)  # producer's generator exhausts normally, after the fact
+    assert item.truncated is True  # still true - not overwritten by the default

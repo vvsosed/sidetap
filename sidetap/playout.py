@@ -169,7 +169,13 @@ class Playout:
         """No more audio is coming."""
         with self._lock:
             item.closed = True
-            item.truncated = truncated
+            # Sticky, not overwritten: playout itself may already have set
+            # this True by abandoning a stalled utterance (_advance_locked's
+            # starvation bound) before the producer's own generator exhausts
+            # normally and calls finish(truncated=False). That later call
+            # must not erase the fact that the listener heard a cut-off
+            # sentence.
+            item.truncated = item.truncated or truncated
             if not item.pcm and item is not self._current:
                 # Nothing ever arrived - whether synthesis failed
                 # (truncated) or simply produced no audio, there is no
@@ -344,11 +350,12 @@ class Playout:
             # utterance is closed - that is a genuine tail. While still
             # open it is a producer that has not delivered a full chunk
             # yet, and zero-padding it would splice silence into the middle
-            # of a word. It would also never let the starvation counter
-            # below increment, since that only counts unread == 0: a
-            # producer trickling sub-chunk fragments forever would hold the
-            # duck closed with no bound, which is the "stuck closed" failure
-            # CLAUDE.md calls silently cruel.
+            # of a word. Falling through to the starvation branch below is
+            # what bounds this: it increments on every tick with nothing
+            # playable, whether unread is 0 or a sub-chunk remainder, so a
+            # producer trickling fragments forever still gets abandoned
+            # rather than holding the duck closed with no bound - the
+            # "stuck closed" failure CLAUDE.md calls silently cruel.
             if unread >= CHUNK_BYTES or (unread > 0 and self._current.closed):
                 chunk = bytes(
                     self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
@@ -371,10 +378,21 @@ class Playout:
                 self._offset = 0
                 self._starved_ticks = 0
             else:
+                # Case 1 of 2 - started and starved: see the `elif` below
+                # for case 2, a queued head that never started playing.
+                # Both share this one _starved_ticks counter, reset to 0
+                # everywhere else in this method, with different remedies.
+                #
                 # Started but nothing to read: synthesis has not kept up.
                 # `offset > 0` means the listener is mid-sentence, which is
                 # what the duck follows - an utterance that has begun and
-                # then starved is still in progress.
+                # then starved is still in progress. This check is
+                # defensive rather than a live distinction today: an open
+                # _current is only ever pulled in at >= START_BUFFER_S
+                # (400 ms), many chunks, so by the time it can reach this
+                # branch offset is already > 0. It stays a real condition,
+                # not an assumed True, in case START_BUFFER_S is ever tuned
+                # below one CHUNK_MS (20 ms).
                 starved = self._offset > 0
                 self._starved_ticks += 1
                 if self._starved_ticks >= STARVE_LIMIT_TICKS:
@@ -382,6 +400,12 @@ class Playout:
                     # up rather than hold the duck closed for the rest of
                     # the call, which would silence the remote party -
                     # the one failure worse than sidetap not working.
+                    log.warning(
+                        "%s playout: utterance stalled %.1fs mid-sentence; "
+                        "abandoning as truncated",
+                        self.direction.value,
+                        STARVE_LIMIT_TICKS * CHUNK_MS / 1000,
+                    )
                     self._current.closed = True
                     self._current.truncated = True
                     if self._offset > 0:
@@ -391,6 +415,10 @@ class Playout:
                     self._starved_ticks = 0
                     starved = False
         elif self._queue:
+            # Case 2 of 2 - queued and not startable: the same
+            # _starved_ticks counter as case 1 above, with a different
+            # remedy (the head is closed in place, not retired).
+            #
             # Nothing is playable because the head is still under the start
             # threshold. The same bound applies, for the same reason: a
             # producer that died mid-fragment must not block the queue.
@@ -404,6 +432,12 @@ class Playout:
                 # that did arrive. That is the same rule the spec applies to
                 # a synthesis that fails part way through - play what
                 # arrived - and it unblocks everything queued behind it.
+                log.warning(
+                    "%s playout: queued utterance stuck under the start "
+                    "threshold for %.1fs; closing what arrived",
+                    self.direction.value,
+                    STARVE_LIMIT_TICKS * CHUNK_MS / 1000,
+                )
                 self._queue[0].closed = True
                 self._queue[0].truncated = True
                 self._starved_ticks = 0
