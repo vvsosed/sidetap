@@ -451,7 +451,12 @@ currently starts on any byte.
 
 - [ ] **Step 3: Implement the threshold**
 
-In `sidetap/playout.py`, add this method to `Playout`, just above `tick`:
+**Note:** Task 1's review extracted `tick()`'s locked body into
+`_advance_locked()`, so the pull condition now lives there, not in `tick()`.
+Work against the real file.
+
+In `sidetap/playout.py`, add this method to `Playout`, just above
+`_advance_locked`:
 
 ```python
     def _startable_locked(self, item: Utterance) -> bool:
@@ -463,7 +468,7 @@ In `sidetap/playout.py`, add this method to `Playout`, just above `tick`:
         return item.closed or item.audio_s >= START_BUFFER_S
 ```
 
-In `tick()`, change the pull condition from:
+In `_advance_locked()`, change the pull condition from:
 
 ```python
             if self._current is None and self._queue:
