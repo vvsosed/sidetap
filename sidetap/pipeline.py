@@ -49,6 +49,12 @@ class DeadAirWatch:
     dead is a different failure, already surfaced by Metrics.set_health from
     RecognitionWorker - keeping that out of here is what stops this reaching
     into the ported audio path.
+
+    Not wired to the IN direction, deliberately: on IN a stalled pipeline is
+    not silent the way OUT's is. Playout there just goes idle, the duck
+    opens back up, and you start hearing the remote party's untranslated
+    voice coming through - a louder, faster signal than any alarm this watch
+    could raise, and one that needs no wiring to notice.
     """
 
     def __init__(self, clock: Clock, threshold_s: float = DEAD_AIR_S):

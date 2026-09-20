@@ -61,6 +61,27 @@ def voice_language(voice_name: str) -> str:
 MIN_SPEAKING_RATE = 0.25
 MAX_SPEAKING_RATE = 2.0
 
+# gRPC sets no deadline of its own, so a hung streaming_synthesize call parks
+# DirectionPipeline._speak inside `for chunk in chunks` forever: the results
+# queue behind it grows unbounded, and the tts health marker stays green
+# because Health is only set on the loop's exit paths, none of which run
+# while parked. asr.py guards its own streaming call the identical way
+# (STREAM_TIMEOUT_S there); this is that same guard for tts.py.
+#
+# 30s, not a tight fit to real synthesis time: the slowest run measured
+# (docs/experiments/04-tts-streaming.md) was 2339 ms for 16.6 s of audio, so
+# 30s is roughly 13x that worst case. It stays generous even at
+# MIN_SPEAKING_RATE (0.25, the setting that produces the *longest* audio):
+# scaling that same 16.6s utterance to a ~4x longer output (~66s of audio)
+# and dividing by the slowest observed synthesis-to-audio ratio (4.7x, not
+# the 7.1x this particular run hit) still lands at ~14s, under half the
+# budget. This is a stuck-RPC backstop, not a latency control - playout's own
+# STARVE_LIMIT_TICKS already gives up on an utterance after 2s of no chunks,
+# so a synthesis still running at 30s has long since stopped being useful to
+# anyone. The timeout exists to free the worker thread and surface the
+# failure, not to salvage the sentence.
+STREAM_TIMEOUT_S = 30.0
+
 
 @dataclass(frozen=True)
 class TtsConfig:
@@ -111,7 +132,9 @@ class ChirpSynthesizer:
                 input=tts.StreamingSynthesisInput(text=text)
             )
 
-        for response in self._client.streaming_synthesize(requests()):
+        for response in self._client.streaming_synthesize(
+            requests(), timeout=STREAM_TIMEOUT_S
+        ):
             if response.audio_content:
                 yield response.audio_content
 

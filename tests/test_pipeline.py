@@ -2,12 +2,20 @@ import queue
 import threading
 import time
 
+from google.api_core import exceptions as gexc
+
 from sidetap.metrics import Health, Metrics
 from sidetap.pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
-from sidetap.playout import STARVE_LIMIT_TICKS, Playout, earcon
+from sidetap.playout import STARVE_LIMIT_TICKS, DuckControl, Playout, earcon
 from sidetap.segment import FinalsOnlySegmenter
 from sidetap.types import TTS_BYTES_PER_S, AsrResult, Direction, Latency
-from tests.conftest import FakeAudioSink, FakeClock, FakeSynthesizer, FakeTranslator
+from tests.conftest import (
+    FakeAudioSink,
+    FakeClock,
+    FakeSynthesizer,
+    FakeTranslator,
+    FakeVolumeControl,
+)
 
 
 def _config(direction=Direction.IN):
@@ -350,6 +358,50 @@ def test_a_synthesis_failure_part_way_through_keeps_what_was_spoken():
     assert len(records) == 1
     assert records[0].truncated is True
     assert records[0].latency.tts_ms == 200.0
+
+
+def test_a_deadline_exceeded_mid_stream_leaves_the_direction_recoverable():
+    """tts.py's new STREAM_TIMEOUT_S turns a hung streaming_synthesize call
+    into a google.api_core.exceptions.DeadlineExceeded raised mid-iteration.
+    pipeline.py's error handling is generic - `except Exception` - and was
+    not changed for this, so this test exists to confirm that generic
+    handling actually covers this specific exception end to end, rather than
+    assuming it does because it is "just another Exception":
+
+    - tts health goes to FAILED (the `except` branch in _speak runs);
+    - the utterance playout already had queued is finished, not left open in
+      the queue forever (the `finally` runs `playout.finish` regardless);
+    - the audio chunk that arrived before the timeout is still spoken; and
+    - the duck is not left stuck closed once that audio finishes playing -
+      the failure mode CLAUDE.md calls worse than sidetap not working at all.
+    """
+    metrics = Metrics()
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, object_id=1)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    class TimingOutSynthesizer:
+        def synthesize(self, text, voice, speaking_rate=1.0):
+            yield b"\x01\x02" * 8000
+            raise gexc.DeadlineExceeded("synthesis stalled")
+
+    pipeline = _pipeline(
+        synthesizer=TimingOutSynthesizer(), playout=playout, metrics=metrics
+    )
+    pipeline.handle(_final(t_end=1.0))
+
+    assert metrics.snapshot().directions[Direction.IN].tts is Health.FAILED
+    # What had already arrived is still queued to be spoken, not discarded.
+    assert playout.backlog_s() > 0.0
+
+    # Drive playout until the queued audio finishes, the way the real
+    # playout thread would. Once nothing is left to play, the duck must have
+    # opened again rather than sitting closed with nothing left to justify it.
+    for _ in range(200):
+        playout.tick()
+
+    assert playout.backlog_s() == 0.0
+    assert duck.is_open is True
 
 
 def test_a_synthesis_failure_before_any_audio_records_nothing():
