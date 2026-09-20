@@ -316,22 +316,40 @@ def test_tts_latency_is_time_to_the_first_chunk_not_the_whole_synthesis():
 
 
 def test_a_synthesis_failure_part_way_through_keeps_what_was_spoken():
+    """The listener heard 200ms of this sentence before it cut off, and that
+    latency must reach the record - it is what distinguishes this case from
+    the starvation-refusal one below, where nothing was ever heard at all.
+
+    Advancing the clock before the first chunk is what makes that
+    distinction checkable: with a clock that never advances, a record with
+    no latency and a record with a real one are indistinguishable, and the
+    `and first_ms is None` guard on the starvation-refusal branch could be
+    dropped without any test noticing - the record would still exist,
+    still be truncated, and still fail to carry the latency it should not
+    have had in the first place.
+    """
+    clock = FakeClock(start=0.0)
     records = []
 
     class FailingSynthesizer:
         def synthesize(self, text, voice, speaking_rate=1.0):
+            clock.advance(0.2)
             yield b"\x01\x02" * 8000
             raise RuntimeError("stream died")
 
     playout = Playout(Direction.IN, FakeAudioSink())
     pipeline = _pipeline(
-        synthesizer=FailingSynthesizer(), playout=playout, on_record=records.append
+        synthesizer=FailingSynthesizer(),
+        playout=playout,
+        on_record=records.append,
+        clock=clock,
     )
-    pipeline.handle(_final(t_end=1.0))
+    pipeline.handle(_final(t_end=0.0))
 
     assert playout.backlog_s() > 0.0        # the first chunk is still spoken
     assert len(records) == 1
     assert records[0].truncated is True
+    assert records[0].latency.tts_ms == 200.0
 
 
 def test_a_synthesis_failure_before_any_audio_records_nothing():
@@ -521,10 +539,24 @@ def test_a_chunk_refused_on_arrival_produces_a_truncated_row_with_no_latency_and
     spoke. But the sentence was said, and was billed, so it still needs a
     transcript row - just one with no latency to report, since there is
     nothing playout ever queued to time.
+
+    The translator advances the clock so the latency assertion is
+    falsifiable: with a clock that never moves, `Latency(asr_ms=0, mt_ms=0)`
+    equals `Latency()` regardless of whether the code actually withheld a
+    real one, and the assertion would pin nothing. It also gives the
+    translation a distinct value from the source text, so the record can be
+    checked against both - a target_text that silently became the source
+    text (round 1's begin(unit, unit.text) mutation, reachable here too)
+    would otherwise pass unnoticed.
     """
     clock = FakeClock()
     watch = DeadAirWatch(clock, threshold_s=6.0)
     watch.heard_speech()
+
+    class TickingTranslator(FakeTranslator):
+        def translate(self, text, src, tgt):
+            clock.advance(0.3)
+            return super().translate(text, src, tgt)
 
     records = []
     playout = Playout(Direction.IN, FakeAudioSink())
@@ -536,18 +568,21 @@ def test_a_chunk_refused_on_arrival_produces_a_truncated_row_with_no_latency_and
             yield b"\x01\x02" * 8000  # arrives too late: refused on item.closed
 
     pipeline = _pipeline(
+        translator=TickingTranslator({"привет": "hello"}),
         synthesizer=DelayedSynthesizer(),
         playout=playout,
         clock=clock,
         dead_air=watch,
         on_record=records.append,
     )
-    pipeline.handle(_final(t_end=0.0))
+    pipeline.handle(_final("привет", t_end=0.0))
 
     assert playout.backlog_s() == 0.0
     assert len(records) == 1
     assert records[0].truncated is True
     assert records[0].dropped is False
+    assert records[0].unit.text == "привет"
+    assert records[0].target_text == "hello"
     assert records[0].latency == Latency()
     clock.advance(7.0)
     assert watch.alarming() is True

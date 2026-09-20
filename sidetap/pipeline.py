@@ -247,6 +247,14 @@ class DirectionPipeline:
             # would lose the source line with it, exactly as on the bypass
             # path above. No latency: there is nothing to report a wait for.
             #
+            # `and handle.truncated` is redundant given the other two: every
+            # playout-side close that leaves first_ms unset (the starvation
+            # bound on a still-queued, never-started utterance) sets
+            # truncated in the same breath, so `produced and first_ms is
+            # None and not handle.dropped` already implies it. Kept anyway,
+            # spelled out, as defence against a future playout path that
+            # closes an utterance without setting the flag.
+            #
             # `first_ms is None` is what scopes this to that case alone: a
             # synthesis that fails after some audio was already accepted
             # also produces and also ends up truncated, but first_ms is set
