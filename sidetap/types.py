@@ -130,6 +130,12 @@ class Translated:
 class Latency:
     asr_ms: float = 0.0
     mt_ms: float = 0.0
+    # This CHANGED MEANING when playout started streaming: it used to be the
+    # full synthesis wall time, and is now the wait until playout accepted
+    # the first chunk. A transcript recorded before that change and one
+    # recorded after are not comparable on this field, and nothing in a
+    # .jsonl says which era it came from - the presence of a non-zero
+    # tts_total_ms beside it is the only hint.
     tts_ms: float = 0.0
     # Full synthesis wall time. Deliberately NOT part of total_ms: once
     # playout starts on the first chunk instead of waiting for the whole

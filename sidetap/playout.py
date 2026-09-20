@@ -155,9 +155,15 @@ class Playout:
         return item
 
     def append(self, item: Utterance, chunk: bytes) -> bool:
-        """Add synthesised audio. False means stop synthesising: the utterance
-        was flushed (bypass) or already closed, and the rest of it will never
-        be heard."""
+        """Add synthesised audio. False means stop synthesising: the rest of
+        this utterance will never be heard.
+
+        Two causes, and a caller that assumes only the first will mis-report
+        the second: it was flushed - by bypass, or by the drop-backlog hotkey,
+        which calls flush() directly and independently of bypass - or it was
+        already closed, which is how playout reports giving up on it at the
+        starvation bound.
+        """
         with self._lock:
             if item.dropped or item.closed:
                 return False
