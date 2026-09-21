@@ -129,7 +129,14 @@ uv run sidetap run \
 `--their-lang`/`--my-lang` are BCP-47 codes (`ru-RU`, `en-US`, `uk-UA`, ...);
 `--voice-in`/`--voice-out` pick the Chirp 3 HD voice each side hears, defaulted
 from a small built-in table — pass one explicitly for a language pair not in
-it, or the run fails fast rather than guessing. `--phrase` boosts recognition
+it, or the run fails fast rather than guessing.
+`--voice-in-gender`/`--voice-out-gender` take `male` or `female` and pick from
+that same table, so you do not have to know that the voices are named after
+moons. Naming a voice and asking for a gender in the *same* direction is
+rejected at parse time rather than one quietly winning. The built-in defaults
+are deliberately not uniform: English defaults male and every other language
+defaults female, so in an `en-US ↔ ru-RU` call the two directions sound
+different without either flag. `--phrase` boosts recognition
 of a name or term that would otherwise get mangled; repeat it as needed.
 `--project` can be omitted if `GOOGLE_CLOUD_PROJECT` is set. `--no-tui` drops
 the dashboard for plain console logging, useful over SSH or in CI.
