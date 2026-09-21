@@ -12,6 +12,13 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Footer, Static
 
+# Private on purpose: Textual exports Footer but not the per-key widget it
+# builds, and a footer key is the only place a toggle's state can be shown
+# where the user already looks for it. tests/test_tui.py asserts the import
+# and the resulting colour, so a Textual release that moves this fails the
+# suite rather than silently leaving the key unlit.
+from textual.widgets._footer import FooterKey
+
 from .metrics import Health, Metrics
 from .types import Direction, Latency
 
@@ -47,6 +54,23 @@ class SidetapApp(App):
     .interim { color: $text-muted; }
     .target { text-style: bold; }
     .stats { color: $text-muted; }
+
+    /* An engaged toggle. $warning, not $error: .pane.alarm owns $error for
+       "something is wrong", and bypass and mute are things the user did on
+       purpose.
+
+       Both component classes have to be named, and NOT because of the
+       background - FooterKey's own background does reach them. It is the
+       foreground: $footer-key-foreground is itself amber in the default
+       theme, so a rule that set only the background paints the key letter
+       #ffa62b on a #fea62b fill and the letter vanishes. gruvbox and nord
+       are nearly as bad. $text re-resolves against the new background, which
+       is what keeps the key readable on every built-in theme. */
+    FooterKey.-engaged {
+        background: $warning;
+        .footer-key--key { background: $warning; color: $text; text-style: bold; }
+        .footer-key--description { background: $warning; color: $text; text-style: bold; }
+    }
     """
 
     BINDINGS = [
@@ -60,7 +84,6 @@ class SidetapApp(App):
         super().__init__()
         self._metrics = metrics
         self._session = session
-        self._bypassed = False
 
     def compose(self) -> ComposeResult:
         for direction in Direction:
@@ -126,10 +149,38 @@ class SidetapApp(App):
         state = "BYPASSED  " if snapshot.bypassed else ""
         self.sub_title = f"{state}mt:{model}  est. ${snapshot.cost_usd:.2f}"
 
+        self._paint_toggles(
+            {"bypass": snapshot.bypassed, "mute": snapshot.muted_out}
+        )
+
+    def _paint_toggles(self, engaged: dict[str, bool]) -> None:
+        """Light the footer key of a toggle that is currently on.
+
+        Re-applied every tick rather than once per keypress, because Footer
+        rebuilds its FooterKey children from scratch whenever screen bindings
+        change (bindings_changed -> recompose) and would drop a class set
+        once. Polling is also what keeps the key honest: it shows what Metrics
+        says, not what this app believes it asked for.
+
+        Keyed on the binding's action, so keys with no toggle state - flush,
+        quit, Textual's own command palette - are skipped by the lookup
+        rather than by a list here that could fall out of date.
+        """
+        for key in self.query(FooterKey):
+            state = engaged.get(key.action)
+            if state is not None:
+                key.set_class(state, "-engaged")
+
     def action_bypass(self) -> None:
-        self._bypassed = not self._bypassed
+        """Toggle against Metrics, not against a flag kept here.
+
+        A local mirror is a second copy of the truth that nothing reconciles:
+        if set_bypass raises partway, or anything else ever changes the
+        session's state, the mirror and the snapshot disagree and the next
+        press does the opposite of what the screen shows.
+        """
         if self._session is not None:
-            self._session.set_bypass(self._bypassed)
+            self._session.set_bypass(not self._metrics.snapshot().bypassed)
 
     def action_mute(self) -> None:
         """Stop sending your translated voice, without leaving the call.
@@ -138,10 +189,14 @@ class SidetapApp(App):
         setter also throws the backlog away, and a queue built up while muted
         is a translation of a conversation that has already moved on. On
         unmute it would arrive as a voice recapping the last minute.
+
+        Through the session rather than the playout directly: bypass
+        suppresses that same playout, so `not playout.suppressed` read the
+        wrong question and un-suppressed OUT mid-bypass. The session holds
+        mute as its own flag and derives suppression from both.
         """
         if self._session is not None:
-            playout = self._session.playouts[Direction.OUT]
-            playout.set_suppressed(not playout.suppressed)
+            self._session.set_mute_out(not self._metrics.snapshot().muted_out)
 
     def action_flush(self) -> None:
         if self._session is not None:

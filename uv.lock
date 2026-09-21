@@ -781,7 +781,7 @@ requires-dist = [
     { name = "google-cloud-speech", specifier = ">=2.27.0" },
     { name = "google-cloud-texttospeech", specifier = ">=2.16.0" },
     { name = "google-cloud-translate", specifier = ">=3.15.0" },
-    { name = "textual", specifier = ">=0.80" },
+    { name = "textual", specifier = ">=8.2" },
     { name = "webrtcvad-wheels", specifier = ">=2.0.14" },
 ]
 

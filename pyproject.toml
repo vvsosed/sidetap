@@ -9,7 +9,11 @@ dependencies = [
     "google-cloud-translate>=3.15.0",
     "google-cloud-texttospeech>=2.16.0",
     "webrtcvad-wheels>=2.0.14",
-    "textual>=0.80",
+    # Pinned to the version actually tested, not the oldest that might work:
+    # tui.py imports FooterKey from textual.widgets._footer, which is private
+    # and belongs to a Footer rewrite that 0.80 predates. tests/test_tui.py
+    # fails loudly if a future release moves it.
+    "textual>=8.2",
 ]
 
 [project.scripts]
