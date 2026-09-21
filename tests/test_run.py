@@ -25,6 +25,7 @@ def _args(**kwargs):
         mt_model="general/translation-llm", tts_region="eu", model="chirp_3",
         phrases=None, out=Path("transcripts"), lag_cap=None, no_tui=True, verbose=False,
         speaking_rate_in=1.0, speaking_rate_out=1.0,
+        voice_in_gender=None, voice_out_gender=None,
     )
     base.update(kwargs)
     return argparse.Namespace(**base)
@@ -33,6 +34,69 @@ def _args(**kwargs):
 def test_default_voice_is_a_chirp3_hd_voice_for_the_language():
     voice = default_voice("ru-RU")
     assert voice.startswith("ru-RU-Chirp3-HD-")
+
+
+def test_the_default_voices_are_exactly_what_they_were_before_gender_existed():
+    """Pinned by name, deliberately unlike the startswith checks around it.
+
+    Those exist so the table can change personality freely. Here not changing
+    is the whole promise of the gender flag - it is additive, and every
+    command line that worked before produces the same two voices. A prefix
+    check cannot tell Charon from Kore.
+    """
+    from sidetap.run import VOICES
+
+    assert {lang: default_voice(lang) for lang in VOICES} == {
+        "en-US": "en-US-Chirp3-HD-Charon",
+        "en-GB": "en-GB-Chirp3-HD-Charon",
+        "ru-RU": "ru-RU-Chirp3-HD-Kore",
+        "uk-UA": "uk-UA-Chirp3-HD-Kore",
+        "de-DE": "de-DE-Chirp3-HD-Kore",
+        "es-ES": "es-ES-Chirp3-HD-Kore",
+        "fr-FR": "fr-FR-Chirp3-HD-Kore",
+        "pl-PL": "pl-PL-Chirp3-HD-Kore",
+    }
+
+
+def test_every_language_offers_both_genders_and_names_its_default():
+    """A half-filled row is a fatal InvalidArgument at the first utterance."""
+    from sidetap.run import VOICES
+    from sidetap.tts import GENDERS
+
+    for lang, entry in VOICES.items():
+        assert set(entry) == {*GENDERS, "default"}, lang
+        assert entry["default"] in GENDERS, lang
+        for gender in GENDERS:
+            assert entry[gender].startswith(f"{lang}-Chirp3-HD-"), (lang, gender)
+
+
+def test_a_gender_overrides_the_language_default():
+    assert default_voice("ru-RU", "male") == "ru-RU-Chirp3-HD-Charon"
+    assert default_voice("en-US", "female") == "en-US-Chirp3-HD-Kore"
+    # And asking for the gender it already defaults to changes nothing.
+    assert default_voice("ru-RU", "female") == default_voice("ru-RU")
+
+
+def test_gender_applies_to_the_language_each_direction_speaks():
+    """IN speaks my_lang, OUT speaks their_lang - the same crossover as voice."""
+    configs = build_direction_configs(
+        _args(voice_in_gender="female", voice_out_gender="male")
+    )
+    assert configs[Direction.IN].voice == "en-US-Chirp3-HD-Kore"
+    assert configs[Direction.OUT].voice == "ru-RU-Chirp3-HD-Charon"
+
+
+def test_one_direction_gendered_leaves_the_other_at_its_default():
+    configs = build_direction_configs(_args(voice_in_gender="female"))
+    assert configs[Direction.IN].voice == "en-US-Chirp3-HD-Kore"
+    assert configs[Direction.OUT].voice == "ru-RU-Chirp3-HD-Kore"
+
+
+def test_a_language_with_no_known_voice_fails_the_same_way_with_a_gender():
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no default Chirp 3 HD voice"):
+        default_voice("xx-XX", "male")
 
 
 def test_an_explicit_voice_wins():

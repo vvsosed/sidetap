@@ -95,6 +95,23 @@ not that the fill is legible in your terminal or that a click lands.
       lit key survives the reflow — Footer rebuilds its keys on layout
       changes, and the class is re-applied by polling rather than held.
 
+## Voice selection
+
+Which voice is speaking can only be checked by ear. The suite pins the table
+and proves the flag reaches `DirectionConfig`; it cannot tell you the audio
+coming out of your headphones is the voice you asked for.
+
+- [ ] Run with no voice flags at all. Confirm you hear a male voice and the
+      remote party hears a female one (for an `en-US` / `ru-RU` pair) — the
+      built-in defaults are not uniform, and this is the baseline any later
+      change to the table has to preserve.
+- [ ] Add `--voice-in-gender female --voice-out-gender male` and confirm both
+      directions swap. Both, not one: the flags are written out separately and
+      a copy-paste slip in either one is invisible to everything else.
+- [ ] Confirm `--voice-in en-US-Chirp3-HD-Kore --voice-in-gender male` exits
+      immediately with a usage message, before the graph is touched or any
+      cloud call is made.
+
 ## Silence that is not silence
 
 An unlinked PipeWire capture node delivers zero bytes rather than silence, so
