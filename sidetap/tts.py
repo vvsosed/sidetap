@@ -61,6 +61,16 @@ def voice_language(voice_name: str) -> str:
 MIN_SPEAKING_RATE = 0.25
 MAX_SPEAKING_RATE = 2.0
 
+# The genders a voice can be asked for. Lives here rather than beside the
+# voice table in run.py so cli.py can validate against it without importing
+# run - that import is deliberately lazy, to keep `doctor` and `devices` from
+# loading the whole pipeline. Matches how MIN/MAX_SPEAKING_RATE are imported.
+#
+# Two values, not the four SsmlVoiceGender carries: ListVoices reports every
+# Chirp 3 HD voice as MALE or FEMALE, never NEUTRAL or UNSPECIFIED
+# (docs/experiments/05-voice-gender.md).
+GENDERS = ("male", "female")
+
 # gRPC sets no deadline of its own, so a hung streaming_synthesize call parks
 # DirectionPipeline._speak inside `for chunk in chunks` forever: the results
 # queue behind it grows unbounded, and the tts health marker stays green

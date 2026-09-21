@@ -28,30 +28,57 @@ log = logging.getLogger(__name__)
 
 SHUTDOWN_JOIN_S = 3.0
 
-# Chirp 3 HD ships 30 shared voice names per locale. One neutral default each
-# for the languages this has actually been run against; anything else must be
-# named explicitly rather than guessed at, because an invalid voice is a fatal
-# InvalidArgument at the first utterance.
-DEFAULT_VOICES = {
-    "en-US": "en-US-Chirp3-HD-Charon",
-    "en-GB": "en-GB-Chirp3-HD-Charon",
-    "ru-RU": "ru-RU-Chirp3-HD-Kore",
-    "uk-UA": "uk-UA-Chirp3-HD-Kore",
-    "de-DE": "de-DE-Chirp3-HD-Kore",
-    "es-ES": "es-ES-Chirp3-HD-Kore",
-    "fr-FR": "fr-FR-Chirp3-HD-Kore",
-    "pl-PL": "pl-PL-Chirp3-HD-Kore",
+# One male and one female voice for each language this has actually been run
+# against; anything else must be named explicitly rather than guessed at,
+# because an invalid voice is a fatal InvalidArgument at the first utterance.
+#
+# Charon and Kore are the pair everywhere because they are the pair that
+# exists everywhere. Chirp 3 HD carries 30 voices (16 male, 14 female) in 52
+# of its 53 locales - and ru-RU, this project's own canonical example, is the
+# one exception, with 8: Charon/Fenrir/Orus/Puck and Aoede/Kore/Leda/Zephyr.
+# Widening this table to more personalities has to start there, not from the
+# published 30 (docs/experiments/05-voice-gender.md).
+#
+# "default" is the voice you get with no --voice-*-gender, and it is
+# deliberately not uniform. These are exactly the voices the table produced
+# before gender was selectable, so adding the flag changed nothing for a
+# command line that already worked. In the canonical en-US <-> ru-RU call it
+# means you hear a male voice and they hear a female one, which also happens
+# to make the two directions easy to tell apart.
+VOICES = {
+    "en-US": {"male": "en-US-Chirp3-HD-Charon",
+              "female": "en-US-Chirp3-HD-Kore", "default": "male"},
+    "en-GB": {"male": "en-GB-Chirp3-HD-Charon",
+              "female": "en-GB-Chirp3-HD-Kore", "default": "male"},
+    "ru-RU": {"male": "ru-RU-Chirp3-HD-Charon",
+              "female": "ru-RU-Chirp3-HD-Kore", "default": "female"},
+    "uk-UA": {"male": "uk-UA-Chirp3-HD-Charon",
+              "female": "uk-UA-Chirp3-HD-Kore", "default": "female"},
+    "de-DE": {"male": "de-DE-Chirp3-HD-Charon",
+              "female": "de-DE-Chirp3-HD-Kore", "default": "female"},
+    "es-ES": {"male": "es-ES-Chirp3-HD-Charon",
+              "female": "es-ES-Chirp3-HD-Kore", "default": "female"},
+    "fr-FR": {"male": "fr-FR-Chirp3-HD-Charon",
+              "female": "fr-FR-Chirp3-HD-Kore", "default": "female"},
+    "pl-PL": {"male": "pl-PL-Chirp3-HD-Charon",
+              "female": "pl-PL-Chirp3-HD-Kore", "default": "female"},
 }
 
 
-def default_voice(language_code: str) -> str:
+def default_voice(language_code: str, gender: str | None = None) -> str:
+    """The voice for a language, optionally forced to a gender.
+
+    gender=None keeps the one-argument call working and returns whatever that
+    language defaulted to before gender existed.
+    """
     try:
-        return DEFAULT_VOICES[language_code]
+        entry = VOICES[language_code]
     except KeyError:
         raise RuntimeError(
             f"no default Chirp 3 HD voice for {language_code!r}. Pass --voice-in "
             "or --voice-out explicitly; see the Chirp 3 HD voice list."
         ) from None
+    return entry[gender or entry["default"]]
 
 
 def build_direction_configs(args) -> dict[Direction, DirectionConfig]:
@@ -60,14 +87,15 @@ def build_direction_configs(args) -> dict[Direction, DirectionConfig]:
             direction=Direction.IN,
             source_lang=args.their_lang,
             target_lang=args.my_lang,
-            voice=args.voice_in or default_voice(args.my_lang),
+            voice=args.voice_in or default_voice(args.my_lang, _gender(args, "in")),
             speaking_rate=_rate(args, "in"),
         ),
         Direction.OUT: DirectionConfig(
             direction=Direction.OUT,
             source_lang=args.my_lang,
             target_lang=args.their_lang,
-            voice=args.voice_out or default_voice(args.their_lang),
+            voice=args.voice_out
+            or default_voice(args.their_lang, _gender(args, "out")),
             speaking_rate=_rate(args, "out"),
         ),
     }
@@ -75,6 +103,10 @@ def build_direction_configs(args) -> dict[Direction, DirectionConfig]:
 
 def _rate(args, side: str) -> float:
     return getattr(args, f"speaking_rate_{side}", 1.0)
+
+
+def _gender(args, side: str) -> str | None:
+    return getattr(args, f"voice_{side}_gender", None)
 
 
 class Session:

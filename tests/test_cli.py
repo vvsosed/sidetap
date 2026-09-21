@@ -302,6 +302,83 @@ def test_a_valid_rate_is_accepted():
     assert args.speaking_rate_out == 1.0, "one direction must not move the other"
 
 
+_RUN = ["run", "--app", "z", "--their-lang", "ru-RU", "--my-lang", "en-US"]
+
+
+def test_voice_gender_defaults_to_unset_per_direction():
+    """Unset, not "male": the table's per-language default has to win.
+
+    A concrete default here would silently re-gender every language whose
+    entry defaults the other way.
+    """
+    args = build_parser().parse_args(_RUN)
+    assert args.voice_in_gender is None
+    assert args.voice_out_gender is None
+    assert not hasattr(args, "voice_gender"), "there is no shared flag"
+
+
+def test_voice_gender_is_per_direction():
+    args = build_parser().parse_args(_RUN + ["--voice-in-gender", "female"])
+    assert args.voice_in_gender == "female"
+    assert args.voice_out_gender is None, "one direction must not move the other"
+
+
+@pytest.mark.parametrize("side", ["in", "out"])
+def test_voice_gender_is_case_insensitive(side):
+    """type=str.lower runs before choices is checked.
+
+    Both flags, because they are written out separately - testing one side of
+    a mirrored pair is how the other silently loses its validator.
+    """
+    args = build_parser().parse_args(_RUN + [f"--voice-{side}-gender", "MALE"])
+    assert getattr(args, f"voice_{side}_gender") == "male"
+
+
+@pytest.mark.parametrize("side", ["in", "out"])
+def test_an_unknown_gender_fails_at_parse_time(side):
+    for bad in ("neutral", "m", "Male ", "", "unspecified"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(_RUN + [f"--voice-{side}-gender", bad])
+
+
+def test_naming_a_voice_and_asking_for_a_gender_is_rejected():
+    """Rather than one quietly winning.
+
+    Ignoring a flag the user typed is the failure DEFAULT_VOICES exists to
+    prevent, and a warning would be invisible with the TUI up.
+    """
+    import pytest
+
+    for flag, gender_flag in (
+        ("--voice-in", "--voice-in-gender"),
+        ("--voice-out", "--voice-out-gender"),
+    ):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                _RUN + [flag, "en-US-Chirp3-HD-Kore", gender_flag, "male"]
+            )
+
+
+def test_naming_one_direction_and_gendering_the_other_is_fine():
+    """The two groups are independent; only the same-direction pair clashes."""
+    args = build_parser().parse_args(
+        _RUN + ["--voice-in", "en-US-Chirp3-HD-Puck", "--voice-out-gender", "male"]
+    )
+    assert args.voice_in == "en-US-Chirp3-HD-Puck"
+    assert args.voice_out_gender == "male"
+
+
+@pytest.mark.parametrize("side", ["in", "out"])
+def test_the_gender_choices_come_from_tts_not_a_second_list(side):
+    from sidetap.tts import GENDERS
+
+    action = next(
+        a for a in build_parser()._subparsers._group_actions[0].choices["run"]._actions
+        if a.dest == f"voice_{side}_gender"
+    )
+    assert tuple(action.choices) == GENDERS
+
+
 def test_the_lag_cap_help_does_not_hardcode_the_default():
     """Written out by hand it goes on claiming 12 after the constant changes.
 

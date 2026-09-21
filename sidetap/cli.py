@@ -19,7 +19,7 @@ from .adapters import (
 )
 from .capture import CaptureError
 from .types import LAG_CAP_S
-from .tts import MAX_SPEAKING_RATE, MIN_SPEAKING_RATE
+from .tts import GENDERS, MAX_SPEAKING_RATE, MIN_SPEAKING_RATE
 from .graph import PLAYBACK_STREAM, SINK, SOURCE, PwGraph
 from .ports import Clock, GraphSource, Linker, ProcessLauncher
 
@@ -90,15 +90,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--my-lang", required=True, metavar="BCP47",
         help="what you speak, e.g. en-US",
     )
-    langs.add_argument(
+    # Naming a voice and asking for a gender are mutually exclusive rather
+    # than one quietly winning. Silently dropping a flag the user typed is the
+    # same class of failure run.py's VOICES table exists to prevent, and a
+    # warning would not rescue it: with the TUI up, Textual owns the screen
+    # and nothing logged is visible, which is why the stderr handler is only
+    # added under --no-tui. argparse rejects this at parse time instead,
+    # before any cloud call.
+    voice_in = langs.add_mutually_exclusive_group()
+    voice_in.add_argument(
         "--voice-in", default="", metavar="VOICE",
         help="Chirp 3 HD voice you hear, in --my-lang "
         "(default: picked from --my-lang)",
     )
-    langs.add_argument(
+    voice_in.add_argument(
+        "--voice-in-gender", type=str.lower, choices=GENDERS, default=None,
+        help="pick the voice YOU hear by gender instead of naming it",
+    )
+    voice_out = langs.add_mutually_exclusive_group()
+    voice_out.add_argument(
         "--voice-out", default="", metavar="VOICE",
         help="Chirp 3 HD voice they hear, in --their-lang "
         "(default: picked from --their-lang)",
+    )
+    voice_out.add_argument(
+        "--voice-out-gender", type=str.lower, choices=GENDERS, default=None,
+        help="pick the voice THEY hear by gender instead of naming it",
     )
 
     cloud = run.add_argument_group("cloud")
