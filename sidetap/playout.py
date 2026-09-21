@@ -364,14 +364,21 @@ class Playout:
         return (unread + sum(len(i.pcm) for i in self._queue)) / TTS_BYTES_PER_S
 
     def set_suppressed(self, value: bool) -> None:
-        """Entering bypass throws the queue away.
+        """Both edges throw the queue away.
 
-        Two reasons. The conversation during bypass happens unmediated, so a
-        translation of it is worth nothing by the time it plays - it would
-        arrive as a voice recapping a minute the user has already had. And the
-        lag cap lives below the suppressed branch in tick(), so a backlog built
-        while suppressed is never trimmed: a two-minute bypass would come back
-        with two minutes queued and push the lot through on_dropped at once.
+        The conversation while suppressed happens without this direction - the
+        parties talk unmediated under bypass, or the remote party simply does
+        not hear you under mute - so a translation of it is worth nothing by
+        the time it could play. Coming back, it would arrive as a voice
+        recapping a minute everyone has already had.
+
+        Entering matters for the obvious reason. LEAVING matters because
+        nothing upstream knows this playout is suppressed: pipeline._speak
+        keeps synthesising and keeps calling begin()/append(), so the queue
+        refills the whole time. begin() trims it to LAG_CAP_S, which bounds
+        the damage but does not prevent it - without this flush, un-muting
+        after a long mute replays up to 20 s of stale translation, which is
+        exactly what README says does not happen.
 
         The flag is set before the flush so a tick already in flight returns
         early rather than pulling a fresh item; the 20 ms chunk it may already
@@ -379,8 +386,7 @@ class Playout:
         already moved past it, for the reason flush() documents.
         """
         self.suppressed = value
-        if value:
-            self.flush()
+        self.flush()
 
     def _startable_locked(self, item: Utterance) -> bool:
         """Hold a new utterance until it can absorb a stall.
