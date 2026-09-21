@@ -130,6 +130,12 @@ class Session:
         # the same links down.
         self._lifecycle_lock = threading.RLock()
         self._bypassed = False
+        # Mute is tracked here, not read back off the OUT playout, because
+        # bypass suppresses that same playout. Derive the user's intent from
+        # the flag it was set on and there is no way to tell "muted" from
+        # "bypassed" when both end in suppressed=True - which is how leaving
+        # bypass used to silently unmute.
+        self._muted_out = False
         self._real_mic_links: list[tuple[int, int]] = []
         # None until setup() gets far enough to create them. setup() can
         # raise before any of these exist - the virtual-mic check runs
@@ -439,8 +445,7 @@ class Session:
             self._set_bypass_locked(value)
 
     def _set_bypass_locked(self, value: bool) -> None:
-        for playout in self.playouts.values():
-            playout.set_suppressed(value)
+        self._apply_suppression_locked(value)
         if value:
             # Directly, not by setting a flag for tick() to notice. Bypass is
             # what the user reaches for when the interpretation is making the
@@ -466,6 +471,45 @@ class Session:
         finally:
             if not value and not self._real_mic_links:
                 self._bypassed = False
+
+    def set_mute_out(self, value: bool) -> None:
+        """Stop sending your translated voice, without leaving the call.
+
+        Recognition and translation keep running; only the OUT playout is
+        suppressed. Pressed while bypassed this changes what you come back
+        to, not what bypass is doing right now - bypass already suppresses
+        OUT, and un-suppressing it there would put translated speech over the
+        unmediated conversation bypass exists to step out of.
+        """
+        with self._lifecycle_lock:
+            # Flag and metric written together, before the part that acts on
+            # them, for the reason _set_bypass_locked writes its own metric
+            # early: the two must not be able to disagree about what the user
+            # asked for, or the lit key and the next keypress diverge.
+            self._muted_out = value
+            self.metrics.set_muted_out(value)
+            self._apply_suppression_locked(self._bypassed)
+
+    def _apply_suppression_locked(self, bypassed: bool) -> None:
+        """OUT is suppressed if EITHER control says so; IN only by bypass.
+
+        Takes `bypassed` as an argument rather than reading self._bypassed,
+        because _set_bypass_locked deliberately writes that field AFTER this
+        runs (see its comment on the ordering) - reading it here would apply
+        the previous value on the way into bypass.
+
+        Guarded on an actual change because set_suppressed() flushes, and
+        flush() cuts the utterance in progress short. Re-asserting a state
+        that already holds - pressing `m` twice while bypassed, say - would
+        chop a sentence for no reason.
+        """
+        for direction, want in (
+            (Direction.IN, bypassed),
+            (Direction.OUT, bypassed or self._muted_out),
+        ):
+            playout = self.playouts[direction]
+            if playout.suppressed != want:
+                playout.set_suppressed(want)
 
     def _link_real_mic(self, connected: bool) -> None:
         """Wire the user's real microphone straight into the virtual mic.

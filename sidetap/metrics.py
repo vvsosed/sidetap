@@ -42,6 +42,10 @@ class Snapshot:
     directions: dict[Direction, DirectionState]
     cost_usd: float = 0.0
     bypassed: bool = False
+    # Your translated voice is not being sent. Separate from `bypassed`,
+    # which also suppresses OUT: the two compose, and Session keeps them as
+    # two fields so leaving bypass restores mute rather than clearing it.
+    muted_out: bool = False
     # Which translation model is actually in use. Session-level, not
     # per-direction: one GoogleTranslator serves both directions, so its
     # sticky downgrade to NMT applies to the whole call.
@@ -54,6 +58,7 @@ class Metrics:
         self._states = {d: DirectionState() for d in Direction}
         self._cost_usd = 0.0
         self._bypassed = False
+        self._muted_out = False
         self._mt_model = ""
 
     def set_interim(self, direction: Direction, text: str) -> None:
@@ -135,6 +140,10 @@ class Metrics:
         with self._lock:
             self._bypassed = value
 
+    def set_muted_out(self, value: bool) -> None:
+        with self._lock:
+            self._muted_out = value
+
     def set_mt_model(self, model: str) -> None:
         """Record which translation model is in use.
 
@@ -154,5 +163,6 @@ class Metrics:
                 directions=deepcopy(self._states),
                 cost_usd=self._cost_usd,
                 bypassed=self._bypassed,
+                muted_out=self._muted_out,
                 mt_model=self._mt_model,
             )

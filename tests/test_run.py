@@ -168,6 +168,112 @@ def test_bypass_toggles_back(tmp_path, routing_graph):
     session.shutdown()
 
 
+def test_mute_suppresses_only_the_outbound_direction(tmp_path, routing_graph):
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.set_mute_out(True)
+    assert session.playouts[Direction.OUT].suppressed is True
+    # Mute is "stop sending my voice", not "stop the call". Suppressing IN
+    # too would silence the person you are listening to.
+    assert session.playouts[Direction.IN].suppressed is False
+    assert session.metrics.snapshot().muted_out is True
+    session.shutdown()
+
+
+def test_muting_clears_the_backlog_rather_than_deferring_it(tmp_path, routing_graph):
+    """A queue built before the mute is a conversation that has moved on.
+
+    Session.set_mute_out has to reach Playout.set_suppressed, which flushes.
+    Assigning `suppressed` directly would suppress and keep the backlog, and
+    unmuting would then play a voice recapping the last minute.
+    """
+    from sidetap.types import TTS_RATE, Translated, Unit
+
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.playouts[Direction.OUT].submit(
+        Translated(
+            unit=Unit(direction=Direction.OUT, text="hi", t_start=0.0, t_end=0.0),
+            text="ciao",
+            pcm=b"\x00" * (TTS_RATE * 2 * 3),  # 3 seconds
+        )
+    )
+    assert session.playouts[Direction.OUT].backlog_s() == 3.0
+
+    session.set_mute_out(True)
+    assert session.playouts[Direction.OUT].suppressed is True
+    assert session.playouts[Direction.OUT].backlog_s() == 0.0
+    session.shutdown()
+
+
+def test_mute_while_bypassed_does_not_un_suppress_the_outbound_playout(
+    tmp_path, routing_graph
+):
+    """Bypass's third effect must survive the mute key.
+
+    Before mute became a flag of its own, `m` read `not playout.suppressed` -
+    which under bypass is `not True` - and switched OUT back on, putting
+    translated speech over the unmediated conversation bypass exists to step
+    out of.
+    """
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.set_bypass(True)
+    session.set_mute_out(True)
+    assert session.playouts[Direction.OUT].suppressed is True
+    session.set_mute_out(False)
+    assert session.playouts[Direction.OUT].suppressed is True
+    session.shutdown()
+
+
+def test_leaving_bypass_restores_mute_rather_than_clearing_it(
+    tmp_path, routing_graph
+):
+    """Muting, bypassing and coming back used to leave you audible."""
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.set_mute_out(True)
+    session.set_bypass(True)
+    session.set_bypass(False)
+    assert session.playouts[Direction.OUT].suppressed is True
+    assert session.metrics.snapshot().muted_out is True
+    # IN was only ever suppressed by bypass, so it comes back.
+    assert session.playouts[Direction.IN].suppressed is False
+    session.shutdown()
+
+
+def test_leaving_bypass_un_suppresses_when_not_muted(tmp_path, routing_graph):
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.set_bypass(True)
+    session.set_bypass(False)
+    assert session.playouts[Direction.OUT].suppressed is False
+    session.shutdown()
+
+
+def test_an_unchanged_suppression_state_is_not_re_applied(tmp_path, routing_graph):
+    """set_suppressed flushes, and flush cuts the utterance in progress short.
+
+    Pressing `b` while already muted must not chop the sentence that is
+    playing on the IN side, and re-asserting OUT's unchanged state must not
+    chop anything either.
+    """
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.set_mute_out(True)
+
+    calls = []
+    out = session.playouts[Direction.OUT]
+    original = out.set_suppressed
+    out.set_suppressed = lambda value: (calls.append(value), original(value))[1]
+
+    session.set_bypass(True)
+    assert calls == [], "OUT was already suppressed by mute; nothing to re-apply"
+    session.set_mute_out(True)
+    assert calls == [], "setting mute to the value it already had re-flushed"
+    session.shutdown()
+
+
 def test_one_direction_dying_does_not_drop_the_call(tmp_path, routing_graph):
     """A bad --their-lang must not kill an OUT direction that is fine."""
     from google.api_core import exceptions as gexc

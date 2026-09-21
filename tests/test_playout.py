@@ -302,6 +302,24 @@ def test_entering_bypass_throws_the_backlog_away():
     assert playout.backlog_s() == 0.0
 
 
+def test_leaving_suppression_throws_away_what_piled_up_behind_it():
+    """Nothing upstream knows a playout is suppressed.
+
+    pipeline._speak keeps synthesising and keeps queueing the whole time, so
+    the queue refills while nobody is listening. begin() trims it to the lag
+    cap, which bounds the pile at ~20 s rather than preventing it - and 20 s
+    of a conversation that has already moved on is exactly what README
+    promises un-muting does not replay.
+    """
+    playout = Playout(Direction.OUT, FakeAudioSink())
+    playout.set_suppressed(True)
+    playout.submit(_translated(1.0))
+    assert playout.backlog_s() == 1.0, "the queue does fill while suppressed"
+
+    playout.set_suppressed(False)
+    assert playout.backlog_s() == 0.0
+
+
 def test_a_duck_whose_node_appears_late_still_ducks():
     """Router.engage() returns before pw-loopback registers the duck node.
 

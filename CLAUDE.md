@@ -24,7 +24,7 @@ imported. The two repositories share no runtime dependency.
 `sidetap/` is the application; see **Architecture** below for the module
 table.
 
-`tests/` holds 435 tests that run with no audio hardware, no network and no
+`tests/` holds 456 tests that run with no audio hardware, no network and no
 credentials — every subprocess, socket and clock the package touches sits
 behind a `Protocol` in `ports.py`, with a real implementation in
 `adapters.py` and a fake in `tests/conftest.py`.
@@ -63,7 +63,7 @@ pw-cli --version                   # needs >= 0.3.60
 pw-dump | head                     # graph as JSON
 wpctl status                       # sinks/sources, incl. sidetap's own nodes
 
-uv run pytest -q                                   # 435 tests, no audio/network/creds needed
+uv run pytest -q                                   # 456 tests, no audio/network/creds needed
 uv run sidetap devices                              # run this MID-CALL, not before
 uv run sidetap doctor                               # environment checks
 uv run sidetap doctor --install                     # write the virtual-mic config (once)
@@ -195,7 +195,7 @@ as a style preference and this is not one.
   `google.cloud.translate` client — its `google.api_core.exceptions` import
   stays at module level, since it needs no network or credentials), not at
   module level. `webrtcvad` the same way (`vad.py:webrtc_detector`), with a
-  fallback to a no-op gate if it is missing. This is what lets 435 tests
+  fallback to a no-op gate if it is missing. This is what lets 456 tests
   import the package and run with no credentials configured at all — a
   top-level `from google.cloud import X` would make every test that merely
   imports the module require live credentials to collect.
@@ -280,6 +280,27 @@ as a style preference and this is not one.
   stays there for the rest of the session — `Metrics.set_mt_model` exists so
   that stays visible, since the next successful NMT call would otherwise turn
   the TUI's `mt` marker green again with no sign the model actually changed.
+- **Mute and bypass both suppress the OUT playout, so neither may be derived
+  from `Playout.suppressed`.** `Session` keeps `_muted_out` as its own flag
+  and `_apply_suppression_locked` derives OUT from `bypassed or _muted_out`
+  (IN from bypass alone). Read the playout instead and the two states are
+  indistinguishable once either is on: `m` under bypass becomes
+  `not True`, which un-suppresses OUT and puts translated speech over the
+  unmediated call bypass exists to step out of, and leaving bypass clears a
+  mute the user never lifted. The guard on an actual change matters too -
+  `set_suppressed` flushes, and flush cuts the utterance in progress short.
+- **`set_suppressed` flushes on BOTH edges.** Nothing upstream knows a
+  playout is suppressed: `pipeline._speak` keeps synthesising and keeps
+  calling `begin()`, so the queue refills the whole time. `begin()`'s trim
+  bounds that at `LAG_CAP_S` rather than preventing it, so flushing only on
+  the way in would replay up to 20 s of a conversation that has already moved
+  on the moment you come back.
+- **The dashboard's toggle state is polled, never pushed.** `_paint_toggles`
+  re-applies the `-engaged` class to the `Footer`'s keys on every 10 Hz tick
+  from the `Metrics` snapshot, because `Footer` rebuilds its `FooterKey`
+  children whenever screen bindings change and would drop a class set once.
+  It also means the key shows what the pipeline actually did, not what the UI
+  asked for - the reason `action_bypass` no longer keeps a local mirror.
 - **Cost is billed on audio actually sent, not on call duration.**
   `RecognitionWorker.blocks()` reports both real speech and keepalive silence
   through `on_audio_sent`, because Google bills them identically — counting
