@@ -214,12 +214,12 @@ point: the state that survives a bypass is the one you are most likely to
 forget you set.
 
 `f` (drop backlog) clears every queued-but-not-yet-started utterance on both
-directions, **and cuts the one in progress short too**. What you still hear
-is the audio already past this process's control: experiment 2 measured
-441 ms of it sitting in `pw-cat`'s own buffer at the moment the hotkey fires,
-and that audio is already past this process's control and
-plays out regardless. `f` prevents the *next* sentence, not the one in
-progress; expect a short tail after pressing it.
+directions, **and cuts the one in progress short too** — `Playout.flush()`
+drops the in-flight utterance along with the queue. What you still hear
+afterwards is only the audio already handed to `pw-cat`, which is past this
+process's control and plays out regardless: experiment 2 measured **+299 ms**
+of steady-state buffering at the 16 KiB pipe sidetap sets. Expect a short tail
+after pressing it.
 
 ## Output
 
@@ -271,10 +271,10 @@ bottom row.
 These are real, current limitations found during development — not
 aspirational TODOs.
 
-- **The drop-backlog hotkey cannot truncate the sentence in progress.**
-  Experiment 2 measured 441 ms of audio already queued past this process's
-  control at the moment it fires; it only prevents what hasn't started yet.
-  See **Hotkeys** above.
+- **The drop-backlog hotkey leaves a short tail.** It does cut the sentence in
+  progress — that is what `Playout.flush()` does — but roughly 300 ms is
+  already inside `pw-cat` and plays out regardless, so the silence is not
+  immediate. See **Hotkeys** above.
 - **Half-duplex cadence is required, not optional.** Full-replacement routing
   means there is no overlay to fall back on, and v1 only translates complete,
   finalised utterances (no incremental commit yet) — so both parties talking

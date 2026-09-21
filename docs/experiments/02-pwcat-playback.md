@@ -159,3 +159,38 @@ of latency.
    a real call. 16 KiB measured stable here across every run, but this is the
    one change that trades buffer headroom for latency, and an underrun is
    audible where the old 1.3 s buffer was merely slow.
+
+## Addendum, 2026-09-21 — consequence 3 was wrong twice
+
+Consequence 3 above says the drop-backlog hotkey "cannot cut the current
+sentence short", and sends 441 ms to `README.md`. Both halves are wrong, and
+the second one is wrong in a way this experiment already had the data to catch.
+
+**It does cut the sentence short.** `Playout.flush()` clears the queue *and*
+the in-flight utterance — `self._current.dropped = True; self._current = None`
+— after which `append()` returns `False` and `_speak` stops synthesising. Its
+docstring is explicit that "the in-progress item is cut short, not
+'dropped'". Nothing about the hotkey stops at the queue boundary.
+
+**441 ms is the wrong figure for it.** Step 2 timed stop-writing to `pw-cat`
+**exiting**, on a `Popen` with no `F_SETPIPE_SZ` and no `--latency 20ms` — the
+64 KiB default this same experiment then recommended replacing. Two reasons it
+cannot describe the hotkey:
+
+- `flush()` never closes `pw-cat`. Playout keeps writing silence, so
+  process-exit time is not the mechanism.
+- Step 2 wrote only 200 ms of tone in total, so 441 ms cannot all be queued
+  audio.
+
+The figure the hotkey actually wants is steady-state buffering at the pipe size
+that shipped, and this experiment measured it in the table above: **+299 ms at
+16 KiB, across three of three runs with zero variance**, against +1259 ms at
+64 KiB.
+
+The residue claim reached `README.md` in two places that then contradicted each
+other — the hotkey section said `f` cuts the sentence in progress, the known
+limitations said it cannot — and from there into the project wiki. Both are
+corrected to ~300 ms.
+
+**The measurements above are left exactly as they were recorded.** Only the
+conclusion drawn from them was wrong.
