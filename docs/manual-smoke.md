@@ -67,6 +67,34 @@ worse, so it has to work when everything else is not.
       there, every later call carries your raw voice alongside the
       translation.
 
+## Mute, and how it composes with bypass
+
+`m` is the toggle a user is most likely to leave on and forget, which is why
+it is the one that has to look engaged. None of this is reachable from the
+test suite: the suite can prove the class is set and the colours differ, but
+not that the fill is legible in your terminal or that a click lands.
+
+- [ ] Press `m`. Confirm the `Mute out` key in the footer fills with amber and
+      its label stays readable — a theme whose key colour is close to the fill
+      can leave the letter present but invisible.
+- [ ] Confirm `Bypass` did **not** light, and neither did `Drop backlog` or
+      `Quit`.
+- [ ] **Click** the `Bypass` label with the mouse. Confirm it toggles exactly
+      as `b` does, and lights.
+- [ ] Press `m`, then `b`, then `b`. Confirm `Mute out` stays lit the whole
+      way through and that you are **still muted** at the end. An earlier
+      build cleared mute here silently, so the user came back audible to a
+      call they thought they had stepped out of.
+- [ ] Press `b`, then `m` while bypassed. Confirm the remote party hears no
+      translated speech at any point — bypass's third effect must survive the
+      mute key. Only the key's appearance should change.
+- [ ] Mute during continuous speech for ~30 s, then unmute. Confirm nothing
+      replays. Synthesis keeps filling the queue while muted, and the lag cap
+      only bounds it at 20 s rather than preventing it.
+- [ ] Narrow the terminal until the footer scrolls, then toggle. Confirm the
+      lit key survives the reflow — Footer rebuilds its keys on layout
+      changes, and the class is re-applied by polling rather than held.
+
 ## Silence that is not silence
 
 An unlinked PipeWire capture node delivers zero bytes rather than silence, so

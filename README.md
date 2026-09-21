@@ -169,6 +169,12 @@ see **Known limitations**.
 | `f` | Drop backlog |
 | `q` | Quit |
 
+Every key in the footer is clickable as well as typeable. The two that hold a
+state — `Bypass` and `Mute out` — fill with amber while they are engaged, so
+"am I still muted?" is answered by looking rather than by remembering. The
+lit key is drawn from the pipeline's own state, not from what the dashboard
+believes it asked for, so a toggle that failed to apply stays unlit.
+
 **Bypass (`b`) has three effects, and all three matter** — describing only one
 is how a user ends up with translated speech talking over the unmediated
 conversation it was meant to replace:
@@ -183,12 +189,22 @@ conversation it was meant to replace:
 Recognition keeps running underneath bypass so the transcript stays
 continuous, but nothing queued during bypass gets spoken afterward — toggling
 `b` off does not replay a backlog of everything said while it was on, because
-the queue is thrown away rather than held.
+the queue is thrown away on the way in *and* on the way out. Both edges
+matter: nothing upstream knows a playout is suppressed, so synthesis carries
+on filling the queue the whole time bypass is on.
 
 `m` (mute) stops sending your translated voice without leaving the call —
 recognition and translation keep running, only your OUT playout is
 suppressed, and unmuting does not play back what accumulated while muted, for
 the same reason.
+
+**Mute and bypass compose rather than overwrite each other.** Bypass
+suppresses your outbound playout for its own reasons (effect 3 above), so
+pressing `m` while bypassed changes what you come back *to*, not what bypass
+is doing right now — and leaving bypass restores your mute instead of
+silently clearing it. The `Mute out` key stays lit throughout, which is the
+point: the state that survives a bypass is the one you are most likely to
+forget you set.
 
 `f` (drop backlog) clears every queued-but-not-yet-started utterance on both
 directions, **and cuts the one in progress short too**. What you still hear
