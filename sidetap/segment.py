@@ -180,7 +180,45 @@ class LocalAgreementSegmenter:
         current = _tokens(result.text)
         self._previous, self._previous_t_end = current, result.t_end
 
-        if _agreed(current, self._committed) < len(self._committed):
+        if self._committed and _agreed(current, self._committed) == 0:
+            # Pairs with the identical check in _finalise, for the identical
+            # reason: RecognitionWorker (asr.py) rebuilds its stream every
+            # MAX_STREAM_SECONDS and after any non-fatal error, neither path
+            # guarantees a final, and nothing tells the segmenter - so a
+            # commit made before the break is still here when the NEXT
+            # utterance's hypotheses arrive. Fixing only the final half would
+            # be worse than fixing neither: the interim slice below would eat
+            # the opening words of the new utterance's early commits, and the
+            # final would then inherit a _committed that is stale AND wrongly
+            # sliced, so the two compound.
+            #
+            # Zero agreement is what makes discarding safe HERE specifically:
+            # not one of the words already translated and spoken appears in
+            # this hypothesis, so there is nothing the next commit could
+            # re-speak. That is the whole argument - a synthesised voice
+            # cannot take a word back, so any rule that discards on a PARTIAL
+            # disagreement would risk exactly that, which is why this is
+            # scoped to zero and the partial case below is only logged.
+            #
+            # Nothing is emitted on this round by construction: _committed is
+            # a prefix of _previous, so agreeing with it on no words means
+            # agreeing with _previous on no words, and the growth check below
+            # returns empty.
+            log.warning(
+                "%s: interim shares nothing with the committed prefix (stream "
+                "restart?); discarding %d committed word(s)",
+                result.direction.value,
+                len(self._committed),
+            )
+            self._committed = []
+            # The watermark describes audio from before the break, so a span
+            # chained off it would reach back across the gap - and
+            # render_markdown sorts on t_start. result.t_end is the earliest
+            # position this utterance is confirmed through, which gives the
+            # first commit after the discard a zero-width span, the same
+            # "one timestamp, no duration" shape _finalise's discard produces.
+            self._span_start = result.t_end
+        elif _agreed(current, self._committed) < len(self._committed):
             # This hypothesis no longer begins with the text already spoken -
             # a word was inserted inside the committed prefix, or dropped from
             # it. `growth` below slices by POSITION, so every later word has
@@ -197,9 +235,10 @@ class LocalAgreementSegmenter:
             # has a symptom and no evidence, and the only record of the cause
             # is audio nobody kept.
             #
-            # It also fires on a stale commit that survived a stream restart
-            # (see _finalise), where the interim slice is wrong for a
-            # different reason. That case is only detected at the final today.
+            # An `elif`, so the stale-commit branch above owns the zero-
+            # agreement case and reports it at warning. Reaching here means
+            # SOME leading word still matches, which is a revision inside a
+            # live commit, not state left over from a dead stream.
             log.debug(
                 "%s: interim revised committed text; the next commit may repeat a word",
                 result.direction.value,
@@ -298,6 +337,16 @@ class LocalAgreementSegmenter:
             # the AsrResult values - timestamps stay monotonic across a
             # rotation by construction (StreamClock.rotated) - so the content
             # is the only evidence available here.
+            #
+            # The cost, accepted deliberately - do NOT "fix" it back. When
+            # this fires on a GENUINE same-utterance revision that diverges
+            # from the first word rather than on a stream restart, the
+            # listener hears the stale clause and then the whole final, so
+            # some words are spoken twice over. That is the trade: audible
+            # redundancy, logged at warning, instead of the silent loss of a
+            # whole sentence that slicing by the stale length produced.
+            # Nothing here can un-speak the earlier clause, so the only
+            # choice available is which of those two happens.
             #
             # Residual, stated rather than hidden: a restarted stream whose
             # first final happens to share its LEADING word with the stale

@@ -464,6 +464,65 @@ def test_an_interim_that_revises_committed_text_says_so(caplog):
     assert "interim revised committed text" in caplog.text
 
 
+def test_a_stale_commit_does_not_eat_the_next_utterances_early_commits(caplog):
+    """The interim half of the stream-restart defect.
+
+    Same break as the final-side tests, but the new utterance is long enough
+    to commit early on its own. Slicing by the stale six-word commit turned
+    "alpha beta gamma, delta epsilon" into "eta, theta" - the opening words
+    of a sentence nobody has heard, gone, on the default path.
+
+    Warning, not debug, and the mirror of the check in _finalise: fixing only
+    the final half would leave the final inheriting a _committed that is
+    stale AND wrongly sliced.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("one two three four five six,", 5.0))
+    segmenter.feed(_interim("one two three four five six, seven eight", 10.0))
+    with caplog.at_level(logging.DEBUG):
+        # The stream restarted. A new utterance, sharing nothing.
+        assert segmenter.feed(_interim("alpha beta gamma, delta", 240.0)) == []
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+    units = segmenter.feed(_interim("alpha beta gamma, delta epsilon zeta", 245.0))
+    assert [u.text for u in units] == ["alpha beta gamma,"]
+
+
+def test_a_discarded_commit_does_not_chain_the_next_span_across_the_break():
+    """The watermark is as stale as the commit it belongs to.
+
+    Left alone it dates the new utterance's first clause to before the
+    restart, and render_markdown sorts on t_start - so the bilingual
+    transcript puts a sentence spoken after the break among the rows from
+    before it.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("one two three four five six,", 5.0))
+    segmenter.feed(_interim("one two three four five six, seven eight", 10.0))
+    segmenter.feed(_interim("alpha beta gamma, delta", 240.0))
+    unit = segmenter.feed(_interim("alpha beta gamma, delta epsilon zeta", 245.0))[0]
+    assert (unit.t_start, unit.t_end) == (240.0, 240.0)
+
+
+def test_the_final_after_a_discarded_interim_commit_is_not_sliced_twice():
+    """The two halves must not compound.
+
+    Once the interim side has discarded and re-committed honestly, the final
+    is an ordinary tail: it agrees with the live commit, so it keeps the
+    count slice and emits only what is new. Nothing is lost and nothing is
+    repeated.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("one two three four five six,", 5.0))
+    segmenter.feed(_interim("one two three four five six, seven eight", 10.0))
+    segmenter.feed(_interim("alpha beta gamma, delta", 240.0))
+    segmenter.feed(_interim("alpha beta gamma, delta epsilon zeta", 245.0))
+    units = segmenter.feed(
+        _final_result("alpha beta gamma, delta epsilon zeta eta.", 250.0)
+    )
+    assert [u.text for u in units] == ["delta epsilon zeta eta."]
+
+
 def test_an_ordinary_interim_logs_no_revision(caplog):
     """A signal that fires on every interim is not a signal."""
     segmenter = LocalAgreementSegmenter()
@@ -539,7 +598,8 @@ def test_a_capture_with_no_early_commits_is_identical_to_finals_only(capture):
 
 
 def test_the_real_monologue_is_committed_in_pieces_instead_of_one_block():
-    """Today's behaviour on this capture is two units, 29.3 s apart.
+    """FinalsOnlySegmenter produced two units on this capture, 29.3 s apart.
+    That is the behaviour this segmenter replaced, not the current one.
 
     Six is pinned rather than bounded: this capture is fixed, so the number is
     a fact about it, and a range would hide a segmenter that started

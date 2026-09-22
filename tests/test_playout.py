@@ -1121,13 +1121,26 @@ def test_a_hold_does_not_spend_the_next_clause_s_start_budget():
     assert playout.tick() is True
 
 
-def test_re_arming_gives_the_next_gap_a_full_budget():
-    """Each committed clause re-arms the hold from zero.
+def test_speech_clears_the_hold_deadline():
+    """A chunk reaching the sink is what resets `_hold_ticks` - nothing else.
 
-    Inheriting the previous gap's count makes the bound cumulative across a
-    monologue instead of per gap: after a couple of ordinary gaps it expires
-    part-way through the next one and the duck opens mid-sentence anyway -
-    the exact burst of untranslated original the hold exists to prevent.
+    The old name said the re-arm did it. It does not, and has not since the
+    counter split: `expect_continuation` only arms, and clearing there made
+    the deadline a lease a caller could renew forever. What clears the
+    counter here is the two ticks of the second clause's audio between the
+    gaps, which is why the second gap gets a full bound rather than the ten
+    ticks the first one left.
+
+    What that pins is the per-gap budget. Without it the bound is cumulative
+    across a monologue: after a couple of ordinary gaps it expires part-way
+    through the next one and the duck opens mid-sentence anyway - the exact
+    burst of untranslated original the hold exists to prevent.
+
+    It does NOT pin the absence of the lease, and never did: restoring
+    reset-on-arm passes this test unchanged, because the counter is zero
+    either way by the time the second gap starts.
+    test_a_producer_cannot_renew_the_hold_forever below is the one that
+    catches that, verified by mutation.
     """
     volume = FakeVolumeControl()
     duck = DuckControl(volume, 42)
