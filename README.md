@@ -140,6 +140,11 @@ different without either flag. `--phrase` boosts recognition
 of a name or term that would otherwise get mangled; repeat it as needed.
 `--project` can be omitted if `GOOGLE_CLOUD_PROJECT` is set. `--no-tui` drops
 the dashboard for plain console logging, useful over SSH or in CI.
+`LocalAgreementSegmenter` commits a monologue clause by clause instead of
+waiting for one final, but it only engages after roughly 11 s of continuous
+speech, so it changes nothing for ordinary turn-taking; `--no-early-commit`
+falls back to the old one-clause-per-final behaviour, and the flag exists so
+the two can be compared on a real call.
 
 ### What you hear, what they hear
 

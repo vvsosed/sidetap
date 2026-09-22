@@ -346,10 +346,12 @@ as a style preference and this is not one.
   spend an incoming clause's start budget and truncate it, measured at 10 ticks
   instead of 100. `_hold_ticks` counts consecutive ticks with the duck shut and
   no chunk written, and is cleared only by a written chunk or `flush()` - not
-  by arming, which would make the bound a lease a caller could renew forever
-  (measured: 33 minutes shut). Worst case across every adversarial pattern
-  tried is 99 ticks, 1.98 s. `pipeline._speak` arms it only after playout has
-  accepted audio, so a direction whose translator is down cannot re-arm it.
+  by arming, which would make the bound a lease a caller could renew forever -
+  before this fix the duck never reopened for the full 100 000-tick (33
+  minute) run a probe simulated, arming every 50 ticks with nothing ever
+  queued. Worst case across every adversarial pattern tried after the fix is
+  99 ticks, 1.98 s. `pipeline._speak` arms it only after playout has accepted
+  audio, so a direction whose translator is down cannot re-arm it.
 
 ## Things that bite at runtime
 

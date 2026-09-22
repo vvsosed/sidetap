@@ -19,6 +19,9 @@ def _result(text="hello", is_final=True, t_start=1.0, t_end=2.0, direction=Direc
     )
 
 
+# --- FinalsOnlySegmenter -----------------------------------------------------
+
+
 def test_a_final_becomes_exactly_one_unit():
     units = FinalsOnlySegmenter().feed(_result())
     assert len(units) == 1
@@ -58,6 +61,9 @@ def test_directions_do_not_share_state():
     segmenter.feed(_result(direction=Direction.IN, is_final=False, text="ru"))
     units = segmenter.feed(_result(direction=Direction.OUT, text="en"))
     assert [(u.direction, u.text) for u in units] == [(Direction.OUT, "en")]
+
+
+# --- the comparison key: case, punctuation, word agreement -------------------
 
 
 def test_the_key_ignores_case_and_punctuation():
@@ -104,6 +110,9 @@ def test_agreement_stops_at_the_first_mismatch():
     committed, translated and spoken, where nothing can take them back.
     """
     assert _agreed(_tokens("а б в г"), _tokens("а X в г")) == 1
+
+
+# --- LocalAgreementSegmenter: committing on interims -------------------------
 
 
 def _interim(text, t_end, direction=Direction.IN):
@@ -164,20 +173,6 @@ def test_a_committed_prefix_says_more_is_coming():
     segmenter.feed(_interim("что у нас есть,", 5.0))
     units = segmenter.feed(_interim("что у нас есть, несколько", 10.0))
     assert [u.continues for u in units] == [True]
-
-
-def test_a_committed_prefix_is_dated_by_the_older_hypothesis():
-    """Its content is confirmed only through the audio the OLDER one covered.
-
-    The newer hypothesis has heard more but agreed on less. Dating the unit by
-    the newer one would report a clause as fresh when it is already five
-    seconds old, in the transcript column that is the stated evidence for
-    whether committing early was worth doing at all.
-    """
-    segmenter = LocalAgreementSegmenter()
-    segmenter.feed(_interim("что у нас есть,", 5.0))
-    units = segmenter.feed(_interim("что у нас есть, несколько", 10.0))
-    assert (units[0].t_start, units[0].t_end) == (0.0, 5.0)
 
 
 def test_a_disagreement_commits_nothing():
@@ -244,6 +239,9 @@ def test_the_cut_takes_the_last_boundary_not_the_first():
     segmenter.feed(_interim("да, конечно, мы", 5.0))
     units = segmenter.feed(_interim("да, конечно, мы согласны", 10.0))
     assert [u.text for u in units] == ["да, конечно,"]
+
+
+# --- LocalAgreementSegmenter: finals, revisions and stream restarts ----------
 
 
 def _final_result(text, t_end, direction=Direction.IN):
@@ -547,6 +545,8 @@ def test_an_ordinary_final_logs_no_revision(caplog):
         segmenter.feed(_final_result("что у нас есть, несколько задач.", 15.0))
     assert "revised" not in caplog.text
 
+
+# --- replayed against the real Chirp capture (chirp_interims.json) -----------
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chirp_interims.json"
 

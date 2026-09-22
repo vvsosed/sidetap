@@ -217,3 +217,108 @@ addendum rather than a rewrite.
 
 Splitting a single long *final* at clause boundaries, AlignAtt, and any
 attempt to reduce the ~1 s recognition lag itself all remain future work.
+
+## Addendum, 2026-09-22 — As built
+
+A whole-branch review checked this document against the shipped code and
+found four places where what shipped is not what was designed, plus one
+mechanism this document never mentions. Left here rather than folded into the
+body, the way Experiment 2 gained an addendum rather than a rewrite.
+
+**The hold does not reuse `_starved_ticks`.** "The bounded duck hold" above
+says `expect_continuation` "reuses the existing `_starved_ticks` /
+`STARVE_LIMIT_TICKS` counter". It ships with its own counter, `_hold_ticks`
+(`playout.py`). Sharing was tried and reverted: it let a hold in progress
+spend an incoming clause's own start budget, so a clause that would otherwise
+have played arrived only to be truncated by a deadline that had nothing to do
+with it - measured at 10 ticks instead of 100. `_hold_ticks` counts
+consecutive shut-and-silent ticks on its own, cleared only by a written chunk
+or `flush()`, so a starving `_current` or a stuck queue head keeps its own
+full `_starved_ticks` budget regardless of whether a hold is also armed.
+
+**The key strips punctuation only at token edges, not throughout.** "The
+comparison key" above says the key is "lowercased and stripped of
+punctuation". `segment.py`'s `_tokens` lowercases fully but strips punctuation
+only from a token's edges (`_EDGE_PUNCTUATION`), because stripping it
+throughout would key `"1.2"` and `"12"` to the same string and let two numbers
+a factor of ten apart compare as agreed - committed, translated and spoken,
+with no way to take a spoken number back. Both revisions Experiment 6 actually
+observed were at a token's edge, which is what edge-only stripping was
+measured to be sufficient for.
+
+**The cut point is a fixed boundary set, not "the last punctuation mark".**
+"Where to cut" above says to cut "at the last punctuation mark inside it". The
+shipped `_BOUNDARY = ",.;:!?…"` (`segment.py`) deliberately excludes the em
+dash: Russian uses it both as a clause separator and to stand in for a missing
+copula ("Москва - столица"), and nothing in the text distinguishes the two, so
+treating it as a boundary risks cutting a subject from its predicate. `_cut`
+also tests only a token's *last character* against that set, not "contains
+punctuation" more generally - a closing quote or bracket with nothing after it
+is missed and costs a later commit, not a wrong one.
+
+**`asr_ms`'s wall-clock read stays outside the unit loop; only the
+`t_end` it is measured against moves in.** "What needs no change" and the
+paragraph above it describe this as `asr_ms` moving inside the unit loop
+wholesale. The implementation is right and this document is wrong: only the
+`unit.t_end` read moves inside the loop; `arrived = self._clock.monotonic() -
+self._session_t0` (`pipeline.py`) is still read once per *result*, before the
+loop, and shared by every unit that result commits. `pipeline.py`'s own
+comment says why - moving the clock read inside the loop would fold `_speak`'s
+translate-and-synthesise time into the second and later units' `asr_ms` on a
+multi-unit result, which is not what that column measures.
+
+**`transcript.py` did not absorb this for free - it had a real bug, now
+fixed.** "What needs no change" claims `metrics.py`, `transcript.py` and
+`cost.py` "all absorb ~5 s commits as they stand". True for the first and
+third; false for `transcript.py`, and this is the claim that hid a real
+regression. `_emit` (`segment.py`) originally took `t_start` from the running
+span watermark unconditionally, so a final whose utterance committed *nothing*
+early - every turn of ordinary conversation - still chained its `t_start` from
+the *previous* utterance's end instead of carrying `t_start == t_end ==
+result.t_end` the way `FinalsOnlySegmenter` does. Every row's start moved back
+by one utterance, and `transcript.render_markdown` sorts on `t_start`, so an
+interleaved two-way transcript came out reordered on the default path, for
+every call. Fixed in commit `17ab049`: `_emit` now takes `t_start` from its
+caller, and `_finalise` chains from the previous piece's span only when the
+utterance was actually committed in pieces; a final that committed nothing
+early carries a whole-utterance span, span included, exactly what
+`FinalsOnlySegmenter` would have produced. A parametrised replay of the real
+`turns` and `medium` captures against both segmenters
+(`test_a_capture_with_no_early_commits_is_identical_to_finals_only`,
+`test_segment.py`) now pins the equivalence, spans included, so this cannot
+regress silently again.
+
+**Not in this document at all: recovery from a stream restart mid-utterance.**
+`RecognitionWorker` (`asr.py`) rebuilds its streaming connection every
+`MAX_STREAM_SECONDS` and after any non-fatal error, and neither path
+guarantees a final for the utterance in progress - so a commit made before the
+break can still be sitting in `_committed` when the *next* utterance's
+hypotheses arrive, with nothing in the `AsrResult` values themselves to say a
+restart happened (timestamps stay monotonic across a rotation by
+construction). `_finalise` and `_interim` (`segment.py`) both now detect this
+the only way available - zero word agreement between the stale commit and the
+new utterance's tokens - and discard the stale commit rather than slicing by
+its length, logging at `warning` because this is speech potentially lost, not
+a tail being revised. In `_finalise` the check runs *before* the remainder is
+sliced, deliberately: the worst case (a final shorter than, or sharing nothing
+with, the stale commit) has no remainder to emit, so checking after would
+leave the loudest available sign that committing early went wrong completely
+unlogged. `_interim` gained the mirror of this check later (commit
+`751576e`), fixing the case where the discard fired only on the final side and
+the interim path below it was left re-slicing a new utterance's opening words
+against the stale, already-invalidated commit. Neither behaviour is mentioned
+above; both are load-bearing.
+
+**Testing section correction.** "Four mutations must each break a named test"
+lists changing the agreement count from 2 to 1 as one of them, implicitly
+naming `test_the_real_capture_commits_nothing_the_final_contradicted` as the
+test that catches it. It does not reliably: its own docstring states that
+under a one-agreement mutation, the measured capture still never produces the
+literal contradicted substring, for an unrelated reason (the mutated
+segmenter locks in the earlier hypothesis's punctuation before the later one
+arrives), so an assertion against that one string is not evidence the
+agreement count is actually 2. The tests that do catch it are
+`test_the_real_monologue_is_committed_in_pieces_instead_of_one_block` (unit
+count changes from 6), `test_the_real_capture_loses_no_words` (the word list
+stops matching), and `test_the_real_monologues_spans_match_the_measured_capture`
+(the pinned spans move) - all in `test_segment.py`.

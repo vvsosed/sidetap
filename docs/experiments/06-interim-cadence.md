@@ -115,7 +115,14 @@ cut point and never as part of the agreement key.
 ## Consequence
 
 1. LocalAgreement-2 is worth building, for the monologue case alone. On this
-   sample it converts "up to 31 s late" into "steadily ~6.7 s behind".
+   sample it converts "up to 31 s late" into a clause reaching the segmenter
+   6.17-6.57 s after the audio position it is confirmed through - the gap
+   between the OLDER interim's own `result_end_offset` and the wall time of
+   the NEXT interim that agrees with it, since that is the arrival that
+   actually triggers the commit: 17.29 - 11.12 = 6.17 s, 22.45 - 16.12 = 6.33 s,
+   27.58 - 21.12 = 6.46 s, 32.69 - 26.12 = 6.57 s. That is the audio-to-commit
+   gap alone, before translation and synthesis add their own time on top - not
+   the end-to-end "behind" figure a live call would show.
 2. **It is self-limiting with no constant to tune.** Below roughly 11 s of
    continuous speech there are not two interims to agree, so the segmenter
    emits nothing early and behaviour is identical to `FinalsOnlySegmenter`.

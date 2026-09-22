@@ -417,7 +417,8 @@ class Playout:
         while a hold is armed and no speech reaches the sink, and ONLY a
         written chunk (or flush()) clears it. Clearing it here made the
         deadline a lease the caller renews forever - re-arming every 50 ticks
-        with nothing ever queued held the duck shut for 33 minutes.
+        with nothing ever queued, the duck never reopened for the entire
+        100 000-tick (33 minute) run a probe simulated it against.
 
         What that buys, stated narrowly enough to be checked against the code
         rather than against intent: once armed, this hold cannot keep the duck
@@ -428,14 +429,23 @@ class Playout:
         queued clause does not count as speech - Task 8 calls begin() for a
         clause before its audio exists, so an unstartable head is the ordinary
         shape, and counting only the empty-queue case left one arm plus a
-        stalling head holding the duck shut for 600 s with nothing played.
+        stalling head holding the duck shut for the entire 30 000-tick (600 s)
+        run that reproduced it, with nothing played and no reopening at all.
 
         While armed it is the tighter of the two deadlines in this module: it
         charges every shut-and-silent tick, including the ones the other arms
         are responsible for (a `_current` starving mid-sentence, a queued head
         under the start threshold), and only a written chunk clears it, where
         `_starved_ticks` is also cleared by an utterance retiring with nothing
-        played. So it fires first, or with them. Unarmed it does nothing at
+        played. That does not make it strictly the first to fire: if a
+        starvation arm's own `_starved_ticks` was already part-way to
+        STARVE_LIMIT_TICKS before this hold was armed, that arm can still
+        reach its deadline first, since `_hold_ticks` only starts counting
+        from the tick it is armed. Harmless when it does - the arm force-
+        closes its head or abandons its utterance in place rather than
+        opening the duck, so this hold's own guarantee (no more than
+        STARVE_LIMIT_TICKS shut-and-silent ticks once armed) still holds; only
+        the order the two can fire in is not fixed. Unarmed it does nothing at
         all, and those arms keep their own `_starved_ticks` deadline exactly
         as they had it.
 
@@ -622,7 +632,8 @@ class Playout:
         False. Called from one place, at the end of the branch chain rather
         than inside any arm of it, because the hold reaches the duck from two
         of those arms and a deadline watching only one of them is not a
-        deadline - that was how a stalling head held the duck shut for 600 s.
+        deadline - that was how a stalling head held the duck shut, with no
+        reopening at all, for the whole 30 000-tick (600 s) run that found it.
 
         The invariant: `_hold_ticks` is the number of consecutive ticks the
         duck has been held shut with a hold armed and NO chunk reaching the
