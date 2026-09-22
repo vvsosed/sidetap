@@ -33,16 +33,22 @@ START_BUFFER_S = 0.4
 # 100 ticks x 20 ms = 2 s. Counted in ticks rather than seconds so playout
 # needs no clock and the test is deterministic.
 #
-# The 2 s is justified differently for the two cases that share it. For an
-# utterance already playing, the yardstick is steady-state throughput -
+# The 2 s is justified differently for each of the three cases that share it.
+# For an utterance already playing, the yardstick is steady-state throughput -
 # synthesis delivers 4.7-7.1x faster than playback, so 2 s of nothing means
 # the producer is gone rather than slow - and the cost of waiting is a duck
 # held shut. For a queued head that never started, the yardstick is
 # time-to-FIRST-chunk, measured at 182-337 ms warm and 543 ms cold, and the
 # cost of giving up is the whole sentence: a first chunk slower than 2 s
 # loses it outright, where before streaming it would merely have been late.
-# One constant covers both because 2 s is generous against either
-# distribution, not because the same argument applies twice.
+# The third consumer is the continuation hold (`_charge_hold_locked`), and its
+# yardstick is neither of those: it is the longest the duck may stay shut with
+# no speech at all, justified empirically against adversarial callers rather
+# than against a latency distribution - see `expect_continuation`.
+# One constant covers all three because 2 s is generous against each
+# distribution, not because the same argument applies three times. Retuning it
+# therefore moves three things, and the third is the one that decides how long
+# a broken pipeline can silence the person you are talking to.
 STARVE_LIMIT_TICKS = 100
 
 
@@ -410,8 +416,8 @@ class Playout:
         whole of its safety: `_hold_ticks` counts every tick the duck is shut
         while a hold is armed and no speech reaches the sink, and ONLY a
         written chunk (or flush()) clears it. Clearing it here made the
-        deadline a lease - re-arming every 50 ticks with nothing ever queued
-        held the duck shut for 33 minutes, one log line, no warning.
+        deadline a lease the caller renews forever - re-arming every 50 ticks
+        with nothing ever queued held the duck shut for 33 minutes.
 
         What that buys, stated narrowly enough to be checked against the code
         rather than against intent: once armed, this hold cannot keep the duck
@@ -553,6 +559,9 @@ class Playout:
                     self._current = None
                     self._offset = 0
                     self._starved_ticks = 0
+                    # This also mutes `_charge_hold_locked` for this one tick:
+                    # it bills only shut ticks, and this one opens the duck.
+                    # The hold's deadline is delayed by 20 ms, never skipped.
                     starved = False
         elif self._queue:
             # Case 2 of 2 - queued and not startable: the same
@@ -569,11 +578,9 @@ class Playout:
             # A hold means the producer says the listener is mid-run and this
             # is the gap before the next clause, not the quiet before the
             # first one, so the duck stays shut across it. Only the duck:
-            # this head keeps its own full `_starved_ticks` budget. The hold's
-            # own deadline is charged for this tick too, below the chain - a
-            # queued head is not audio, and Task 8 queues one before its audio
-            # exists, so leaving these ticks uncounted is what let a recurring
-            # TTS stall silence the call for ten minutes.
+            # this head keeps its own full `_starved_ticks` budget. A queued
+            # head is not audio, so `_charge_hold_locked` bills this tick to
+            # the hold's deadline all the same.
             starved = self._continuation
             self._starved_ticks += 1
             if self._starved_ticks >= STARVE_LIMIT_TICKS:
@@ -605,22 +612,29 @@ class Playout:
                 # holds the duck shut.
                 starved = True
 
-        # The hold's deadline, in ONE place because the hold reaches the duck
-        # from two branches above and a bound that only watches one of them is
-        # not a bound. Written as "ticks of duck-shut with no speech reaching
-        # the sink", which is the thing that has to be bounded - not ticks
-        # since the producer last spoke up, and not ticks with an empty queue.
-        #
-        # Only a chunk actually written clears it. Clearing it on re-arm makes
-        # the deadline a lease the caller renews forever: re-arming every 50
-        # ticks with nothing ever queued held the duck shut for 33 minutes
-        # with one log line. Counting only the empty-queue branch is worse -
-        # one arm plus a head that never reaches START_BUFFER_S held it shut
-        # for 600 s with no speech at all, which is this module's one
-        # unforgivable failure.
+        return chunk, finished, self._charge_hold_locked(chunk, starved)
+
+    def _charge_hold_locked(self, chunk: bytes | None, starved: bool) -> bool:
+        """Bill this tick to the continuation hold, and expire it if it is due.
+
+        Takes what _advance_locked decided and returns `starved` unchanged
+        unless the hold has run out, in which case it disarms and returns
+        False. Called from one place, at the end of the branch chain rather
+        than inside any arm of it, because the hold reaches the duck from two
+        of those arms and a deadline watching only one of them is not a
+        deadline - that was how a stalling head held the duck shut for 600 s.
+
+        The invariant: `_hold_ticks` is the number of consecutive ticks the
+        duck has been held shut with a hold armed and NO chunk reaching the
+        sink. Not ticks since the producer last spoke up, and not ticks with
+        an empty queue. Only a written chunk clears it here, and only flush()
+        clears it elsewhere; arming does not, and neither does expiring.
+        `expect_continuation` records the two failures that rule those out.
+        """
         if chunk is not None:
             self._hold_ticks = 0
-        elif starved and self._continuation:
+            return starved
+        if starved and self._continuation:
             self._hold_ticks += 1
             if self._hold_ticks >= STARVE_LIMIT_TICKS:
                 log.warning(
@@ -632,12 +646,12 @@ class Playout:
                 # Disarm, and do NOT zero the counter. Left armed, the hold
                 # re-arms itself next tick and the duck sawtooths for the rest
                 # of the call. Zeroed, a producer re-arming after each expiry
-                # buys another full bound every time - the lease again, just
-                # slower. Leaving it spent means a re-arm gets one tick and
-                # expires again until real audio resets it.
+                # buys another full bound every time. Leaving it spent means a
+                # re-arm gets one tick and expires again until real audio
+                # resets it.
                 self._continuation = False
-                starved = False
-        return chunk, finished, starved
+                return False
+        return starved
 
     def tick(self) -> bool:
         """Write exactly one chunk. True if it carried speech."""
