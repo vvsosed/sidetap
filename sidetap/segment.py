@@ -159,6 +159,20 @@ class LocalAgreementSegmenter:
         growth = current[len(self._committed) : agreed]
         growth = growth[: _cut(growth)]
         if not growth:
+            # Unreachable today: the agreement check above guarantees at
+            # least one token, and _cut never returns 0 for a non-empty
+            # list. Kept because nothing downstream can be counted on to
+            # catch an empty Unit instead. _speak (pipeline.py) calls
+            # translate() before checking its result, and only
+            # GoogleTranslator's own internal empty-string check
+            # (translate.py) stops it there with no network call; the
+            # Translator Protocol makes no such promise, and FakeTranslator
+            # (tests/conftest.py) returns a non-empty marker for "" - which
+            # would carry a sourceless Unit past _speak's
+            # `if not target_text.strip()` bail into a synthesized, recorded
+            # transcript row with nothing behind it. The invariant that
+            # rules this branch out lives in _cut, a different function from
+            # this one, so a change there could quietly make it reachable.
             return []
 
         # t_end is the OLDER hypothesis's audio position, because that is the
