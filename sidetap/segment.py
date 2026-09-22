@@ -180,6 +180,31 @@ class LocalAgreementSegmenter:
         current = _tokens(result.text)
         self._previous, self._previous_t_end = current, result.t_end
 
+        if _agreed(current, self._committed) < len(self._committed):
+            # This hypothesis no longer begins with the text already spoken -
+            # a word was inserted inside the committed prefix, or dropped from
+            # it. `growth` below slices by POSITION, so every later word has
+            # shifted and the slice re-emits something the listener already
+            # heard: after committing "a b c d,", the pair "a b X c d, e f" /
+            # "a b X c d, e f g." grows into "d, e f" and speaks "d," twice.
+            #
+            # Logged, not corrected. Experiment 6 measured interims as purely
+            # additive, so on a real capture this does not fire at all;
+            # correcting it would mean re-matching by content, which trades a
+            # shift nobody has observed for a repeat, and a synthesised voice
+            # cannot take a word back. The mirror of _finalise's revision log
+            # below - without it, manual-smoke.md's "no word repeated" check
+            # has a symptom and no evidence, and the only record of the cause
+            # is audio nobody kept.
+            #
+            # It also fires on a stale commit that survived a stream restart
+            # (see _finalise), where the interim slice is wrong for a
+            # different reason. That case is only detected at the final today.
+            log.debug(
+                "%s: interim revised committed text; the next commit may repeat a word",
+                result.direction.value,
+            )
+
         agreed = _agreed(previous, current)
         if agreed <= len(self._committed):
             return []
@@ -207,7 +232,13 @@ class LocalAgreementSegmenter:
         # has since got to. The transcript's latency column is the spec's
         # stated evidence for this whole change, so overstating freshness here
         # would corrupt the one number it is judged by.
-        unit = self._emit(result.direction, growth, previous_t_end, continues=True)
+        unit = self._emit(
+            result.direction,
+            growth,
+            self._span_start,
+            previous_t_end,
+            continues=True,
+        )
         self._committed = self._committed + growth
         return [unit]
 
@@ -215,11 +246,21 @@ class LocalAgreementSegmenter:
         self,
         direction: Direction,
         tokens: list[tuple[str, str]],
+        t_start: float,
         t_end: float,
         *,
         continues: bool,
     ) -> Unit:
         """Build the Unit and advance the span watermark past it.
+
+        `t_start` is the caller's to choose, and the choice is not cosmetic.
+        A clause committed part-way through an utterance chains from the
+        previous clause's t_end, so the pieces read as a sequence. An
+        utterance that committed nothing early must instead carry
+        `result.t_start`, which asr.py makes equal to t_end - anything else
+        makes the default segmenter disagree with FinalsOnlySegmenter on every
+        row of an ordinary call, and render_markdown sorts on t_start, so the
+        bilingual transcript comes out in the wrong order.
 
         Not a pure constructor: the caller must not call this speculatively or
         discard the result, or the next unit will claim to start where this one
@@ -228,7 +269,7 @@ class LocalAgreementSegmenter:
         unit = Unit(
             direction=direction,
             text=" ".join(surface for surface, _ in tokens),
-            t_start=self._span_start,
+            t_start=t_start,
             t_end=t_end,
             continues=continues,
         )
@@ -242,6 +283,38 @@ class LocalAgreementSegmenter:
         self._previous = []
         self._previous_t_end = 0.0
         self._committed = []
+
+        if committed and _agreed(tokens, committed) == 0:
+            # Not one word in common with what we already spoke. The committed
+            # state does not describe this utterance at all, so slicing by its
+            # length would cut that many words off the front of a sentence
+            # nobody has heard - silent loss of speech.
+            #
+            # The case this exists for is a stream restart. RecognitionWorker
+            # (asr.py) rebuilds its stream every MAX_STREAM_SECONDS and after
+            # any non-fatal error, and NEITHER path guarantees a final, so the
+            # commit state of the interrupted utterance survives into the next
+            # one with nothing to clear it. A restart is not observable from
+            # the AsrResult values - timestamps stay monotonic across a
+            # rotation by construction (StreamClock.rotated) - so the content
+            # is the only evidence available here.
+            #
+            # Residual, stated rather than hidden: a restarted stream whose
+            # first final happens to share its LEADING word with the stale
+            # commit still gets mis-sliced, by at most the non-matching
+            # remainder of that commit. The debug log below is what reports
+            # it. Widening this to "discard on any disagreement" would fix
+            # that at the cost of repeating a clause the listener already
+            # heard on every ordinary tail revision, which is the trade
+            # _finalise has always refused.
+            log.warning(
+                "%s: final shares nothing with the committed prefix (stream "
+                "restart?); discarding %d committed word(s) and emitting the "
+                "whole final",
+                result.direction.value,
+                len(committed),
+            )
+            committed = []
 
         remainder = tokens[len(committed) :]
 
@@ -271,4 +344,14 @@ class LocalAgreementSegmenter:
             self._span_start = result.t_end
             return []
 
-        return [self._emit(result.direction, remainder, result.t_end, continues=False)]
+        # An utterance that committed nothing early is one whole utterance,
+        # and must be indistinguishable from what FinalsOnlySegmenter would
+        # have produced - span included, since that is what the transcript is
+        # sorted and timed by. Only an utterance actually spoken in pieces
+        # chains its span from the previous piece.
+        t_start = self._span_start if committed else result.t_start
+        return [
+            self._emit(
+                result.direction, remainder, t_start, result.t_end, continues=False
+            )
+        ]

@@ -103,6 +103,15 @@ position through which the text is confirmed — and its `t_start` is the
 previous commit's end. Chirp rejects `enable_word_time_offsets` in streaming
 mode, so nothing finer is available.
 
+Chaining applies **only within an utterance that was actually committed in
+pieces.** A final whose utterance committed nothing early — every turn of
+ordinary conversation, since Chirp emits no interims for short utterances —
+must carry exactly the span `FinalsOnlySegmenter` would have given it,
+`t_start == t_end == result.t_end`. Chaining unconditionally moves every
+row's start back by one utterance, and `transcript.render_markdown` sorts on
+`t_start`, so an interleaved two-way transcript comes out reordered — on the
+default path, for every call.
+
 That forces one change in `pipeline.py`. `asr_ms` is computed once from
 `result.t_end` before the unit loop. For a committed prefix that reports the
 current interim's arrival lag (~1.0 s) when the content is really ~6 s old,

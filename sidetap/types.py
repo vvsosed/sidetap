@@ -87,9 +87,10 @@ class AsrResult:
 class Unit:
     """A translatable unit emitted by the segmenter.
 
-    With FinalsOnlySegmenter this is one per final AsrResult. With a future
-    LocalAgreementSegmenter it would be one per committed clause, which is the
-    entire reason this type is distinct from AsrResult.
+    With LocalAgreementSegmenter, the default, this is one per committed
+    clause: a long utterance becomes several, which is the entire reason this
+    type is distinct from AsrResult. With FinalsOnlySegmenter (--no-early-commit)
+    it is one per final AsrResult.
     """
 
     direction: Direction

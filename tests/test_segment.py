@@ -3,6 +3,8 @@ import logging
 import re
 from pathlib import Path
 
+import pytest
+
 from sidetap.segment import FinalsOnlySegmenter, LocalAgreementSegmenter, _agreed, _tokens
 from sidetap.types import AsrResult, Direction
 
@@ -364,14 +366,112 @@ def test_a_final_that_drops_committed_text_still_says_so(caplog):
     the emit path never runs. Checking the revision first is what stops that
     case - the loudest available sign that committing early went wrong - from
     passing in complete silence.
+
+    The final here still SHARES its opening words with the commit, which is
+    what keeps it on this path: a final sharing nothing at all is the stale
+    -state case below, which discards the commit instead of slicing by it.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
     segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
     with caplog.at_level(logging.DEBUG):
-        units = segmenter.feed(_final_result("нет ничего", 15.0))
+        units = segmenter.feed(_final_result("что у нас.", 15.0))
     assert units == []
     assert "revised" in caplog.text
+
+
+def test_a_final_sharing_nothing_with_the_commit_is_emitted_whole(caplog):
+    """The stream restarted mid-utterance, and nothing told the segmenter.
+
+    RecognitionWorker rebuilds its stream every MAX_STREAM_SECONDS and after
+    any non-fatal error, and neither path guarantees a final - so a commit
+    made before the break is still sitting there when the first final of the
+    NEXT utterance arrives. Slicing that final by the stale commit's length
+    cuts words off the front of a sentence nobody has heard: six committed
+    words turned "completely new sentence here." into nothing at all.
+
+    Warning, not debug: this is speech being lost, not a tail being revised.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("one two three four five six,", 5.0))
+    segmenter.feed(_interim("one two three four five six, seven eight", 10.0))
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_final_result("completely new sentence here.", 240.0))
+    assert [u.text for u in units] == ["completely new sentence here."]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_a_stale_commit_does_not_shorten_the_final_it_shares_nothing_with():
+    """The same break, with a final long enough that slicing would not be
+    visible as a total loss - it would just quietly eat the first six words.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("one two three four five six,", 5.0))
+    segmenter.feed(_interim("one two three four five six, seven eight", 10.0))
+    units = segmenter.feed(
+        _final_result("alpha beta gamma delta epsilon zeta eta theta iota.", 240.0)
+    )
+    assert [u.text for u in units] == [
+        "alpha beta gamma delta epsilon zeta eta theta iota."
+    ]
+
+
+def test_a_discarded_commit_leaves_the_final_carrying_a_whole_utterances_span():
+    """Nothing of the stale commit describes this utterance, its span least
+    of all - chaining from it would date the sentence to before the break.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("one two three four five six,", 5.0))
+    segmenter.feed(_interim("one two three four five six, seven eight", 10.0))
+    unit = segmenter.feed(_final_result("completely new sentence here.", 240.0))[0]
+    assert (unit.t_start, unit.t_end) == (240.0, 240.0)
+
+
+def test_an_ordinary_tail_revision_still_slices_by_the_commit(caplog):
+    """The discard rule must not swallow the case Experiment 6 measured.
+
+    There the final's first 51 words matched the commit exactly and the
+    insertion was past the commit point. A final that agrees on SOME leading
+    words is an ordinary revision: it keeps the count slice and the debug
+    log, because emitting it whole would repeat a clause already spoken.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_final_result("что у нас было несколько задач.", 15.0))
+    assert [u.text for u in units] == ["несколько задач."]
+    assert [r.levelno for r in caplog.records] == [logging.DEBUG]
+
+
+def test_an_interim_that_revises_committed_text_says_so(caplog):
+    """_finalise has had this log since the start; _interim had nothing.
+
+    `growth` slices by POSITION, so a word inserted inside the committed
+    prefix shifts every later one and the next commit re-speaks a clause the
+    listener already heard - "d," twice below. Not corrected here (Experiment
+    6 measured interims as purely additive, so correcting would trade a
+    should-never-happen shift for a real risk of repetition), but logged, so
+    manual-smoke.md's "no word repeated" check has evidence instead of a
+    mystery.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("a b c d,", 5.0))
+    segmenter.feed(_interim("a b c d, e", 10.0))
+    with caplog.at_level(logging.DEBUG):
+        segmenter.feed(_interim("a b X c d, e f", 15.0))
+        segmenter.feed(_interim("a b X c d, e f g.", 20.0))
+    assert "interim revised committed text" in caplog.text
+
+
+def test_an_ordinary_interim_logs_no_revision(caplog):
+    """A signal that fires on every interim is not a signal."""
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    with caplog.at_level(logging.DEBUG):
+        segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+        segmenter.feed(_interim("что у нас есть, несколько задач, которые", 15.0))
+    assert "interim revised" not in caplog.text
 
 
 def test_an_ordinary_final_logs_no_revision(caplog):
@@ -399,8 +499,8 @@ def _capture(name):
     raise AssertionError(f"no {name!r} in the capture")
 
 
-def _replay(name):
-    segmenter = LocalAgreementSegmenter()
+def _replay(name, segmenter=None):
+    segmenter = segmenter if segmenter is not None else LocalAgreementSegmenter()
     units = []
     for row in _capture(name):
         result = AsrResult(
@@ -409,6 +509,33 @@ def _replay(name):
         )
         units.extend(segmenter.feed(result))
     return units
+
+
+@pytest.mark.parametrize("capture", ["turns", "medium"])
+def test_a_capture_with_no_early_commits_is_identical_to_finals_only(capture):
+    """Text AND spans, not just text. This is the "changes nothing for
+    ordinary conversation" claim in --no-early-commit's help, README and the
+    spec, checked instead of asserted.
+
+    Spans are the half that broke: _emit used to take t_start from the running
+    span watermark unconditionally, so a final that committed nothing early
+    still chained from the PREVIOUS utterance's end. Every row's start time
+    moved back by one utterance, and render_markdown sorts on t_start - so in
+    an interleaved two-way call the bilingual transcript came out reordered,
+    on the default path, for every call.
+
+    Both captures qualify: `turns` produces no interims at all and `medium`
+    produces one, and a commit needs two that agree.
+    """
+    expected = [
+        (u.direction, u.text, u.t_start, u.t_end, u.continues)
+        for u in _replay(capture, FinalsOnlySegmenter())
+    ]
+    got = [
+        (u.direction, u.text, u.t_start, u.t_end, u.continues)
+        for u in _replay(capture, LocalAgreementSegmenter())
+    ]
+    assert got == expected
 
 
 def test_the_real_monologue_is_committed_in_pieces_instead_of_one_block():
@@ -494,10 +621,16 @@ def test_the_real_monologues_spans_match_the_measured_capture():
     Pinned to the six (t_start, t_end) pairs measured against this capture -
     each interim's end_offset once the two hypotheses feeding a commit have
     both arrived, and the closing final's end_offset for the last unit.
+
+    The FIRST pair is the odd one out and deliberately so: that unit is the
+    final of a short opening utterance that committed nothing early, so it
+    carries a whole utterance's span - t_start == t_end == its own end offset,
+    exactly what FinalsOnlySegmenter produces. Only the five that follow, cut
+    out of one long utterance, chain from the previous piece.
     """
     spans = [(u.t_start, u.t_end) for u in _replay("monologue")]
     assert spans == [
-        (0.0, 6.04),
+        (6.04, 6.04),
         (6.04, 11.12),
         (11.12, 16.12),
         (16.12, 21.12),
