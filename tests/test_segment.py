@@ -224,3 +224,16 @@ def test_growth_with_no_boundary_at_all_is_committed_whole():
     segmenter.feed(_interim("мы рискуем снова оказаться", 5.0))
     units = segmenter.feed(_interim("мы рискуем снова оказаться в ситуации", 10.0))
     assert [u.text for u in units] == ["мы рискуем снова оказаться"]
+
+
+def test_the_cut_takes_the_last_boundary_not_the_first():
+    """Scanning backwards is the whole point of the loop.
+
+    Stopping at the first boundary would hold back clauses that were already
+    agreed, one commit at a time - the stall this feature exists to remove,
+    reintroduced a comma at a time.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("да, конечно, мы", 5.0))
+    units = segmenter.feed(_interim("да, конечно, мы согласны", 10.0))
+    assert [u.text for u in units] == ["да, конечно,"]

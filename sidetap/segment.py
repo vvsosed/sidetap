@@ -69,8 +69,13 @@ def _tokens(text: str) -> list[tuple[str, str]]:
 # cutting there would hand the translator a subject with no predicate, which
 # is precisely the mid-clause fragment this function exists to prevent. Since
 # nothing distinguishes the two uses from the text alone, the safe reading is
-# to treat it as no boundary: a missed boundary only makes the next commit
-# longer, while a wrong one damages the translation.
+# to treat it as no boundary.
+#
+# Note what that does when the dash is the only candidate in the growth: the
+# fallback below commits the whole growth UNCUT this round. Not later, not
+# held back - the opposite. That is still the outcome to want, because an
+# uncut span is a complete thought, where a cut at a copula would hand the
+# translator a subject with no predicate.
 #
 # Only the token's LAST character is tested, so "..." needs no entry of its
 # own - it ends in "." already. A closing quote or bracket with no punctuation
