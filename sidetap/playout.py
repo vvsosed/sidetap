@@ -406,26 +406,38 @@ class Playout:
         hears as one sentence, roughly every five seconds of a monologue
         (docs/experiments/06-interim-cadence.md).
 
-        Bounded by STARVE_LIMIT_TICKS on a counter of its own, reset on every
-        call so each newly committed clause re-arms with a full budget instead
-        of inheriting whatever the last gap spent. Sharing `_starved_ticks`
-        with the starvation arms instead let a hold spend the next clause's
-        start budget: a gap that had already run 90 ticks left a clause
-        arriving perfectly normally 10 ticks before it was force-closed as
-        truncated, losing the rest of it.
+        This call only arms the hold. It clears no counter, and that is the
+        whole of its safety: `_hold_ticks` counts every tick the duck is shut
+        while a hold is armed and no speech reaches the sink, and ONLY a
+        written chunk (or flush()) clears it. Clearing it here made the
+        deadline a lease - re-arming every 50 ticks with nothing ever queued
+        held the duck shut for 33 minutes, one log line, no warning.
 
-        The bound is per reason, not per call. A starving utterance abandoned
-        at its own deadline, followed by a hold running to its own, shuts the
-        duck for roughly two bounds with a single 20 ms opening between them.
-        What is guaranteed is that every arm fails open on its own deadline -
-        not that the duck cannot be shut for longer than one bound across two
-        consecutive failures. That guarantee is still the one that matters: a
-        duck stuck closed silences the person you are talking to, which this
-        module treats as worse than not working.
+        What that buys, stated narrowly enough to be checked against the code
+        rather than against intent: once armed, this hold cannot keep the duck
+        shut for STARVE_LIMIT_TICKS ticks without a chunk of translated speech
+        actually being written, no matter what the caller does afterwards -
+        measured at 99 ticks (1.98 s) worst case over 100 000 ticks of every
+        adversarial pattern tried, including re-arming on every single tick. A
+        queued clause does not count as speech - Task 8 calls begin() for a
+        clause before its audio exists, so an unstartable head is the ordinary
+        shape, and counting only the empty-queue case left one arm plus a
+        stalling head holding the duck shut for 600 s with nothing played.
+
+        While armed it is the tighter of the two deadlines in this module: it
+        charges every shut-and-silent tick, including the ones the other arms
+        are responsible for (a `_current` starving mid-sentence, a queued head
+        under the start threshold), and only a written chunk clears it, where
+        `_starved_ticks` is also cleared by an utterance retiring with nothing
+        played. So it fires first, or with them. Unarmed it does nothing at
+        all, and those arms keep their own `_starved_ticks` deadline exactly
+        as they had it.
+
+        Narrowness is the point. A duck stuck closed silences the person you
+        are talking to, which this module treats as worse than not working.
         """
         with self._lock:
             self._continuation = value
-            self._hold_ticks = 0
 
     def _startable_locked(self, item: Utterance) -> bool:
         """Hold a new utterance until it can absorb a stall.
@@ -447,13 +459,19 @@ class Playout:
     def _advance_locked(self) -> tuple[bytes | None, Translated | None, bool]:
         """Pull, read and retire under the lock.
 
-        Returns (chunk, finished, starved). `starved` means the listener is
-        mid-way through something and there is nothing to play - an utterance
-        already part-spoken, or the gap before a clause the producer has
-        announced via expect_continuation() - so the duck must stay closed
-        across that gap. Read as "nothing playable" instead, it would hold the
-        duck shut before the first word of a translation the listener has not
-        started hearing yet, which is the quiet the original belongs in.
+        Returns (chunk, finished, starved). `starved` means the duck must stay
+        closed although nothing is being played, on one of two grounds: an
+        utterance the listener is demonstrably part-way through (`_offset` has
+        moved), or a continuation the producer has ANNOUNCED via
+        expect_continuation(). The second is a claim, not an observation - it
+        can be armed on a completely idle playout that has never spoken a
+        word, and reading it as if it were the first is what made an unbounded
+        hold look impossible. It is bounded below the branch chain for that
+        reason, on ticks rather than on trust.
+
+        Read as "nothing playable" instead, `starved` would hold the duck shut
+        before the first word of a translation the listener has not started
+        hearing yet, which is the quiet the original belongs in.
         """
         if (
             self._current is None
@@ -548,11 +566,14 @@ class Playout:
             # not the stuck-closed failure - it is the whole direction going
             # quiet with nothing on screen explaining why.
             #
-            # A hold means the listener is mid-run and this is the gap before
-            # the next clause, not the quiet before the first one, so the duck
-            # stays shut across it. Only the duck: this head keeps its own
-            # full `_starved_ticks` budget, which is why the hold counts on
-            # `_hold_ticks` instead of adding to this one.
+            # A hold means the producer says the listener is mid-run and this
+            # is the gap before the next clause, not the quiet before the
+            # first one, so the duck stays shut across it. Only the duck:
+            # this head keeps its own full `_starved_ticks` budget. The hold's
+            # own deadline is charged for this tick too, below the chain - a
+            # queued head is not audio, and Task 8 queues one before its audio
+            # exists, so leaving these ticks uncounted is what let a recurring
+            # TTS stall silence the call for ten minutes.
             starved = self._continuation
             self._starved_ticks += 1
             if self._starved_ticks >= STARVE_LIMIT_TICKS:
@@ -579,24 +600,43 @@ class Playout:
             self._starved_ticks = 0
             if self._continuation:
                 # Nothing queued at all, but the producer says more of this
-                # run is coming. Hold the duck shut across the gap, on this
-                # arm's own copy of the bound so it always fails open.
+                # run is coming. Hold the duck shut across the gap; the
+                # deadline for it is charged below, with every other tick it
+                # holds the duck shut.
                 starved = True
-                self._hold_ticks += 1
-                if self._hold_ticks >= STARVE_LIMIT_TICKS:
-                    log.warning(
-                        "%s playout: expected continuation never arrived in "
-                        "%.1fs; reopening the duck",
-                        self.direction.value,
-                        STARVE_LIMIT_TICKS * CHUNK_MS / 1000,
-                    )
-                    # Disarm, do not merely pause: left set, the hold re-arms
-                    # on the next tick and the duck sawtooths - open for one
-                    # 20 ms tick, shut for two more seconds - for the rest of
-                    # the call.
-                    self._continuation = False
-                    self._hold_ticks = 0
-                    starved = False
+
+        # The hold's deadline, in ONE place because the hold reaches the duck
+        # from two branches above and a bound that only watches one of them is
+        # not a bound. Written as "ticks of duck-shut with no speech reaching
+        # the sink", which is the thing that has to be bounded - not ticks
+        # since the producer last spoke up, and not ticks with an empty queue.
+        #
+        # Only a chunk actually written clears it. Clearing it on re-arm makes
+        # the deadline a lease the caller renews forever: re-arming every 50
+        # ticks with nothing ever queued held the duck shut for 33 minutes
+        # with one log line. Counting only the empty-queue branch is worse -
+        # one arm plus a head that never reaches START_BUFFER_S held it shut
+        # for 600 s with no speech at all, which is this module's one
+        # unforgivable failure.
+        if chunk is not None:
+            self._hold_ticks = 0
+        elif starved and self._continuation:
+            self._hold_ticks += 1
+            if self._hold_ticks >= STARVE_LIMIT_TICKS:
+                log.warning(
+                    "%s playout: held the duck for %.1fs with no translated "
+                    "speech; reopening it and dropping the hold",
+                    self.direction.value,
+                    STARVE_LIMIT_TICKS * CHUNK_MS / 1000,
+                )
+                # Disarm, and do NOT zero the counter. Left armed, the hold
+                # re-arms itself next tick and the duck sawtooths for the rest
+                # of the call. Zeroed, a producer re-arming after each expiry
+                # buys another full bound every time - the lease again, just
+                # slower. Leaving it spent means a re-arm gets one tick and
+                # expires again until real audio resets it.
+                self._continuation = False
+                starved = False
         return chunk, finished, starved
 
     def tick(self) -> bool:
