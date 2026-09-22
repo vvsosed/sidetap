@@ -297,3 +297,50 @@ def test_spans_are_contiguous_and_end_where_the_text_was_confirmed():
     second = segmenter.feed(_final_result("что у нас есть, задач больше.", 15.0))[0]
     assert (first.t_start, first.t_end) == (0.0, 5.0)
     assert (second.t_start, second.t_end) == (5.0, 15.0)
+
+
+def test_a_final_that_revises_committed_text_emits_from_the_commit_point():
+    """Nothing can be un-spoken, so a revision cannot be honoured.
+
+    The listener already heard "есть". Emitting from where the final diverges
+    would repeat "было" over the top of it; emitting from the commit point
+    drops a word they will never know was missing. Experiment 6 caught a real
+    final doing this, which is why the segmenter logs it rather than trusting
+    that finals only ever extend.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    units = segmenter.feed(_final_result("что у нас было несколько задач.", 15.0))
+    assert [u.text for u in units] == ["несколько задач."]
+
+
+def test_a_new_utterance_is_not_offset_by_the_last_one():
+    """Two interims after the final, not one - one cannot see the leak.
+
+    Without the reset, the stale committed count offsets the new utterance's
+    growth slice and silently eats its opening words. One interim hides it,
+    because the first interim of any utterance commits nothing anyway.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    segmenter.feed(_final_result("что у нас есть, несколько задач.", 15.0))
+
+    segmenter.feed(_interim("совсем другое, но нужно", 20.0))
+    units = segmenter.feed(_interim("совсем другое, но нужно сказать", 25.0))
+    assert [u.text for u in units] == ["совсем другое,"]
+
+
+def test_a_final_that_emits_nothing_still_advances_the_span():
+    """Otherwise the next utterance claims to start before this final.
+
+    Spans are what the transcript's latency column is built from, and one that
+    reaches back across a finished utterance reads as a clause that took the
+    whole gap to arrive.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_final_result("   ", 5.0))
+    segmenter.feed(_interim("совсем другое,", 10.0))
+    unit = segmenter.feed(_interim("совсем другое, но нужно", 15.0))[0]
+    assert unit.t_start == 5.0
