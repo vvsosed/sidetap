@@ -234,7 +234,7 @@ class LocalAgreementSegmenter:
         committed = self._committed
 
         self._previous = []
-        self._previous_t_end = result.t_end
+        self._previous_t_end = 0.0
         self._committed = []
 
         remainder = tokens[len(committed) :]

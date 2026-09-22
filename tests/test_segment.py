@@ -273,7 +273,13 @@ def test_a_final_that_adds_nothing_emits_nothing():
     assert segmenter.feed(_final_result("что у нас есть, несколько задач,", 20.0)) == []
 
 
-def test_a_final_resets_the_state_for_the_next_utterance():
+def test_one_interim_after_a_final_commits_nothing():
+    """A new utterance starts from nothing agreed, like any other.
+
+    This does NOT prove the committed list was reset - one interim cannot,
+    because the previous-hypothesis reset alone forces the same answer. See
+    test_a_new_utterance_is_not_offset_by_the_last_one, which feeds two.
+    """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
     segmenter.feed(_interim("что у нас есть, задач", 10.0))
@@ -363,3 +369,18 @@ def test_a_final_that_drops_committed_text_still_says_so(caplog):
         units = segmenter.feed(_final_result("нет ничего", 15.0))
     assert units == []
     assert "revised" in caplog.text
+
+
+def test_an_ordinary_final_logs_no_revision(caplog):
+    """A signal that fires on every final is not a signal.
+
+    The revision log exists to be the loudest thing in this module when
+    committing early goes wrong. If it also fires when nothing went wrong,
+    nobody reading the log will look at it twice.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    with caplog.at_level(logging.DEBUG):
+        segmenter.feed(_final_result("что у нас есть, несколько задач.", 15.0))
+    assert "revised" not in caplog.text
