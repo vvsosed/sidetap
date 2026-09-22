@@ -123,6 +123,11 @@ class DirectionPipeline:
         # this seam exists, works by comparing consecutive INTERIM hypotheses.
         # Returning early on interims would make the seam decorative, because
         # no future segmenter could ever see the input its algorithm needs.
+        #
+        # One reading per result, shared by every unit it commits. Moving this
+        # inside the loop would fold _speak's own translate-and-synthesise time
+        # into the second and later units' asr_ms, which is not what that
+        # column measures.
         arrived = self._clock.monotonic() - self._session_t0
 
         for unit in self._segmenter.feed(result):
@@ -309,6 +314,12 @@ class DirectionPipeline:
             # audio. Arming it on a failure path would let a direction whose
             # translator is down re-arm every five seconds and hold the duck
             # shut for the whole call with silence behind it.
+            #
+            # This call only ever arms; clearing is handle()'s job alone, and
+            # it clears on result.is_final, not on unit.continues. A future
+            # segmenter that emitted a non-continuing unit from an INTERIM,
+            # not only from a final, would leave an already-armed hold
+            # standing, because handle()'s clear never runs on an interim.
             self._playout.expect_continuation(True)
 
         tts_total_ms = round((self._clock.monotonic() - started) * 1000, 1)
