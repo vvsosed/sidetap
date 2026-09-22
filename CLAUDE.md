@@ -24,7 +24,7 @@ imported. The two repositories share no runtime dependency.
 `sidetap/` is the application; see **Architecture** below for the module
 table.
 
-`tests/` holds 531 tests that run with no audio hardware, no network and no
+`tests/` holds 555 tests that run with no audio hardware, no network and no
 credentials — every subprocess, socket and clock the package touches sits
 behind a `Protocol` in `ports.py`, with a real implementation in
 `adapters.py` and a fake in `tests/conftest.py`.
@@ -63,7 +63,7 @@ pw-cli --version                   # needs >= 0.3.60
 pw-dump | head                     # graph as JSON
 wpctl status                       # sinks/sources, incl. sidetap's own nodes
 
-uv run pytest -q                                   # 531 tests, no audio/network/creds needed
+uv run pytest -q                                   # 555 tests, no audio/network/creds needed
 uv run sidetap devices                              # run this MID-CALL, not before
 uv run sidetap doctor                               # environment checks
 uv run sidetap doctor --install                     # write the virtual-mic config (once)
@@ -195,7 +195,7 @@ as a style preference and this is not one.
   `google.cloud.translate` client — its `google.api_core.exceptions` import
   stays at module level, since it needs no network or credentials), not at
   module level. `webrtcvad` the same way (`vad.py:webrtc_detector`), with a
-  fallback to a no-op gate if it is missing. This is what lets 531 tests
+  fallback to a no-op gate if it is missing. This is what lets 555 tests
   import the package and run with no credentials configured at all — a
   top-level `from google.cloud import X` would make every test that merely
   imports the module require live credentials to collect.
