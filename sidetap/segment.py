@@ -61,6 +61,29 @@ def _tokens(text: str) -> list[tuple[str, str]]:
     ]
 
 
+# What ends a clause. Interims carry punctuation (Experiment 6 finding 7), so
+# a boundary is almost always available inside five seconds of speech.
+_BOUNDARY = ",.;:!?…"
+
+
+def _cut(tokens: list[tuple[str, str]]) -> int:
+    """How many of these tokens to commit now.
+
+    Everything up to and including the last clause boundary, so a fragment
+    does not reach the translator mid-clause - the word-order cost the v1 spec
+    named as LocalAgreement-2's main downside.
+
+    With no boundary anywhere, commit the lot. Holding it back would reproduce
+    the stall this exists to remove: five seconds of speech with no punctuation
+    is precisely where waiting hurts. One rule, no constant, and it fails
+    toward speaking.
+    """
+    for i in range(len(tokens) - 1, -1, -1):
+        if tokens[i][0][-1:] in _BOUNDARY:
+            return i + 1
+    return len(tokens)
+
+
 def _agreed(previous: list[tuple[str, str]], current: list[tuple[str, str]]) -> int:
     """How many leading words two hypotheses agree on, by key.
 
@@ -134,6 +157,9 @@ class LocalAgreementSegmenter:
         if agreed <= len(self._committed):
             return []
         growth = current[len(self._committed) : agreed]
+        growth = growth[: _cut(growth)]
+        if not growth:
+            return []
 
         # t_end is the OLDER hypothesis's audio position, because that is the
         # point through which this text is confirmed - not where the speaker

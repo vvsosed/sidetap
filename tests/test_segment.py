@@ -190,3 +190,37 @@ def test_the_two_directions_do_not_share_state():
     assert segmenter.feed(
         _interim("this is english,", 10.0, direction=Direction.OUT)
     ) == []
+
+
+def test_the_commit_is_cut_at_the_last_clause_boundary():
+    """A fragment reaching the translator mid-clause is the cost the v1 spec
+    named. Interims do carry punctuation, so there is usually a cut available.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("мы рискуем снова оказаться в ситуации, когда", 5.0))
+    units = segmenter.feed(
+        _interim("мы рискуем снова оказаться в ситуации, когда команда", 10.0)
+    )
+    assert [u.text for u in units] == ["мы рискуем снова оказаться в ситуации,"]
+
+
+def test_text_held_back_by_the_cut_is_committed_later():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("в ситуации, когда", 5.0))
+    segmenter.feed(_interim("в ситуации, когда команда работает", 10.0))
+    units = segmenter.feed(
+        _interim("в ситуации, когда команда работает сверхурочно, а", 15.0)
+    )
+    assert [u.text for u in units] == ["когда команда работает"]
+
+
+def test_growth_with_no_boundary_at_all_is_committed_whole():
+    """Holding it back would reproduce the stall this change exists to remove.
+
+    Five seconds of speech with no punctuation is exactly the case where
+    waiting hurts, so the rule fails toward speaking.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("мы рискуем снова оказаться", 5.0))
+    units = segmenter.feed(_interim("мы рискуем снова оказаться в ситуации", 10.0))
+    assert [u.text for u in units] == ["мы рискуем снова оказаться"]
