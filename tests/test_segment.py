@@ -142,6 +142,20 @@ def test_a_committed_prefix_says_more_is_coming():
     assert [u.continues for u in units] == [True]
 
 
+def test_a_committed_prefix_is_dated_by_the_older_hypothesis():
+    """Its content is confirmed only through the audio the OLDER one covered.
+
+    The newer hypothesis has heard more but agreed on less. Dating the unit by
+    the newer one would report a clause as fresh when it is already five
+    seconds old, in the transcript column that is the stated evidence for
+    whether committing early was worth doing at all.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    units = segmenter.feed(_interim("что у нас есть, несколько", 10.0))
+    assert (units[0].t_start, units[0].t_end) == (0.0, 5.0)
+
+
 def test_a_disagreement_commits_nothing():
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть", 5.0))
