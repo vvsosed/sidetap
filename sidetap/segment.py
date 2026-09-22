@@ -238,22 +238,31 @@ class LocalAgreementSegmenter:
         self._committed = []
 
         remainder = tokens[len(committed) :]
-        if not remainder:
-            # Everything this final carried had already been committed, or it
-            # carried nothing at all. The span still advances, so the next
-            # utterance's first commit does not claim to start back here.
-            self._span_start = result.t_end
-            return []
 
         if _agreed(tokens, committed) < len(committed):
             # A final may revise text already committed - Experiment 6 saw one
-            # insert a word thirteen from the end. Nothing can be un-spoken,
-            # so emit from where committing stopped rather than from where the
-            # revision starts: losing a word the listener will not hear beats
-            # repeating a clause they already heard.
+            # insert a word thirteen from the end. This is only ever logged,
+            # never corrected: emitting from where the revision starts would
+            # repeat a clause the listener already heard, where emitting from
+            # the commit point at worst drops a word they will never know was
+            # missing.
+            #
+            # Checked BEFORE the remainder, because the worst case has no
+            # remainder to emit: a final shorter than what was committed, or
+            # one that diverges outright, slices to nothing and returns below.
+            # Checking after would leave the loudest available signal that
+            # committing early went wrong completely unlogged.
             log.debug(
                 "%s: final revised committed text; emitting from the commit point",
                 result.direction.value,
             )
+
+        if not remainder:
+            # Nothing further to say - either the final only repeated what was
+            # already committed, or it carried less than that, which the check
+            # above has already logged. The span still advances, so the next
+            # utterance's first commit does not claim to start back here.
+            self._span_start = result.t_end
+            return []
 
         return [self._emit(result.direction, remainder, result.t_end, continues=False)]

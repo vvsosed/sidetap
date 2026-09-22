@@ -1,3 +1,5 @@
+import logging
+
 from sidetap.segment import FinalsOnlySegmenter, LocalAgreementSegmenter, _agreed, _tokens
 from sidetap.types import AsrResult, Direction
 
@@ -344,3 +346,20 @@ def test_a_final_that_emits_nothing_still_advances_the_span():
     segmenter.feed(_interim("совсем другое,", 10.0))
     unit = segmenter.feed(_interim("совсем другое, но нужно", 15.0))[0]
     assert unit.t_start == 5.0
+
+
+def test_a_final_that_drops_committed_text_still_says_so(caplog):
+    """The worst disagreement is the one with nothing left to emit.
+
+    A final shorter than what was committed slices to no remainder at all, so
+    the emit path never runs. Checking the revision first is what stops that
+    case - the loudest available sign that committing early went wrong - from
+    passing in complete silence.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_final_result("нет ничего", 15.0))
+    assert units == []
+    assert "revised" in caplog.text
