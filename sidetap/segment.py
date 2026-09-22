@@ -63,6 +63,19 @@ def _tokens(text: str) -> list[tuple[str, str]]:
 
 # What ends a clause. Interims carry punctuation (Experiment 6 finding 7), so
 # a boundary is almost always available inside five seconds of speech.
+#
+# The em dash is deliberately NOT here, though Russian uses it to separate
+# clauses. It also stands in for the missing copula - "Москва - столица" - and
+# cutting there would hand the translator a subject with no predicate, which
+# is precisely the mid-clause fragment this function exists to prevent. Since
+# nothing distinguishes the two uses from the text alone, the safe reading is
+# to treat it as no boundary: a missed boundary only makes the next commit
+# longer, while a wrong one damages the translation.
+#
+# Only the token's LAST character is tested, so "..." needs no entry of its
+# own - it ends in "." already. A closing quote or bracket with no punctuation
+# after it ("(да)") is missed for the same reason, and costs a later commit
+# rather than a wrong one.
 _BOUNDARY = ",.;:!?…"
 
 
