@@ -930,3 +930,151 @@ def test_a_dropped_streamed_utterance_reports_exactly_the_pcm_that_had_arrived()
     assert [d.text for d in dropped] == ["victim"]
     assert dropped[0].pcm == chunk
     assert playout.backlog_s() == 1.0
+
+
+def test_the_duck_holds_across_a_gap_when_more_of_the_run_is_coming():
+    """The gap between two committed clauses is not the end of the sentence.
+
+    Opening here would let a burst of the untranslated original through the
+    middle of what the listener hears as one sentence.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))  # 2 chunks
+    playout.expect_continuation(True)
+    assert playout.tick() is True
+    assert playout.tick() is True
+    assert duck.is_open is False
+
+    for _ in range(10):  # 200 ms of gap before the next clause
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+
+def test_the_duck_holds_while_the_next_clause_is_still_buffering():
+    """The gap is not always an empty queue.
+
+    The next clause is usually queued already and sitting under
+    START_BUFFER_S, which reaches a different branch of _advance_locked.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+
+    nxt = playout.begin(_unit(), "next")
+    playout.append(nxt, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))  # 100 ms
+    for _ in range(5):
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+
+def test_the_duck_opens_when_the_run_ends():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    assert duck.is_open is False
+
+    playout.expect_continuation(False)
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_a_continuation_that_never_arrives_still_opens_the_duck():
+    """The same bound as every other reason the duck stays shut.
+
+    A duck stuck closed silences the person you are on a call with and leaves
+    them talking to nobody, which CLAUDE.md names as worse than sidetap not
+    working at all. Exactly STARVE_LIMIT_TICKS, because an off-by-one either
+    way is a real bug here.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    assert duck.is_open is False
+
+    for _ in range(STARVE_LIMIT_TICKS):
+        playout.tick()
+    assert duck.is_open is True
+
+
+def test_flushing_clears_the_continuation_hold():
+    """Bypass engaging and the drop-backlog hotkey both funnel through flush.
+
+    Neither should leave the duck shut waiting for audio that was just thrown
+    away.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    assert duck.is_open is False
+
+    playout.flush()
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_leaving_suppression_does_not_resume_a_stale_hold():
+    """set_suppressed flushes on both edges, so the hold goes with the queue.
+
+    The run it belonged to is minutes old by the time bypass is released.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+
+    playout.set_suppressed(True)
+    playout.set_suppressed(False)
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_an_expired_hold_does_not_re_arm_itself():
+    """The bound has to disarm the hold, not merely pause it.
+
+    Leaving _continuation set where the bound fires re-arms the hold on the
+    very next tick: the duck opens for one 20 ms tick, shuts for another two
+    seconds, and repeats for the rest of the call. That is the stuck-closed
+    failure with a sawtooth on it, and the exactly-at-the-bound test above
+    passes straight through it - it only looks at the one tick where the duck
+    does open.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    for _ in range(STARVE_LIMIT_TICKS):
+        playout.tick()
+    assert duck.is_open is True
+
+    for _ in range(STARVE_LIMIT_TICKS * 2):
+        playout.tick()
+        assert duck.is_open is True
