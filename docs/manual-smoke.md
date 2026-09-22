@@ -164,6 +164,16 @@ pausing. Nothing in the test suite can reach any of it.
       with no word repeated and none missing. Word order across a clause
       boundary is the quality cost the design named, and this is the only
       place it can be judged.
+- [ ] **Nothing is spoken twice, and the log says why if it is.** This is the
+      check that found the worst regression this feature has had: Chirp
+      re-windows a long hypothesis mid-utterance, and the first version read
+      that as a dead stream and re-spoke whole clauses - roughly 15% of a
+      five-minute call. `segment.py` now aligns every candidate against what
+      it has actually spoken, and logs at **warning** ("shares no words with
+      the N already spoken") the one case where a repeat can still reach the
+      ear. Grep the session log for that line after any long monologue: with
+      no warnings and a repeat audible, the alignment is wrong; with warnings
+      and no repeat, a stream restarted, which is benign.
 - [ ] **The end of a monologue releases the duck promptly.** When the speaker
       stops, the original should become audible again within a second or so -
       not after the 2 s bound, which would mean the final never cleared the

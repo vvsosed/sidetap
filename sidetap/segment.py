@@ -129,14 +129,68 @@ def _agreed(previous: list[tuple[str, str]], current: list[tuple[str, str]]) -> 
     return n
 
 
+# How many spoken tokens one utterance keeps for the alignment below. The
+# search is quadratic in this number, so it cannot be unbounded on a stream
+# that never finalises - but it must stay comfortably above any overlap that
+# can really occur, because a token trimmed out of the window can no longer be
+# recognised as already spoken, and the next hypothesis that re-covers it gets
+# it spoken a second time. That is the regression this whole rule exists to
+# stop. The largest overlap ever measured on a real call was 69 words; 400 is
+# nearly six times that and more words than any single Chirp utterance
+# observed (the 34.8 s monologue of Experiment 6 ran to about 100), so the
+# window can only bite on a stream that has gone minutes without a final.
+_SPOKEN_LIMIT = 400
+
+
+def _overlap(spoken: list[tuple[str, str]], candidate: list[tuple[str, str]]) -> int:
+    """How many of the candidate's leading tokens the listener already heard.
+
+    The largest k for which the LAST k keys of `spoken` equal the FIRST k keys
+    of `candidate` - the candidate picking up where speech stopped. Content,
+    not position: Chirp re-windows its hypothesis mid-utterance, dropping
+    words off the front of what it reports, and any rule that slices by a
+    count re-emits whatever that shift exposes. On the first real call that
+    cost roughly 15% of everything the listener heard, in bursts of 50 to 110
+    words each.
+
+    Maximal, so of several possible anchors the LAST one wins. That is the
+    direction to fail in: too large a k drops words that were new, too small a
+    one speaks words already spoken, and a synthesised voice cannot take a
+    word back. "and then, and then" anchors on the second "and then" and loses
+    nothing, because the first is inside the overlap either way.
+
+    The trailing containment check covers the other shape the real call
+    produced: a hypothesis that SHRANK, so the candidate is a run from the
+    middle of what was already spoken rather than a continuation of its end.
+    Nothing in it is new, so nothing may be emitted - without this the
+    agreement between two early-diverging interims is spoken again in full,
+    which is the same 50-word repeat by a different door. Its one cost is a
+    speaker who repeats a whole phrase verbatim and has it interpreted once;
+    that is cheap next to what it prevents, and it can only ever suppress
+    words the listener has already heard in that same order.
+    """
+    spoken_keys = [key for _, key in spoken]
+    candidate_keys = [key for _, key in candidate]
+    for k in range(min(len(spoken_keys), len(candidate_keys)), 0, -1):
+        if spoken_keys[len(spoken_keys) - k :] == candidate_keys[:k]:
+            return k
+    width = len(candidate_keys)
+    if width and any(
+        spoken_keys[i : i + width] == candidate_keys
+        for i in range(len(spoken_keys) - width + 1)
+    ):
+        return width
+    return 0
+
+
 class FinalsOnlySegmenter:
     """One Unit per final result. Interims are discarded.
 
     **One instance per direction, never shared.** This implementation is
     stateless, so sharing would work today - but LocalAgreement-2 holds the
-    previous hypothesis and the committed prefix as instance state, and one
-    instance fed by both directions would interleave two conversations and
-    emit nonsense. DirectionPipeline constructs one per direction; do not
+    previous hypothesis and the words it has already spoken as instance state,
+    and one instance fed by both directions would interleave two conversations
+    and emit nonsense. DirectionPipeline constructs one per direction; do not
     "hoist the constant out of the loop".
     """
 
@@ -160,14 +214,24 @@ class LocalAgreementSegmenter:
     from the end of text that had already appeared in one interim. Two
     agreements leave that tail uncommitted; one would have spoken text the
     final then contradicted, and a synthesised voice cannot take a word back.
+
+    What keeps a clause from being spoken twice is `_spoken` and nothing else.
+    Every candidate - an interim's growth or a final's text - is aligned by
+    CONTENT against the words this utterance has already put through the
+    translator, and only the part past that alignment is emitted. There is no
+    second notion of "how far we got" to fall out of step with it: the first
+    real call ran a count-based prefix instead, and Chirp re-windowing its
+    hypothesis mid-utterance turned that into roughly 15% of the call being
+    verbatim repeats of speech from up to a minute earlier.
     """
 
     def __init__(self):
         self._previous: list[tuple[str, str]] = []
         self._previous_t_end = 0.0
-        # The tokens already emitted for the utterance in progress. Kept as
-        # tokens rather than a count so a final can be checked against them.
-        self._committed: list[tuple[str, str]] = []
+        # Everything this utterance has actually emitted, in order. Tokens
+        # rather than a count, because a count can only be spent positionally
+        # and a re-windowed hypothesis moves every position.
+        self._spoken: list[tuple[str, str]] = []
         self._span_start = 0.0
 
     def feed(self, result: AsrResult) -> list[Unit]:
@@ -175,96 +239,111 @@ class LocalAgreementSegmenter:
             return self._finalise(result)
         return self._interim(result)
 
+    def _align(
+        self, candidate: list[tuple[str, str]], direction: Direction, stage: str
+    ) -> int:
+        """`_overlap` against what was spoken, plus the one report of it.
+
+        Logged here rather than at the call sites so both paths report the
+        same event in the same words - the previous version logged a revision
+        on the final path only for its first three weeks, and the interim half
+        of the same defect went unnoticed for exactly that long.
+        """
+        spoken = self._spoken
+        k = _overlap(spoken, candidate)
+        if not spoken or not candidate:
+            # Nothing spoken yet is the ordinary start of an utterance, and an
+            # empty candidate is an empty final. Neither is a revision, and a
+            # signal that fires when nothing went wrong is not a signal.
+            return k
+        if k == 0:
+            # Warning: this is the one outcome that can still put a repeat in
+            # the listener's ear. A stream restart lands here and is harmless
+            # (nothing of the old utterance is in this text), but so does a
+            # wholesale revision, and then everything emitted below re-covers
+            # ground already spoken. Nothing in the AsrResult tells the two
+            # apart - timestamps stay monotonic across a rotation by
+            # construction - so the log is the only evidence the ear-witness
+            # in manual-smoke.md will ever have.
+            log.warning(
+                "%s: %s shares no words with the %d already spoken (stream "
+                "restart, or a re-windowed hypothesis); emitting it whole",
+                direction.value,
+                stage,
+                len(spoken),
+            )
+        elif k < len(spoken):
+            # Debug: the alignment found the seam and trimmed to it, so
+            # nothing is repeated and nothing is lost. It still means Chirp
+            # revised or re-windowed, which the offline experiment never saw,
+            # so it is worth a line - just not one that competes with the
+            # case above.
+            log.debug(
+                "%s: %s revised text already spoken; %d of %d spoken word(s) "
+                "still align, emitting only what is past them",
+                direction.value,
+                stage,
+                k,
+                len(spoken),
+            )
+        return k
+
+    def _remember(self, tokens: list[tuple[str, str]]) -> None:
+        # Trim from the FRONT. The alignment anchors on the END of what was
+        # spoken, so the oldest tokens are the only ones it can afford to
+        # lose; trimming the other end would discard exactly what the next
+        # hypothesis is about to be matched against.
+        self._spoken = (self._spoken + tokens)[-_SPOKEN_LIMIT:]
+
     def _interim(self, result: AsrResult) -> list[Unit]:
         previous, previous_t_end = self._previous, self._previous_t_end
         current = _tokens(result.text)
         self._previous, self._previous_t_end = current, result.t_end
 
-        if self._committed and _agreed(current, self._committed) == 0:
-            # Pairs with the identical check in _finalise, for the identical
-            # reason: RecognitionWorker (asr.py) rebuilds its stream every
-            # MAX_STREAM_SECONDS and after any non-fatal error, neither path
-            # guarantees a final, and nothing tells the segmenter - so a
-            # commit made before the break is still here when the NEXT
-            # utterance's hypotheses arrive. Fixing only the final half would
-            # be worse than fixing neither: the interim slice below would eat
-            # the opening words of the new utterance's early commits, and the
-            # final would then inherit a _committed that is stale AND wrongly
-            # sliced, so the two compound.
-            #
-            # Zero agreement is what makes discarding safe HERE specifically:
-            # not one of the words already translated and spoken appears in
-            # this hypothesis, so there is nothing the next commit could
-            # re-speak. That is the whole argument - a synthesised voice
-            # cannot take a word back, so any rule that discards on a PARTIAL
-            # disagreement would risk exactly that, which is why this is
-            # scoped to zero and the partial case below is only logged.
-            #
-            # Nothing is emitted on this round by construction: _committed is
-            # a prefix of _previous, so agreeing with it on no words means
-            # agreeing with _previous on no words, and the growth check below
-            # returns empty.
-            log.warning(
-                "%s: interim shares nothing with the committed prefix (stream "
-                "restart?); discarding %d committed word(s)",
-                result.direction.value,
-                len(self._committed),
-            )
-            self._committed = []
-            # The watermark describes audio from before the break, so a span
-            # chained off it would reach back across the gap - and
-            # render_markdown sorts on t_start. result.t_end is the earliest
-            # position this utterance is confirmed through, which gives the
-            # first commit after the discard a zero-width span, the same
-            # "one timestamp, no duration" shape _finalise's discard produces.
-            self._span_start = result.t_end
-        elif _agreed(current, self._committed) < len(self._committed):
-            # This hypothesis no longer begins with the text already spoken -
-            # a word was inserted inside the committed prefix, or dropped from
-            # it. `growth` below slices by POSITION, so every later word has
-            # shifted and the slice re-emits something the listener already
-            # heard: after committing "a b c d,", the pair "a b X c d, e f" /
-            # "a b X c d, e f g." grows into "d, e f" and speaks "d," twice.
-            #
-            # Logged, not corrected. Experiment 6 measured interims as purely
-            # additive, so on a real capture this does not fire at all;
-            # correcting it would mean re-matching by content, which trades a
-            # shift nobody has observed for a repeat, and a synthesised voice
-            # cannot take a word back. The mirror of _finalise's revision log
-            # below - without it, manual-smoke.md's "no word repeated" check
-            # has a symptom and no evidence, and the only record of the cause
-            # is audio nobody kept.
-            #
-            # An `elif`, so the stale-commit branch above owns the zero-
-            # agreement case and reports it at warning. Reaching here means
-            # SOME leading word still matches, which is a revision inside a
-            # live commit, not state left over from a dead stream.
-            log.debug(
-                "%s: interim revised committed text; the next commit may repeat a word",
-                result.direction.value,
-            )
-
         agreed = _agreed(previous, current)
-        if agreed <= len(self._committed):
+        if not agreed:
             return []
-        growth = current[len(self._committed) : agreed]
+
+        # The whole agreed prefix, not a slice of it. What has already been
+        # said is decided by content below, so there is nothing here for a
+        # position to be right or wrong about.
+        candidate = current[:agreed]
+        spoken_before = len(self._spoken)
+        aligned = self._align(candidate, result.direction, "interim")
+        growth = candidate[aligned:]
+        if not growth:
+            # Two hypotheses agreeing on nothing the listener has not already
+            # heard. Common while a re-windowed hypothesis catches back up,
+            # and the reason the count-based version spoke clauses twice.
+            return []
         growth = growth[: _cut(growth)]
         if not growth:
-            # Unreachable today: the agreement check above guarantees at
-            # least one token, and _cut never returns 0 for a non-empty
-            # list. Kept because nothing downstream can be counted on to
-            # catch an empty Unit instead. _speak (pipeline.py) calls
-            # translate() before checking its result, and only
-            # GoogleTranslator's own internal empty-string check
+            # Unreachable today: `growth` is non-empty here and _cut never
+            # returns 0 for a non-empty list. Kept because nothing downstream
+            # can be counted on to catch an empty Unit instead. _speak
+            # (pipeline.py) calls translate() before checking its result, and
+            # only GoogleTranslator's own internal empty-string check
             # (translate.py) stops it there with no network call; the
             # Translator Protocol makes no such promise, and FakeTranslator
             # (tests/conftest.py) returns a non-empty marker for "" - which
             # would carry a sourceless Unit past _speak's
             # `if not target_text.strip()` bail into a synthesized, recorded
-            # transcript row with nothing behind it. The invariant that
-            # rules this branch out lives in _cut, a different function from
-            # this one, so a change there could quietly make it reachable.
+            # transcript row with nothing behind it. The invariant that rules
+            # this branch out lives in _cut, a different function from this
+            # one, so a change there could quietly make it reachable.
             return []
+
+        if spoken_before and not aligned:
+            # Nothing of this candidate continues what was spoken (the
+            # alignment came back zero), so the span watermark - which
+            # describes the end of that spoken text - does not describe this
+            # either. A stream restart is the case that matters: chaining
+            # across it dates the new utterance's first clause to before the
+            # break, and render_markdown sorts on t_start, so the bilingual
+            # transcript interleaves it among rows from minutes earlier.
+            # Anchoring on this unit's own t_end gives it the "one timestamp,
+            # no duration" shape a whole-utterance final carries.
+            self._span_start = previous_t_end
 
         # t_end is the OLDER hypothesis's audio position, because that is the
         # point through which this text is confirmed - not where the speaker
@@ -278,7 +357,7 @@ class LocalAgreementSegmenter:
             previous_t_end,
             continues=True,
         )
-        self._committed = self._committed + growth
+        self._remember(growth)
         return [unit]
 
     def _emit(
@@ -317,88 +396,36 @@ class LocalAgreementSegmenter:
 
     def _finalise(self, result: AsrResult) -> list[Unit]:
         tokens = _tokens(result.text)
-        committed = self._committed
+        aligned = self._align(tokens, result.direction, "final")
 
         self._previous = []
         self._previous_t_end = 0.0
-        self._committed = []
+        # Per-utterance. Carrying it into the next utterance would let that
+        # one's opening word anchor on this one's last - "всё." closing one
+        # sentence and opening the next - and the alignment would then eat a
+        # word nobody has heard and chain a span across the gap between them.
+        self._spoken = []
 
-        if committed and _agreed(tokens, committed) == 0:
-            # Not one word in common with what we already spoke. The committed
-            # state does not describe this utterance at all, so slicing by its
-            # length would cut that many words off the front of a sentence
-            # nobody has heard - silent loss of speech.
-            #
-            # The case this exists for is a stream restart. RecognitionWorker
-            # (asr.py) rebuilds its stream every MAX_STREAM_SECONDS and after
-            # any non-fatal error, and NEITHER path guarantees a final, so the
-            # commit state of the interrupted utterance survives into the next
-            # one with nothing to clear it. A restart is not observable from
-            # the AsrResult values - timestamps stay monotonic across a
-            # rotation by construction (StreamClock.rotated) - so the content
-            # is the only evidence available here.
-            #
-            # The cost, accepted deliberately - do NOT "fix" it back. When
-            # this fires on a GENUINE same-utterance revision that diverges
-            # from the first word rather than on a stream restart, the
-            # listener hears the stale clause and then the whole final, so
-            # some words are spoken twice over. That is the trade: audible
-            # redundancy, logged at warning, instead of the silent loss of a
-            # whole sentence that slicing by the stale length produced.
-            # Nothing here can un-speak the earlier clause, so the only
-            # choice available is which of those two happens.
-            #
-            # Residual, stated rather than hidden: a restarted stream whose
-            # first final happens to share its LEADING word with the stale
-            # commit still gets mis-sliced, by at most the non-matching
-            # remainder of that commit. The debug log below is what reports
-            # it. Widening this to "discard on any disagreement" would fix
-            # that at the cost of repeating a clause the listener already
-            # heard on every ordinary tail revision, which is the trade
-            # _finalise has always refused.
-            log.warning(
-                "%s: final shares nothing with the committed prefix (stream "
-                "restart?); discarding %d committed word(s) and emitting the "
-                "whole final",
-                result.direction.value,
-                len(committed),
-            )
-            committed = []
-
-        remainder = tokens[len(committed) :]
-
-        if _agreed(tokens, committed) < len(committed):
-            # A final may revise text already committed - Experiment 6 saw one
-            # insert a word thirteen from the end. This is only ever logged,
-            # never corrected: emitting from where the revision starts would
-            # repeat a clause the listener already heard, where emitting from
-            # the commit point at worst drops a word they will never know was
-            # missing.
-            #
-            # Checked BEFORE the remainder, because the worst case has no
-            # remainder to emit: a final shorter than what was committed, or
-            # one that diverges outright, slices to nothing and returns below.
-            # Checking after would leave the loudest available signal that
-            # committing early went wrong completely unlogged.
-            log.debug(
-                "%s: final revised committed text; emitting from the commit point",
-                result.direction.value,
-            )
+        # A final is never cut: nothing is left to wait for, so nothing is
+        # held back.
+        remainder = tokens[aligned:]
 
         if not remainder:
-            # Nothing further to say - either the final only repeated what was
-            # already committed, or it carried less than that, which the check
-            # above has already logged. The span still advances, so the next
-            # utterance's first commit does not claim to start back here.
+            # Nothing further to say - the final only repeated what was
+            # already spoken, or carried less than it, which _align has
+            # already logged. The span still advances, so the next utterance's
+            # first commit does not claim to start back here.
             self._span_start = result.t_end
             return []
 
         # An utterance that committed nothing early is one whole utterance,
         # and must be indistinguishable from what FinalsOnlySegmenter would
         # have produced - span included, since that is what the transcript is
-        # sorted and timed by. Only an utterance actually spoken in pieces
-        # chains its span from the previous piece.
-        t_start = self._span_start if committed else result.t_start
+        # sorted and timed by. Only a final that actually continues text
+        # already spoken chains from it; a zero alignment means this text
+        # continues nothing, whether because the utterance is untouched or
+        # because the stream restarted under it.
+        t_start = self._span_start if aligned else result.t_start
         return [
             self._emit(
                 result.direction, remainder, t_start, result.t_end, continues=False

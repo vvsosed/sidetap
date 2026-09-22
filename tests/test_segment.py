@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from sidetap.segment import FinalsOnlySegmenter, LocalAgreementSegmenter, _agreed, _tokens
+from sidetap.segment import (
+    _SPOKEN_LIMIT,
+    FinalsOnlySegmenter,
+    LocalAgreementSegmenter,
+    _agreed,
+    _tokens,
+)
 from sidetap.types import AsrResult, Direction
 
 
@@ -279,14 +285,14 @@ def test_a_final_that_adds_nothing_emits_nothing():
 def test_one_interim_after_a_final_commits_nothing():
     """A new utterance starts from nothing agreed, like any other.
 
-    This does NOT prove the committed list was reset - one interim cannot,
+    This does NOT prove the spoken list was cleared - one interim cannot,
     because the previous-hypothesis reset alone forces the same answer. Nor
     does test_a_new_utterance_is_not_offset_by_the_last_one, despite feeding
-    two - its new utterance shares no vocabulary with the old commit, so
-    _interim's own stale-commit discard covers for a missing reset there too.
-    What actually pins the reset is
-    test_a_final_resets_the_committed_state_even_when_the_next_utterance_overlaps,
-    which defeats that discard on purpose.
+    two - its new utterance shares no words with the last one, so the
+    alignment comes back zero and emits the opening whole either way. What
+    actually pins the clear is
+    test_a_final_clears_the_spoken_text_even_when_the_next_utterance_opens_on_it,
+    where the two utterances meet on a shared word.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
@@ -315,37 +321,43 @@ def test_spans_are_contiguous_and_end_where_the_text_was_confirmed():
     assert (second.t_start, second.t_end) == (5.0, 15.0)
 
 
-def test_a_final_that_revises_committed_text_emits_from_the_commit_point():
-    """Nothing can be un-spoken, so a revision cannot be honoured.
+def test_a_final_that_revises_inside_the_spoken_text_is_emitted_whole(caplog):
+    """The price of aligning by content, pinned rather than preferred.
 
-    The listener already heard "есть". Emitting from where the final diverges
-    would repeat "было" over the top of it; emitting from the commit point
-    drops a word they will never know was missing. Experiment 6 caught a real
-    final doing this, which is why the segmenter logs it rather than trusting
-    that finals only ever extend.
+    "есть," was spoken and the final replaces it with "было", so no suffix of
+    what was spoken opens the final and no prefix of the final was spoken: the
+    alignment is zero and the whole final goes out, with "что у нас" heard a
+    second time. The count-based version emitted only "несколько задач." here,
+    silently dropping the revised word instead.
+
+    This is the one shape where the old rule did better, which is why the
+    alignment reports it at warning. It is the mirror of the shape that
+    actually happened on a real call - a hypothesis re-windowed onto a LATER
+    part of the same utterance - where the count-based rule repeated 50 to 110
+    words at a time and this one repeats nothing
+    (test_a_final_after_a_re_windowed_interim_emits_only_the_new_tail).
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
     segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
-    units = segmenter.feed(_final_result("что у нас было несколько задач.", 15.0))
-    assert [u.text for u in units] == ["несколько задач."]
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_final_result("что у нас было несколько задач.", 15.0))
+    assert [u.text for u in units] == ["что у нас было несколько задач."]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
 
 
 def test_a_new_utterance_is_not_offset_by_the_last_one():
     """Two interims after the final, not one - one interim proves nothing.
 
-    This is not the reset-in-_finalise regression test it looks like. The new
-    utterance ("совсем другое...") shares no leading word with the old commit
-    ("что у нас есть,..."), so _interim's own stale-commit discard (agreement
-    == 0 against self._committed, added in a later commit than this test)
-    would clean up a missing _finalise reset on its own - confirmed by
-    mutation-testing this test against that exact removal, which it does not
-    catch. What this test actually pins is narrower: that an unrelated new
-    utterance is not offset, one interim hides nothing because the first
-    interim of any utterance commits nothing anyway. See
-    test_a_final_resets_the_committed_state_even_when_the_next_utterance_overlaps
-    for the case _interim's discard cannot cover, where the reset is load-
-    bearing.
+    This is not the clear-in-_finalise regression test it looks like. The new
+    utterance ("совсем другое...") shares no word with the text already spoken
+    ("что у нас есть,..."), so the alignment comes back zero and emits the
+    opening whole whether or not _finalise cleared anything - confirmed by
+    mutation. What this test actually pins is narrower: that an unrelated new
+    utterance is not offset, and one interim would hide nothing because the
+    first interim of any utterance commits nothing anyway. See
+    test_a_final_clears_the_spoken_text_even_when_the_next_utterance_opens_on_it
+    for the case the alignment cannot cover, where the clear is load-bearing.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
@@ -357,32 +369,27 @@ def test_a_new_utterance_is_not_offset_by_the_last_one():
     assert [u.text for u in units] == ["совсем другое,"]
 
 
-def test_a_final_resets_the_committed_state_even_when_the_next_utterance_overlaps():
-    """The reset in _finalise, pinned where _interim cannot cover for it.
+def test_a_final_clears_the_spoken_text_even_when_the_next_utterance_opens_on_it():
+    """`self._spoken = []` in _finalise, pinned where nothing covers for it.
 
-    _interim's stale-commit discard only fires on ZERO agreement with the old
-    commit. A new utterance that happens to open with the same word as the
-    one just committed ("что", below) slips past that guard, so only
-    _finalise's own `self._committed = []` stands between this and a growth
-    slice offset by the stale commit's length.
+    _spoken is per-utterance, and the word that ends one utterance is a
+    perfectly ordinary word to open the next with - "всё" here. Carried over,
+    that one word aligns, so the next utterance's final emits "было готово
+    вчера." and the listener never hears its first word; worse, a non-zero
+    alignment chains the span, dating a sentence spoken at 20 s to 15 s, and
+    render_markdown sorts on t_start.
 
-    Without the reset: after committing 4 words ("что у нас есть,"), the new
-    utterance's two interims agree on 5 words - more than the stale count -
-    so `growth = current[len(self._committed):agreed]` slices from index 4,
-    keeping only the new utterance's 5th word and silently dropping its own
-    first four ("что случилось вчера вечером"). With the reset, the slice
-    starts from 0 and the new utterance commits its own opening whole.
+    Both halves are asserted for that reason. The text alone would also pass
+    with the reset moved into the alignment instead of the state.
     """
     segmenter = LocalAgreementSegmenter()
-    segmenter.feed(_interim("что у нас есть,", 5.0))
-    segmenter.feed(_interim("что у нас есть, ладно", 10.0))
-    segmenter.feed(_final_result("что у нас есть, всё.", 15.0))
+    segmenter.feed(_interim("у нас всё,", 5.0))
+    segmenter.feed(_interim("у нас всё, ладно", 10.0))
+    segmenter.feed(_final_result("у нас всё, ладно.", 15.0))
 
-    segmenter.feed(_interim("что случилось вчера вечером дома", 20.0))
-    units = segmenter.feed(
-        _interim("что случилось вчера вечером дома, кажется", 25.0)
-    )
-    assert [u.text for u in units] == ["что случилось вчера вечером дома,"]
+    units = segmenter.feed(_final_result("всё было готово вчера.", 20.0))
+    assert [u.text for u in units] == ["всё было готово вчера."]
+    assert (units[0].t_start, units[0].t_end) == (20.0, 20.0)
 
 
 def test_a_final_that_emits_nothing_still_advances_the_span():
@@ -399,17 +406,16 @@ def test_a_final_that_emits_nothing_still_advances_the_span():
     assert unit.t_start == 5.0
 
 
-def test_a_final_that_drops_committed_text_still_says_so(caplog):
+def test_a_final_that_drops_spoken_text_still_says_so(caplog):
     """The worst disagreement is the one with nothing left to emit.
 
-    A final shorter than what was committed slices to no remainder at all, so
-    the emit path never runs. Checking the revision first is what stops that
-    case - the loudest available sign that committing early went wrong - from
-    passing in complete silence.
+    A final carrying LESS than what was spoken aligns whole - every word of it
+    was already heard - so there is no remainder and the emit path never runs.
+    The log is what stops the loudest available sign that committing early
+    went wrong from passing in complete silence.
 
-    The final here still SHARES its opening words with the commit, which is
-    what keeps it on this path: a final sharing nothing at all is the stale
-    -state case below, which discards the commit instead of slicing by it.
+    Debug rather than warning, because nothing reaches the listener twice:
+    what this costs is the revision, which cannot be honoured anyway.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
@@ -420,17 +426,20 @@ def test_a_final_that_drops_committed_text_still_says_so(caplog):
     assert "revised" in caplog.text
 
 
-def test_a_final_sharing_nothing_with_the_commit_is_emitted_whole(caplog):
+def test_a_final_sharing_nothing_with_the_spoken_text_is_emitted_whole(caplog):
     """The stream restarted mid-utterance, and nothing told the segmenter.
 
     RecognitionWorker rebuilds its stream every MAX_STREAM_SECONDS and after
-    any non-fatal error, and neither path guarantees a final - so a commit
-    made before the break is still sitting there when the first final of the
-    NEXT utterance arrives. Slicing that final by the stale commit's length
-    cuts words off the front of a sentence nobody has heard: six committed
-    words turned "completely new sentence here." into nothing at all.
+    any non-fatal error, and neither path guarantees a final - so text spoken
+    before the break is still in _spoken when the first final of the NEXT
+    utterance arrives. Slicing that final by a count cuts words off the front
+    of a sentence nobody has heard: six spoken words turned "completely new
+    sentence here." into nothing at all. Zero alignment emits it whole, which
+    is why the two discard rules this replaced are gone rather than ported.
 
-    Warning, not debug: this is speech being lost, not a tail being revised.
+    Warning, not debug: a zero alignment is the one outcome that can still put
+    a repeat in the listener's ear, and nothing in an AsrResult distinguishes
+    a restart (harmless here) from a wholesale revision (not).
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("one two three four five six,", 5.0))
@@ -441,7 +450,7 @@ def test_a_final_sharing_nothing_with_the_commit_is_emitted_whole(caplog):
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
 
 
-def test_a_stale_commit_does_not_shorten_the_final_it_shares_nothing_with():
+def test_spoken_text_does_not_shorten_a_final_it_shares_nothing_with():
     """The same break, with a final long enough that slicing would not be
     visible as a total loss - it would just quietly eat the first six words.
     """
@@ -456,9 +465,14 @@ def test_a_stale_commit_does_not_shorten_the_final_it_shares_nothing_with():
     ]
 
 
-def test_a_discarded_commit_leaves_the_final_carrying_a_whole_utterances_span():
-    """Nothing of the stale commit describes this utterance, its span least
-    of all - chaining from it would date the sentence to before the break.
+def test_a_zero_alignment_leaves_the_final_carrying_a_whole_utterances_span():
+    """Nothing already spoken describes this utterance, its span least of all
+    - chaining from it would date the sentence to before the break.
+
+    This is the other half of requirement "chaining only within an utterance
+    actually committed in pieces": an alignment of zero means this final
+    continues nothing, so it carries result.t_start exactly as
+    FinalsOnlySegmenter would have given it.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("one two three four five six,", 5.0))
@@ -467,54 +481,61 @@ def test_a_discarded_commit_leaves_the_final_carrying_a_whole_utterances_span():
     assert (unit.t_start, unit.t_end) == (240.0, 240.0)
 
 
-def test_an_ordinary_tail_revision_still_slices_by_the_commit(caplog):
-    """The discard rule must not swallow the case Experiment 6 measured.
+def test_a_revision_past_the_spoken_text_emits_only_the_new_tail(caplog):
+    """The revision Experiment 6 actually measured, which must stay silent.
 
-    There the final's first 51 words matched the commit exactly and the
-    insertion was past the commit point. A final that agrees on SOME leading
-    words is an ordinary revision: it keeps the count slice and the debug
-    log, because emitting it whole would repeat a clause already spoken.
+    There the final's first 51 words matched what had been committed exactly
+    and the inserted word landed past the commit point - "а" here. Everything
+    spoken still aligns, so the final emits only its new tail and logs
+    nothing at all: a signal that fires when nothing went wrong is not a
+    signal, and this is the common case on a monologue.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
     segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
     with caplog.at_level(logging.DEBUG):
-        units = segmenter.feed(_final_result("что у нас было несколько задач.", 15.0))
-    assert [u.text for u in units] == ["несколько задач."]
-    assert [r.levelno for r in caplog.records] == [logging.DEBUG]
+        units = segmenter.feed(
+            _final_result("что у нас есть, несколько а задач.", 15.0)
+        )
+    assert [u.text for u in units] == ["несколько а задач."]
+    assert caplog.records == []
 
 
-def test_an_interim_that_revises_committed_text_says_so(caplog):
-    """_finalise has had this log since the start; _interim had nothing.
+def test_an_interim_agreeing_only_on_spoken_text_emits_nothing(caplog):
+    """A hypothesis that SHRANK, which the count rule got right by accident.
 
-    `growth` slices by POSITION, so a word inserted inside the committed
-    prefix shifts every later one and the next commit re-speaks a clause the
-    listener already heard - "d," twice below. Not corrected here (Experiment
-    6 measured interims as purely additive, so correcting would trade a
-    should-never-happen shift for a real risk of repetition), but logged, so
-    manual-smoke.md's "no word repeated" check has evidence instead of a
-    mystery.
+    A word inserted inside the spoken prefix drops the agreement between the
+    two live hypotheses back to "a b" - text the listener already heard in
+    full. By content that is nothing new, so nothing is emitted. The count
+    version guarded this with `agreed <= len(committed)`; without the
+    containment arm of `_overlap` the suffix search alone calls "a b"
+    genuinely new, because it is not a SUFFIX of what was spoken, and speaks
+    it a second time.
+
+    Logged at debug, not warning: the alignment found the seam, so nothing
+    reached the listener twice.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("a b c d,", 5.0))
     segmenter.feed(_interim("a b c d, e", 10.0))
     with caplog.at_level(logging.DEBUG):
-        segmenter.feed(_interim("a b X c d, e f", 15.0))
-        segmenter.feed(_interim("a b X c d, e f g.", 20.0))
-    assert "interim revised committed text" in caplog.text
+        assert segmenter.feed(_interim("a b X c d, e f", 15.0)) == []
+    assert [r.levelno for r in caplog.records] == [logging.DEBUG]
+    assert "revised" in caplog.text
 
 
-def test_a_stale_commit_does_not_eat_the_next_utterances_early_commits(caplog):
+def test_a_restart_does_not_eat_the_next_utterances_early_commits(caplog):
     """The interim half of the stream-restart defect.
 
     Same break as the final-side tests, but the new utterance is long enough
-    to commit early on its own. Slicing by the stale six-word commit turned
+    to commit early on its own. Slicing by the six words already spoken turned
     "alpha beta gamma, delta epsilon" into "eta, theta" - the opening words
     of a sentence nobody has heard, gone, on the default path.
 
-    Warning, not debug, and the mirror of the check in _finalise: fixing only
-    the final half would leave the final inheriting a _committed that is
-    stale AND wrongly sliced.
+    The log moved one round later than it used to sit. The first interim after
+    the break agrees with its predecessor on nothing, so there is no candidate
+    to align and nothing to report; the warning lands on the round that
+    actually emits, where it describes text the listener is about to hear.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("one two three four five six,", 5.0))
@@ -522,14 +543,16 @@ def test_a_stale_commit_does_not_eat_the_next_utterances_early_commits(caplog):
     with caplog.at_level(logging.DEBUG):
         # The stream restarted. A new utterance, sharing nothing.
         assert segmenter.feed(_interim("alpha beta gamma, delta", 240.0)) == []
+    assert caplog.records == []
+
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_interim("alpha beta gamma, delta epsilon zeta", 245.0))
+    assert [u.text for u in units] == ["alpha beta gamma,"]
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
 
-    units = segmenter.feed(_interim("alpha beta gamma, delta epsilon zeta", 245.0))
-    assert [u.text for u in units] == ["alpha beta gamma,"]
 
-
-def test_a_discarded_commit_does_not_chain_the_next_span_across_the_break():
-    """The watermark is as stale as the commit it belongs to.
+def test_a_zero_alignment_does_not_chain_the_next_span_across_the_break():
+    """The watermark is as stale as the text it belongs to.
 
     Left alone it dates the new utterance's first clause to before the
     restart, and render_markdown sorts on t_start - so the bilingual
@@ -544,13 +567,14 @@ def test_a_discarded_commit_does_not_chain_the_next_span_across_the_break():
     assert (unit.t_start, unit.t_end) == (240.0, 240.0)
 
 
-def test_the_final_after_a_discarded_interim_commit_is_not_sliced_twice():
+def test_the_final_after_a_restarted_interim_commit_is_not_sliced_twice():
     """The two halves must not compound.
 
-    Once the interim side has discarded and re-committed honestly, the final
-    is an ordinary tail: it agrees with the live commit, so it keeps the
-    count slice and emits only what is new. Nothing is lost and nothing is
-    repeated.
+    Once the interim side has committed the new utterance's opening, the final
+    aligns on THAT - "alpha beta gamma," sitting at the end of _spoken, three
+    words behind the stale six - and emits only what is new. Nothing is lost
+    and nothing is repeated, without either path needing to know a restart
+    happened.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("one two three four five six,", 5.0))
@@ -586,6 +610,131 @@ def test_an_ordinary_final_logs_no_revision(caplog):
     with caplog.at_level(logging.DEBUG):
         segmenter.feed(_final_result("что у нас есть, несколько задач.", 15.0))
     assert "revised" not in caplog.text
+
+
+# --- LocalAgreementSegmenter: aligning against what was actually spoken ------
+
+
+def test_a_final_after_a_re_windowed_interim_emits_only_the_new_tail():
+    """The shape of the regression the first real call produced.
+
+    Chirp re-windows its hypothesis mid-utterance: an interim arrives that
+    shares no LEADING word with the text already spoken, because it starts
+    part-way into the same sentence. The count-based version read that as a
+    dead stream, threw the commit away, and the final of that same utterance
+    then found nothing committed and re-spoke the lot. On a five-minute call
+    against real lecture audio that was roughly 15% of everything the listener
+    heard, in three bursts of 50 to 110 words, with the session log showing
+    "discarding 69 / 55 / 14 / 83 committed word(s)".
+
+    Aligning by content instead, the two largest events measured out of those
+    transcripts come to:
+
+        spoken 69 words, final 98 words -> overlap 69, emits 29 new
+        spoken 66 words, final 80 words -> overlap 55, emits 25 new
+
+    - the overlaps matching the discarded-word counts in the log exactly. The
+    wording below is this test's own; the transcripts are someone else's
+    content and are not in this repository.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("first clause here,", 5.0))
+    segmenter.feed(_interim("first clause here, second clause here,", 10.0))
+    segmenter.feed(_interim("first clause here, second clause here, third clause", 15.0))
+    # The re-window: same utterance, but reported from its second clause on.
+    assert segmenter.feed(_interim("second clause here, third clause follows", 20.0)) == []
+
+    units = segmenter.feed(
+        _final_result(
+            "first clause here, second clause here, third clause follows.", 25.0
+        )
+    )
+    assert [u.text for u in units] == ["third clause follows."]
+    assert (units[0].t_start, units[0].t_end) == (10.0, 25.0)
+
+
+def test_a_final_overlapping_only_the_tail_of_the_spoken_text_emits_the_rest():
+    """The windowed case: the candidate starts inside what was spoken.
+
+    Six words have been spoken, and the final opens on the LAST three of them
+    rather than the first - there is no common prefix at all, which is what a
+    leading-word comparison would have looked for. The overlap is a suffix of
+    one against a prefix of the other, so the seam is found three words in and
+    only what is past it is emitted.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("first clause here,", 5.0))
+    segmenter.feed(_interim("first clause here, second clause here,", 10.0))
+    segmenter.feed(_interim("first clause here, second clause here, third clause", 15.0))
+
+    units = segmenter.feed(
+        _final_result("second clause here, third clause follows.", 25.0)
+    )
+    assert [u.text for u in units] == ["third clause follows."]
+
+
+def test_a_zero_alignment_emits_a_new_utterances_agreed_prefix_whole(caplog):
+    """A genuinely new utterance, which is what the discards used to handle.
+
+    Nothing of "alpha beta gamma" survives into the new utterance, so the
+    alignment is zero and all six agreed words are emitted. A count-based
+    slice would keep only the last three and drop "one two three" - the
+    opening of a sentence nobody has heard - which is the silent loss the
+    discard rules existed to prevent. One rule now covers both that case and
+    the re-window above.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("alpha beta gamma", 5.0))
+    segmenter.feed(_interim("alpha beta gamma delta", 10.0))
+
+    segmenter.feed(_interim("one two three four five six", 240.0))
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_interim("one two three four five six seven", 245.0))
+    assert [u.text for u in units] == ["one two three four five six"]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_a_repeated_phrase_anchors_on_its_last_occurrence():
+    """"and then, and then" - the anchor ambiguity ordinary speech creates.
+
+    Two overlaps fit here: the whole spoken text against the final's first
+    four words, and its trailing "and then" against the final's first two.
+    Maximal takes the longer one and emits "he left."; the shorter anchor
+    emits "and then he left." and speaks the phrase a third time.
+
+    That is the direction to fail in. A wrong anchor that is too LONG drops
+    words the listener never knows were missing; one that is too short speaks
+    words they have already heard, and a synthesised voice cannot take a word
+    back. The whole regression this alignment replaced was of the second kind.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("and then and then", 5.0))
+    segmenter.feed(_interim("and then and then he", 10.0))
+
+    units = segmenter.feed(_final_result("and then and then he left.", 15.0))
+    assert [u.text for u in units] == ["he left."]
+
+
+def test_the_spoken_window_is_capped_and_keeps_the_newest_words():
+    """The cap bounds the quadratic search; the direction bounds the damage.
+
+    An utterance that never finalises - a stream restarting under a monologue
+    - would otherwise grow _spoken without limit, and the overlap search is
+    quadratic in its length. Trimming the FRONT is what makes the cap safe:
+    the alignment anchors on the END of what was spoken, so the oldest words
+    are the only ones it can afford to lose. Trim the other end and the very
+    words the next hypothesis is about to be matched against are the ones
+    thrown away.
+    """
+    segmenter = LocalAgreementSegmenter()
+    words = " ".join(f"w{i}" for i in range(1000))
+    segmenter.feed(_interim(words, 5.0))
+    units = segmenter.feed(_interim(words + " tail", 10.0))
+
+    assert len(units[0].text.split()) == 1000
+    assert len(segmenter._spoken) == _SPOKEN_LIMIT
+    assert [key for _, key in segmenter._spoken[:1]] == ["w600"]
+    assert [key for _, key in segmenter._spoken[-1:]] == ["w999"]
 
 
 # --- replayed against the real Chirp capture (chirp_interims.json) -----------
@@ -686,14 +835,15 @@ def test_the_real_capture_survives_the_case_change():
 
 
 def test_the_real_capture_loses_no_words():
-    """Nothing is dropped or duplicated when no final revises a commit.
+    """Nothing is dropped or duplicated when no final revises what was spoken.
 
-    Not the general invariant it looks like: _finalise deliberately drops
-    words when a final revises text already committed, and this capture never
-    triggers that - the inserted "а" lands in the uncommitted remainder, not
-    inside the committed prefix. The intentional-drop path is covered by
-    test_a_final_that_revises_committed_text_emits_from_the_commit_point and
-    its neighbours.
+    Not the general invariant it looks like: a final that revises text already
+    spoken cannot be honoured either way, and this capture never triggers one
+    - the inserted "а" lands past the commit point, not inside it. What
+    happens when it does land inside is covered by
+    test_a_final_that_revises_inside_the_spoken_text_is_emitted_whole (the
+    text goes out again) and test_a_final_that_drops_spoken_text_still_says_so
+    (it does not go out at all).
     """
     final_text = [r["text"] for r in _capture("monologue") if r["final"]]
     expected = re.findall(r"\w+", " ".join(final_text).lower())

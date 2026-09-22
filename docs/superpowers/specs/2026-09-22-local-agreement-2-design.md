@@ -58,13 +58,15 @@ unchanged. One instance per direction, which `FinalsOnlySegmenter`'s docstring
 already forbids hoisting out of the loop; that warning stops being
 hypothetical here.
 
-State: the previous interim's tokens, and how many words of the utterance in
-progress have already been committed.
+State: the previous interim's tokens, and the tokens of the utterance in
+progress that have actually been spoken. *(Superseded in part - the second
+was a word COUNT until a real call falsified it; see "The count was the bug"
+at the end of this document.)*
 
 On an **interim**: take the longest common key prefix against the previous
 interim, and commit whatever it adds beyond what has already been sent. On a
-**final**: match the final's leading tokens against what was committed, emit
-the remainder in full, and reset. The punctuation rule below does not apply to
+**final**: match the final's leading tokens against what was spoken, emit the
+remainder in full, and reset. The punctuation rule below does not apply to
 a final — there is nothing left to wait for, so nothing is held back.
 
 Two agreements, fixed. Not configurable, and justified by measurement rather
@@ -288,7 +290,40 @@ early carries a whole-utterance span, span included, exactly what
 `test_segment.py`) now pins the equivalence, spans included, so this cannot
 regress silently again.
 
-**Not in this document at all: recovery from a stream restart mid-utterance.**
+**The count was the bug: `_committed` is gone, replaced by `_spoken`.**
+Everything in the paragraph below, and the "how many words have been
+committed" in the design above, was falsified by the first real call ever run
+against this feature. Chirp does not only extend a hypothesis - it re-windows
+it mid-utterance, reporting the same sentence from a later word on, which the
+offline experiment never saw because its interims were purely additive.
+Against a count that shift is unrecoverable: the zero-agreement rule below
+read a re-window as a dead stream, discarded the commit, and the final of that
+same utterance then found nothing committed and re-spoke everything. Roughly
+15% of a five-minute call was verbatim repeats of speech up to a minute old,
+in three bursts of 50 to 110 words, with the session log reading "discarding
+69 / 55 / 14 / 83 committed word(s)".
+
+The fix replaces both concepts with one. `_spoken` holds the tokens this
+utterance has actually emitted, and every candidate - an interim's growth or a
+final's text - is aligned against it by CONTENT before anything is emitted:
+the largest k for which the last k spoken keys equal the candidate's first k,
+emit `candidate[k:]`. A stream restart is then just `k == 0`, which emits the
+new utterance whole - the behaviour the discards existed to produce - so both
+discard rules are deleted rather than ported. `_overlap` carries one more arm,
+for a hypothesis that SHRANK: a candidate wholly contained in what was spoken
+adds nothing and emits nothing, which is what `agreed <= len(committed)` used
+to do positionally. The window is capped at `_SPOKEN_LIMIT = 400` tokens,
+trimmed from the front, because the search is quadratic and an utterance on a
+stream that never finalises is unbounded; 400 is nearly six times the largest
+overlap ever measured (69). Cost, stated because it is real: an edit INSIDE
+the spoken text - a word substituted, not appended - breaks the alignment to
+zero and the final goes out whole, where the count rule emitted only the tail.
+That is logged at `warning` and is the one shape where the old rule did
+better; the shape that actually happens on a real call is the re-window, and
+it is the opposite way round.
+
+**Superseded, and kept for the reasoning: recovery from a stream restart
+mid-utterance.**
 `RecognitionWorker` (`asr.py`) rebuilds its streaming connection every
 `MAX_STREAM_SECONDS` and after any non-fatal error, and neither path
 guarantees a final for the utterance in progress - so a commit made before the
