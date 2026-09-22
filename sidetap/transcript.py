@@ -23,12 +23,23 @@ def hhmmss(seconds: float) -> str:
 def record_to_dict(record: Record) -> dict:
     """One JSONL row.
 
-    NOTE: `t` and `t_end` are always EQUAL. Chirp 3 gives no word timestamps
-    in streaming mode (setting enable_word_time_offsets is a fatal
-    InvalidArgument), so an utterance's only timestamp is its end offset and
-    both fields carry it. Do NOT infer duration from `t_end - t` - every
-    utterance would read as instantaneous. The duration of the SPOKEN audio is
-    derivable from the synthesised PCM instead, via Translated.audio_s.
+    NOTE: do NOT infer a duration from `t_end - t`. Chirp 3 gives no word
+    timestamps in streaming mode (setting enable_word_time_offsets is a fatal
+    InvalidArgument), so an utterance's only timestamp is its end offset, and
+    the two fields mean different things depending on how the row was cut:
+
+      - A whole utterance - every row under --no-early-commit, and every row
+        for an utterance LocalAgreementSegmenter committed nothing early for,
+        which is all of ordinary turn-taking conversation - carries that one
+        end offset in BOTH fields, so `t_end - t` is zero and every such row
+        would read as instantaneous.
+      - A clause committed early carries the PREVIOUS clause's end offset in
+        `t`, so `t_end - t` is the gap between two recognition hypotheses
+        (~5 s, whatever Chirp's interim cadence was), not how long the clause
+        took to say.
+
+    The duration of the SPOKEN audio is derivable from the synthesised PCM
+    instead, via Translated.audio_s.
     """
     return {
         "t": record.unit.t_start,

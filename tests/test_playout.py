@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from sidetap.playout import CHUNK_MS, STARVE_LIMIT_TICKS, DuckControl, Playout
@@ -930,3 +932,317 @@ def test_a_dropped_streamed_utterance_reports_exactly_the_pcm_that_had_arrived()
     assert [d.text for d in dropped] == ["victim"]
     assert dropped[0].pcm == chunk
     assert playout.backlog_s() == 1.0
+
+
+def test_the_duck_holds_across_a_gap_when_more_of_the_run_is_coming():
+    """The gap between two committed clauses is not the end of the sentence.
+
+    Opening here would let a burst of the untranslated original through the
+    middle of what the listener hears as one sentence.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))  # 2 chunks
+    playout.expect_continuation(True)
+    assert playout.tick() is True
+    assert playout.tick() is True
+    assert duck.is_open is False
+
+    for _ in range(10):  # 200 ms of gap before the next clause
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+
+def test_the_duck_holds_while_the_next_clause_is_still_buffering():
+    """The gap is not always an empty queue.
+
+    The next clause is usually queued already and sitting under
+    START_BUFFER_S, which reaches a different branch of _advance_locked.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+
+    nxt = playout.begin(_unit(), "next")
+    playout.append(nxt, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))  # 100 ms
+    for _ in range(5):
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+
+def test_the_duck_opens_when_the_run_ends():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    assert duck.is_open is False
+
+    playout.expect_continuation(False)
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_a_continuation_that_never_arrives_still_opens_the_duck():
+    """The same bound as every other reason the duck stays shut.
+
+    A duck stuck closed silences the person you are on a call with and leaves
+    them talking to nobody, which CLAUDE.md names as worse than sidetap not
+    working at all. Exactly STARVE_LIMIT_TICKS, because an off-by-one either
+    way is a real bug here.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    assert duck.is_open is False
+
+    for _ in range(STARVE_LIMIT_TICKS):
+        playout.tick()
+    assert duck.is_open is True
+
+
+def test_flushing_clears_the_continuation_hold():
+    """Bypass engaging and the drop-backlog hotkey both funnel through flush.
+
+    Neither should leave the duck shut waiting for audio that was just thrown
+    away.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    assert duck.is_open is False
+
+    playout.flush()
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_leaving_suppression_does_not_resume_a_stale_hold():
+    """set_suppressed flushes on both edges, so the hold goes with the queue.
+
+    The run it belonged to is minutes old by the time bypass is released.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+
+    playout.set_suppressed(True)
+    playout.set_suppressed(False)
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_an_expired_hold_does_not_re_arm_itself(caplog):
+    """The bound has to disarm the hold, not merely pause it.
+
+    Leaving _continuation set where the bound fires re-arms the hold on the
+    very next tick: the duck opens for one 20 ms tick, shuts for another two
+    seconds, and repeats for the rest of the call. That is the stuck-closed
+    failure with a sawtooth on it, and the exactly-at-the-bound test above
+    passes straight through it - it only looks at the one tick where the duck
+    does open.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    with caplog.at_level(logging.WARNING, logger="sidetap.playout"):
+        for _ in range(STARVE_LIMIT_TICKS):
+            playout.tick()
+        assert duck.is_open is True
+
+        for _ in range(STARVE_LIMIT_TICKS * 2):
+            playout.tick()
+            assert duck.is_open is True
+
+    # Disarming is also what stops the warning repeating. Left armed, the
+    # deadline is re-reached on every tick from here to hangup: 50 lines a
+    # second into the journal and the TUI, burying whatever else went wrong.
+    assert len([r for r in caplog.records if "held the duck" in r.getMessage()]) == 1
+
+
+def test_a_hold_does_not_spend_the_next_clause_s_start_budget():
+    """Two different failures must not share one deadline.
+
+    A hold that has already run most of its bound used to leave a freshly
+    queued clause only the remainder before force-closing it as truncated -
+    losing the rest of a clause that was arriving perfectly normally.
+    """
+    playout = Playout(Direction.IN, FakeAudioSink())
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+
+    for _ in range(STARVE_LIMIT_TICKS - 10):  # 1.8s of gap, most of the bound
+        assert playout.tick() is False
+
+    clause = playout.begin(_unit(), "next clause")
+    playout.append(clause, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+
+    # Its own full budget, counted from where it was queued rather than from
+    # where the gap left off: one tick short of the bound it is still intact.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        assert playout.tick() is False
+    assert clause.closed is False
+    assert clause.truncated is False
+
+    # Which is what the budget is for: the producer is still allowed to
+    # deliver the rest of it. A force-closed head refuses every later append.
+    rest = b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2)
+    assert playout.append(clause, rest) is True
+    assert playout.tick() is True
+
+
+def test_speech_clears_the_hold_deadline():
+    """A chunk reaching the sink is what resets `_hold_ticks` - nothing else.
+
+    The old name said the re-arm did it. It does not, and has not since the
+    counter split: `expect_continuation` only arms, and clearing there made
+    the deadline a lease a caller could renew forever. What clears the
+    counter here is the two ticks of the second clause's audio between the
+    gaps, which is why the second gap gets a full bound rather than the ten
+    ticks the first one left.
+
+    What that pins is the per-gap budget. Without it the bound is cumulative
+    across a monologue: after a couple of ordinary gaps it expires part-way
+    through the next one and the duck opens mid-sentence anyway - the exact
+    burst of untranslated original the hold exists to prevent.
+
+    It does NOT pin the absence of the lease, and never did: restoring
+    reset-on-arm passes this test unchanged, because the counter is zero
+    either way by the time the second gap starts.
+    test_a_producer_cannot_renew_the_hold_forever below is the one that
+    catches that, verified by mutation.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    for _ in range(STARVE_LIMIT_TICKS - 10):  # most of the first gap's budget
+        playout.tick()
+    assert duck.is_open is False
+
+    # The next clause lands and the producer re-arms for the gap behind it.
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    assert playout.tick() is True
+    assert playout.tick() is True
+
+    # A full bound of gap, not the 10 ticks left over from the first one.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+
+def test_a_producer_cannot_renew_the_hold_forever():
+    """The bound is a deadline, not a lease.
+
+    Re-arming must not buy another two seconds when no audio has arrived in
+    between - otherwise a caller that arms per clause holds the duck shut for
+    the rest of the call, and the remote party is silenced with nothing on
+    screen saying why.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.expect_continuation(True)
+    for tick in range(5000):
+        if tick % 50 == 0:
+            playout.expect_continuation(True)  # a caller arming per clause
+        playout.tick()
+        if duck.is_open:
+            break
+    assert duck.is_open is True
+    assert tick <= STARVE_LIMIT_TICKS
+
+    # And it stays open: a re-arm after the deadline has passed buys at most
+    # the one tick it takes to expire again, not another full bound.
+    open_ticks = 0
+    for tick in range(5000):
+        if tick % 50 == 0:
+            playout.expect_continuation(True)
+        playout.tick()
+        open_ticks += duck.is_open
+    assert open_ticks >= 4900
+
+
+def test_a_queue_that_never_becomes_playable_does_not_suspend_the_bound():
+    """A queued clause is not audio. Task 8 queues one before its audio exists,
+    so an unstartable head is the ordinary shape, and the bound has to count
+    those ticks or a recurring TTS stall silences the call.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.expect_continuation(True)  # armed exactly once
+    for tick in range(5000):
+        if tick % 90 == 0:
+            # A clause whose synthesis stalls under START_BUFFER_S, replaced
+            # every 90 ticks - never playable, never speech.
+            item = playout.begin(_unit(), "stalling")
+            playout.append(item, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+        playout.tick()
+        if duck.is_open:
+            break
+    assert duck.is_open is True
+    assert tick <= STARVE_LIMIT_TICKS
+
+
+def test_a_flush_gives_the_next_run_a_full_hold():
+    """Only real speech and a flush clear the deadline - so a flush must.
+
+    Bypass and the drop-backlog hotkey both funnel through flush(), and the
+    run after one starts from nothing. Carrying the spent deadline across it
+    would expire the very next hold within a tick or two, and the duck would
+    open mid-sentence through the first clause after every bypass.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.expect_continuation(True)
+    for _ in range(STARVE_LIMIT_TICKS - 10):  # spend most of the deadline
+        playout.tick()
+    assert duck.is_open is False
+
+    playout.flush()
+    playout.expect_continuation(True)
+
+    # A full deadline again, with no speech in between to have cleared it.
+    for _ in range(STARVE_LIMIT_TICKS - 10):
+        playout.tick()
+    assert duck.is_open is False

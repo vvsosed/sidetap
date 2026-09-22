@@ -8,7 +8,7 @@ from sidetap.metrics import Health, Metrics
 from sidetap.pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
 from sidetap.playout import STARVE_LIMIT_TICKS, DuckControl, Playout, earcon
 from sidetap.segment import FinalsOnlySegmenter
-from sidetap.types import TTS_BYTES_PER_S, AsrResult, Direction, Latency
+from sidetap.types import TTS_BYTES_PER_S, AsrResult, Direction, Latency, Unit
 from tests.conftest import (
     FakeAudioSink,
     FakeClock,
@@ -960,3 +960,126 @@ def test_speaking_rate_is_passed_through_to_the_synthesizer():
     pipeline.handle(_final(t_end=1.0))
 
     assert synthesizer.rates == [1.3]
+
+
+# --- per-unit ASR latency and the duck hold (Task 8) ------------------------
+
+
+class _OneUnitSegmenter:
+    """Emits a fixed Unit on every interim, nothing on a final."""
+
+    def __init__(self, unit):
+        self.unit = unit
+
+    def feed(self, result):
+        return [] if result.is_final else [self.unit]
+
+
+class _NothingSegmenter:
+    def feed(self, result):
+        return []
+
+
+def test_the_asr_latency_is_measured_from_the_unit_not_the_result():
+    """A committed prefix is confirmed through the OLDER hypothesis.
+
+    Its content is seconds older than the result that triggered it. Reading
+    result.t_end reports a six-second-old clause as one second old, in the
+    exact column the spec names as this change's evidence.
+    """
+    records = []
+    unit = Unit(direction=Direction.IN, text="привет", t_start=10.0, t_end=14.0)
+    pipeline = _pipeline(
+        segmenter=_OneUnitSegmenter(unit),
+        clock=FakeClock(20.0),
+        on_record=records.append,
+    )
+    pipeline.handle(_interim("прив"))
+    assert records[0].latency.asr_ms == 6000.0
+
+
+def test_a_continuing_clause_holds_the_duck_across_the_gap():
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+    unit = Unit(
+        direction=Direction.IN, text="привет", t_start=0.0, t_end=1.0, continues=True
+    )
+    pipeline = _pipeline(segmenter=_OneUnitSegmenter(unit), playout=playout)
+
+    pipeline.handle(_interim("прив"))
+    # FakeTranslator's default marker ("[en-US]привет", 13 chars) is what
+    # actually reaches the synthesizer, not unit.text - 13 * 480 bytes/char
+    # is ~130 ms, 7 ticks of real audio at CHUNK_MS=20 (measured directly
+    # against Playout, not assumed).
+    for _ in range(7):
+        playout.tick()
+    for _ in range(5):
+        assert playout.tick() is False
+    assert duck.is_open is False
+
+
+def test_a_failed_clause_does_not_arm_the_duck_hold():
+    """Otherwise a direction whose translator is down re-arms every five
+    seconds and holds the duck shut for the whole call, with silence behind
+    it - the stuck-closed failure, reached by a different road.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+    unit = Unit(
+        direction=Direction.IN, text="привет", t_start=0.0, t_end=1.0, continues=True
+    )
+    pipeline = _pipeline(
+        segmenter=_OneUnitSegmenter(unit),
+        synthesizer=FakeSynthesizer(error=RuntimeError("boom")),
+        playout=playout,
+    )
+
+    pipeline.handle(_interim("прив"))
+    playout.tick()
+    assert duck.is_open is True
+
+
+def test_speak_only_arms_the_hold_for_a_continuing_unit():
+    """Exercises _speak() directly, bypassing handle()'s own end-of-call
+    expect_continuation(False) for a final result.
+
+    That clear masks an unconditional arm for every unit reachable through
+    handle() today: every production segmenter's interim-triggered units
+    carry continues=True already, and a final-triggered unit's arm (right or
+    wrong) is wiped by handle()'s own clear a few lines later in the same
+    call. Nothing driving the pipeline through handle() can tell a correct
+    arm apart from an unconditional one, so this drives _speak() on its own
+    to pin the guard itself.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+    pipeline = _pipeline(playout=playout)
+    unit = Unit(
+        direction=Direction.IN, text="привет", t_start=0.0, t_end=1.0, continues=False
+    )
+
+    pipeline._speak(unit, asr_ms=0.0)
+    for _ in range(7):  # drain whatever FakeSynthesizer produced
+        playout.tick()
+    assert playout.tick() is False
+    assert duck.is_open is True
+
+
+def test_a_final_ends_the_duck_hold_even_when_it_commits_nothing():
+    """The last interim often already covered everything the final carries.
+
+    Without clearing here, the hold would sit until the starvation bound
+    instead of ending with the sentence.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+    playout.expect_continuation(True)
+    pipeline = _pipeline(segmenter=_NothingSegmenter(), playout=playout)
+
+    pipeline.handle(_final())
+    playout.tick()
+    assert duck.is_open is True

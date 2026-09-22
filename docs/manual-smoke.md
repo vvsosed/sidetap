@@ -139,6 +139,63 @@ underrun is audible where the old 1.3 s buffer was merely slow.
       you still hear is the 441 ms experiment 2 measured already sitting
       inside pw-cat, which cannot be recalled.
 
+## Committing early (`LocalAgreementSegmenter`)
+
+Everything below needs someone willing to talk for half a minute without
+pausing. Nothing in the test suite can reach any of it.
+
+- [ ] **A monologue keeps being spoken, instead of stopping.** Have the other
+      party talk continuously for 30 s. The first sentence arrives at the same
+      time it always did - what should change is that translation keeps coming
+      every few seconds afterwards, rather than going silent until they stop
+      and then delivering a wall of speech. Compare directly against
+      `--no-early-commit`.
+- [ ] **The duck does not flap between clauses.** This is the check that
+      decides whether the feature ships on by default. Listen for the original
+      bleeding through *inside* the monologue, in the gap between one
+      committed clause and the next. It should not be audible at all. If it
+      is, `Playout.expect_continuation` is not being armed.
+- [ ] **Ordinary conversation is unchanged.** Normal turn-taking produces no
+      interim results, so nothing should sound or read differently from
+      before. If short sentences start arriving in fragments, the segmenter is
+      committing on one hypothesis instead of two.
+- [ ] **The transcript reads as clauses, not as a jumble.** A monologue should
+      render as several rows whose text joins back into the whole utterance,
+      with no word repeated and none missing. Word order across a clause
+      boundary is the quality cost the design named, and this is the only
+      place it can be judged.
+- [ ] **Nothing is spoken twice, and the log says why if it is.** This is the
+      check that found the worst regression this feature has had: Chirp
+      re-windows a long hypothesis mid-utterance, and the first version read
+      that as a dead stream and re-spoke whole clauses - roughly 15% of a
+      five-minute call. `segment.py` now aligns every candidate against what
+      it has actually spoken, and logs at **warning** ("shares no words with
+      the N already spoken") the one case where a repeat can still reach the
+      ear. Grep the session log for that line after any long monologue: with
+      no warnings and a repeat audible, the alignment is wrong; with warnings
+      and no repeat, a stream restarted, which is benign. A repeat of a few
+      words under that warning is expected too: a re-window over fewer than
+      `MIN_ANCHOR` (8) spoken words is repeated by design.
+- [ ] **Nothing new is dropped, and the log says what was.** When a hypothesis
+      re-windows back past where the spoken text began, `segment.py` anchors
+      on the spoken run inside it and drops the words in front, logging at
+      **warning** ("dropped N leading word(s) in front of a run of M already
+      spoken"). This is the one path that can lose speech rather than repeat
+      it, and nobody hears a word that was never played, so check each line
+      against the transcript: the N dropped words should be ones from before
+      the run, not new speech. M far above 8 with N small is a real
+      re-window; M near 8 with a clause dropped is a false anchor, and means
+      `MIN_ANCHOR` is too low. The same N on consecutive lines is one
+      re-window, logged again at each interim until its final.
+- [ ] **The end of a monologue releases the duck promptly.** When the speaker
+      stops, the original should become audible again within a second or so -
+      not after the 2 s bound, which would mean the final never cleared the
+      hold.
+- [ ] **A translator or synthesis failure mid-monologue does not silence the
+      call.** The duck must reopen within about two seconds of the last audio
+      actually played. If the far end goes quiet for longer than that, the
+      hold is being armed on a failure path.
+
 ## Lag and drops
 
 - [ ] Have the remote party talk continuously for two minutes.

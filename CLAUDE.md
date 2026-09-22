@@ -24,7 +24,7 @@ imported. The two repositories share no runtime dependency.
 `sidetap/` is the application; see **Architecture** below for the module
 table.
 
-`tests/` holds 472 tests that run with no audio hardware, no network and no
+`tests/` holds 555 tests that run with no audio hardware, no network and no
 credentials — every subprocess, socket and clock the package touches sits
 behind a `Protocol` in `ports.py`, with a real implementation in
 `adapters.py` and a fake in `tests/conftest.py`.
@@ -63,7 +63,7 @@ pw-cli --version                   # needs >= 0.3.60
 pw-dump | head                     # graph as JSON
 wpctl status                       # sinks/sources, incl. sidetap's own nodes
 
-uv run pytest -q                                   # 472 tests, no audio/network/creds needed
+uv run pytest -q                                   # 555 tests, no audio/network/creds needed
 uv run sidetap devices                              # run this MID-CALL, not before
 uv run sidetap doctor                               # environment checks
 uv run sidetap doctor --install                     # write the virtual-mic config (once)
@@ -151,7 +151,7 @@ second implementation.
 | `vad.py` | `SilenceGate` — drops silence, keeps a tail so utterances finalise |
 | `rotation.py` | `StreamClock`, `AudioTimeline` — offsets across rotated streams |
 | `asr.py` | Chirp 3 streaming recognition, `RecognitionWorker` |
-| `segment.py` | the `Segmenter` seam; `FinalsOnlySegmenter` for v1 |
+| `segment.py` | the `Segmenter` seam; finals-only, or LocalAgreement-2 prefixes |
 | `translate.py` | Cloud Translation v3 adapter, NMT fallback |
 | `tts.py` | Chirp 3 HD streaming synthesis adapter |
 | `playout.py` | lag-capped queue of growable utterances, `DuckControl`, PCM writer |
@@ -195,7 +195,7 @@ as a style preference and this is not one.
   `google.cloud.translate` client — its `google.api_core.exceptions` import
   stays at module level, since it needs no network or credentials), not at
   module level. `webrtcvad` the same way (`vad.py:webrtc_detector`), with a
-  fallback to a no-op gate if it is missing. This is what lets 472 tests
+  fallback to a no-op gate if it is missing. This is what lets 555 tests
   import the package and run with no credentials configured at all — a
   top-level `from google.cloud import X` would make every test that merely
   imports the module require live credentials to collect.
@@ -321,6 +321,45 @@ as a style preference and this is not one.
   lag cap off for that direction — bounded by the same `STARVE_LIMIT_TICKS`,
   since a head stuck unstartable for that long gets force-closed in place
   regardless of what left it open.
+- **Committing early is bounded by Chirp, not by a constant.** Interims arrive
+  once per 5 s of sent audio and short utterances produce none at all
+  (`docs/experiments/06-interim-cadence.md`), so `LocalAgreementSegmenter`
+  needs ~11 s of continuous speech before two hypotheses can agree and is
+  inert below that. There is deliberately no length threshold in the code: a
+  constant here would be a second, worse copy of a bound the API already
+  imposes, and it would drift the moment Google changes the cadence.
+- **The comparison key is lowercased and stripped of edge punctuation.** Both
+  were measured changing between two interims of one utterance - `Что` to
+  `что`, `сверхурочно.` to `сверхурочно,`. Compare surfaces instead and the
+  longest common prefix on the real capture is **zero characters**, so nothing
+  commits early and the feature silently does nothing at all. Punctuation is
+  stripped only at a token's edges, because stripping it throughout would key
+  `1.2` and `12` the same and commit a number the recogniser had not settled
+  on. It picks the cut point; it never decides agreement.
+- **`MIN_ANCHOR = 8` (`segment.py`) is a safety floor, not a knob for
+  repeats.** `_overlap`'s third arm matches a tail of what was already spoken
+  ANYWHERE in the candidate and drops everything in front of it - what catches
+  Chirp re-windowing back past an utterance's first commit, which re-spoke 64
+  words on a real call. Lower the floor to catch shorter re-windows and an
+  ordinary phrase that recurs in new speech anchors instead, silently dropping
+  the new words before it; coincidental runs on that call reached 6 words. A
+  few repeated words from a re-window shorter than 8 are the intended cost.
+- **`Playout.expect_continuation` is the only thing keeping the duck shut
+  between committed clauses, and it has its own deadline.** `tick()` opens the
+  duck whenever the queue drains and nothing is starved, and "starved" means an
+  utterance already part-way through - which the gap between two clauses is
+  not. Without the hold, IN leaks a burst of the untranslated original into
+  that gap roughly every 5 s of a monologue. The hold counts on `_hold_ticks`,
+  **not** the `_starved_ticks` the other two cases share: sharing let a hold
+  spend an incoming clause's start budget and truncate it, measured at 10 ticks
+  instead of 100. `_hold_ticks` counts consecutive ticks with the duck shut and
+  no chunk written, and is cleared only by a written chunk or `flush()` - not
+  by arming, which would make the bound a lease a caller could renew forever -
+  before this fix the duck never reopened for the full 100 000-tick (33
+  minute) run a probe simulated, arming every 50 ticks with nothing ever
+  queued. Worst case across every adversarial pattern tried after the fix is
+  99 ticks, 1.98 s. `pipeline._speak` arms it only after playout has accepted
+  audio, so a direction whose translator is down cannot re-arm it.
 
 ## Things that bite at runtime
 

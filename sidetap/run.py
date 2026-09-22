@@ -17,7 +17,7 @@ from .pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
 from .playout import DuckControl, Playout, earcon
 from .ports import LinkResult
 from .routing import JOURNAL_PATH, VIRTMIC_SINK, Router
-from .segment import FinalsOnlySegmenter
+from .segment import FinalsOnlySegmenter, LocalAgreementSegmenter
 from .transcript import BilingualTranscript
 from .translate import TranslateConfig, build_translator
 from .tts import TtsConfig, build_synthesizer
@@ -276,7 +276,16 @@ class Session:
             self.playouts[direction] = playout
             self.pipelines[direction] = DirectionPipeline(
                 config=config,
-                segmenter=FinalsOnlySegmenter(),
+                # Constructed inside the loop, one per direction.
+                # LocalAgreementSegmenter holds per-utterance state, so a
+                # single instance fed by both directions would interleave two
+                # conversations and commit a prefix of neither. segment.py
+                # says so too; this is the line it is talking about.
+                segmenter=(
+                    FinalsOnlySegmenter()
+                    if getattr(args, "no_early_commit", False)
+                    else LocalAgreementSegmenter()
+                ),
                 translator=translator,
                 synthesizer=synthesizer,
                 playout=playout,

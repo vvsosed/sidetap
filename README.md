@@ -140,6 +140,11 @@ different without either flag. `--phrase` boosts recognition
 of a name or term that would otherwise get mangled; repeat it as needed.
 `--project` can be omitted if `GOOGLE_CLOUD_PROJECT` is set. `--no-tui` drops
 the dashboard for plain console logging, useful over SSH or in CI.
+`LocalAgreementSegmenter` commits a monologue clause by clause instead of
+waiting for one final, but it only engages after roughly 11 s of continuous
+speech, so it changes nothing for ordinary turn-taking; `--no-early-commit`
+falls back to the old one-clause-per-final behaviour, and the flag exists so
+the two can be compared on a real call.
 
 ### What you hear, what they hear
 
@@ -276,11 +281,14 @@ aspirational TODOs.
   already inside `pw-cat` and plays out regardless, so the silence is not
   immediate. See **Hotkeys** above.
 - **Half-duplex cadence is required, not optional.** Full-replacement routing
-  means there is no overlay to fall back on, and v1 only translates complete,
-  finalised utterances (no incremental commit yet) — so both parties talking
-  continuously without pausing pushes the translation further and further
-  behind rather than keeping pace, until the lag cap (default 20 s) starts
-  dropping the oldest queued utterances.
+  means there is no overlay to fall back on. `LocalAgreementSegmenter` (on by
+  default; `--no-early-commit` restores the old behaviour) commits a
+  monologue clause by clause instead of waiting for a single final, but it
+  only acts on interim hypotheses and only once roughly 11 s of continuous
+  speech has passed — so sustained speech from both parties without pausing
+  still pushes the translation further and further behind rather than keeping
+  pace, until the lag cap (default 20 s) starts dropping the oldest queued
+  utterances.
 - **Cloud Translation cannot be pinned to `europe-west3`.** Unlike
   Speech-to-Text, Translation only accepts `global` or `us-central1`
   (Experiment 3); `--mt-region` defaults to `global`. Translation LLM (the
@@ -295,9 +303,12 @@ aspirational TODOs.
   `DirectionPipeline._speak` already starts playout at time-to-first-chunk
   rather than the whole utterance (271 ms saved on a short sentence, 2109 ms
   on a long one, Experiment 4) — but that gain sits downstream of the wait
-  above. `segment.py`'s `FinalsOnlySegmenter` is the placeholder seam for
-  LocalAgreement-2, which would cut the wait itself; that seam exists and is
-  unused.
+  above. `segment.py`'s `LocalAgreementSegmenter` now cuts that wait, but only
+  where Chirp makes it possible: short utterances produce no interim results
+  at all, so turn-taking is unchanged and the gain is confined to monologues,
+  where a measured 29.3 s wait becomes a commit roughly every 5 s
+  (`docs/experiments/06-interim-cadence.md`). `--no-early-commit` restores the
+  old behaviour.
 - **`aggressiveness = 2`** in the silence gate is applied identically to both
   directions, but it is tuned (per its own docstring) for a raw room
   microphone; the remote direction arrives already compressed, AGC'd and
