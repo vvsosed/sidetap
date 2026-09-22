@@ -40,6 +40,13 @@ def _tokens(text: str) -> list[tuple[str, str]]:
     them to the same key would commit, translate and speak one before the
     recogniser had settled on which.
 
+    A sign is the one case this does not catch: "-12" keys to "12", so a
+    negative and a positive still agree. Left alone deliberately rather than
+    special-cased, because a leading "-" is indistinguishable here from an
+    ordinary edge dash, and conversational speech in either language tends to
+    render a negative as a word ("минус пять", "minus five") rather than as a
+    signed digit.
+
     A token whose surface is punctuation alone keeps an empty key. It still
     occupies a position, so a dash present in one hypothesis and absent from
     the next ends the agreement there rather than silently shifting it - which
