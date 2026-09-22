@@ -77,3 +77,13 @@ def test_agreement_counts_words_not_characters():
 def test_a_word_extended_in_the_next_hypothesis_ends_the_agreement():
     """A truncated trailing word needs no special case: its key differs."""
     assert _agreed(_tokens("без поним"), _tokens("без понимания")) == 1
+
+
+def test_agreement_stops_at_the_first_mismatch():
+    """A later match must not resurrect an earlier disagreement.
+
+    Without the break, a hypothesis that diverges and then re-converges would
+    report agreement on words that were never agreed - and those words get
+    committed, translated and spoken, where nothing can take them back.
+    """
+    assert _agreed(_tokens("а б в г"), _tokens("а X в г")) == 1
