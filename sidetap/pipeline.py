@@ -124,15 +124,30 @@ class DirectionPipeline:
         # Returning early on interims would make the seam decorative, because
         # no future segmenter could ever see the input its algorithm needs.
         arrived = self._clock.monotonic() - self._session_t0
-        # Rounded to a tenth of a ms: these are wall-clock subtractions, so
-        # raw floats carry binary rounding noise (10.2 - 10.0 == 0.19999...
-        # not 0.2) that a millisecond-scale metric has no business showing.
-        asr_ms = round(max(0.0, (arrived - result.t_end) * 1000), 1)
 
         for unit in self._segmenter.feed(result):
             if self._dead_air is not None:
                 self._dead_air.heard_speech()
+            # Per unit, not per result. A committed prefix is confirmed only
+            # through the OLDER hypothesis's audio position, so its content is
+            # seconds older than the result that triggered it - reading
+            # result.t_end here reports a clause as ~1 s old when it is ~6 s
+            # old, and the transcript's latency column is the stated evidence
+            # for the whole commit-early decision. Identical under
+            # FinalsOnlySegmenter, where unit.t_end IS result.t_end.
+            #
+            # Rounded to a tenth of a ms: these are wall-clock subtractions,
+            # so raw floats carry binary rounding noise (10.2 - 10.0 ==
+            # 0.19999... not 0.2) that a millisecond-scale metric has no
+            # business showing.
+            asr_ms = round(max(0.0, (arrived - unit.t_end) * 1000), 1)
             self._speak(unit, asr_ms)
+
+        if result.is_final:
+            # Ends the duck hold with the sentence, including when the final
+            # committed nothing new because the last interim already covered
+            # it. Without this the hold would sit until the starvation bound.
+            self._playout.expect_continuation(False)
 
     def _speak(self, unit: Unit, asr_ms: float) -> None:
         direction = self._config.direction
@@ -288,6 +303,13 @@ class DirectionPipeline:
             # Nothing playout accepted, so nothing was heard: no latency, no
             # record, and dead-air stays armed.
             return
+
+        if unit.continues:
+            # Armed only here, on the path where playout actually accepted
+            # audio. Arming it on a failure path would let a direction whose
+            # translator is down re-arm every five seconds and hold the duck
+            # shut for the whole call with silence behind it.
+            self._playout.expect_continuation(True)
 
         tts_total_ms = round((self._clock.monotonic() - started) * 1000, 1)
 
