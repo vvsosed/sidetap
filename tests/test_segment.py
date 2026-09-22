@@ -237,3 +237,63 @@ def test_the_cut_takes_the_last_boundary_not_the_first():
     segmenter.feed(_interim("да, конечно, мы", 5.0))
     units = segmenter.feed(_interim("да, конечно, мы согласны", 10.0))
     assert [u.text for u in units] == ["да, конечно,"]
+
+
+def _final_result(text, t_end, direction=Direction.IN):
+    return AsrResult(
+        direction=direction, text=text, is_final=True, t_start=t_end, t_end=t_end,
+    )
+
+
+def test_a_final_emits_only_what_was_not_committed():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    units = segmenter.feed(_final_result("что у нас есть, несколько задач.", 15.0))
+    assert [u.text for u in units] == ["несколько задач."]
+    assert [u.continues for u in units] == [False]
+
+
+def test_a_final_is_not_cut_at_a_boundary():
+    """Nothing is left to wait for, so nothing is held back."""
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("в ситуации,", 5.0))
+    segmenter.feed(_interim("в ситуации, когда команда", 10.0))
+    units = segmenter.feed(_final_result("в ситуации, когда команда работает", 15.0))
+    assert [u.text for u in units] == ["когда команда работает"]
+
+
+def test_a_final_that_adds_nothing_emits_nothing():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач", 10.0))
+    segmenter.feed(_interim("что у нас есть, несколько задач,", 15.0))
+    assert segmenter.feed(_final_result("что у нас есть, несколько задач,", 20.0)) == []
+
+
+def test_a_final_resets_the_state_for_the_next_utterance():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, задач", 10.0))
+    segmenter.feed(_final_result("что у нас есть, задач.", 15.0))
+    # A new utterance: one interim again commits nothing.
+    assert segmenter.feed(_interim("совсем другое,", 20.0)) == []
+
+
+def test_a_whitespace_only_final_emits_nothing():
+    segmenter = LocalAgreementSegmenter()
+    assert segmenter.feed(_final_result("   ", 5.0)) == []
+
+
+def test_spans_are_contiguous_and_end_where_the_text_was_confirmed():
+    """t_end is the OLDER hypothesis's position, not the newer one's.
+
+    Reading the newer one would report a committed clause as a second old when
+    it is six seconds old.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    first = segmenter.feed(_interim("что у нас есть, задач больше", 10.0))[0]
+    second = segmenter.feed(_final_result("что у нас есть, задач больше.", 15.0))[0]
+    assert (first.t_start, first.t_end) == (0.0, 5.0)
+    assert (second.t_start, second.t_end) == (5.0, 15.0)

@@ -14,9 +14,12 @@ turns into a latency figure.
 
 from __future__ import annotations
 
+import logging
 import re
 
 from .types import AsrResult, Direction, Unit
+
+log = logging.getLogger(__name__)
 
 # Only the EDGES. Stripping punctuation throughout would collapse "1.2" and
 # "12" to the same key, and two numbers that differ by a factor of ten would
@@ -227,4 +230,30 @@ class LocalAgreementSegmenter:
         return unit
 
     def _finalise(self, result: AsrResult) -> list[Unit]:
-        return []
+        tokens = _tokens(result.text)
+        committed = self._committed
+
+        self._previous = []
+        self._previous_t_end = result.t_end
+        self._committed = []
+
+        remainder = tokens[len(committed) :]
+        if not remainder:
+            # Everything this final carried had already been committed, or it
+            # carried nothing at all. The span still advances, so the next
+            # utterance's first commit does not claim to start back here.
+            self._span_start = result.t_end
+            return []
+
+        if _agreed(tokens, committed) < len(committed):
+            # A final may revise text already committed - Experiment 6 saw one
+            # insert a word thirteen from the end. Nothing can be un-spoken,
+            # so emit from where committing stopped rather than from where the
+            # revision starts: losing a word the listener will not hear beats
+            # repeating a clause they already heard.
+            log.debug(
+                "%s: final revised committed text; emitting from the commit point",
+                result.direction.value,
+            )
+
+        return [self._emit(result.direction, remainder, result.t_end, continues=False)]
