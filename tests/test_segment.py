@@ -1,4 +1,4 @@
-from sidetap.segment import FinalsOnlySegmenter, _agreed, _tokens
+from sidetap.segment import FinalsOnlySegmenter, LocalAgreementSegmenter, _agreed, _tokens
 from sidetap.types import AsrResult, Direction
 
 
@@ -97,3 +97,65 @@ def test_agreement_stops_at_the_first_mismatch():
     committed, translated and spoken, where nothing can take them back.
     """
     assert _agreed(_tokens("а б в г"), _tokens("а X в г")) == 1
+
+
+def _interim(text, t_end, direction=Direction.IN):
+    return AsrResult(
+        direction=direction, text=text, is_final=False,
+        t_start=t_end, t_end=t_end,
+    )
+
+
+def test_one_interim_commits_nothing():
+    """There is nothing to agree with.
+
+    This is what makes the feature self-limiting: Experiment 6 measured one
+    interim per 5 s of speech, so two agreeing hypotheses need ~11 s of
+    continuous speech. Below that the segmenter is FinalsOnlySegmenter, with
+    no threshold constant anywhere.
+    """
+    segmenter = LocalAgreementSegmenter()
+    assert segmenter.feed(_interim("что у нас есть", 5.0)) == []
+
+
+def test_two_agreeing_interims_commit_the_agreed_prefix():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    units = segmenter.feed(_interim("что у нас есть, несколько важных", 10.0))
+    assert [u.text for u in units] == ["что у нас есть,"]
+
+
+def test_a_committed_prefix_is_not_committed_again():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, несколько важных задач,", 10.0))
+    units = segmenter.feed(
+        _interim("что у нас есть, несколько важных задач, которые нужно", 15.0)
+    )
+    assert [u.text for u in units] == ["несколько важных задач,"]
+
+
+def test_a_committed_prefix_says_more_is_coming():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    units = segmenter.feed(_interim("что у нас есть, несколько", 10.0))
+    assert [u.continues for u in units] == [True]
+
+
+def test_a_disagreement_commits_nothing():
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть", 5.0))
+    assert segmenter.feed(_interim("это совсем другое", 10.0)) == []
+
+
+def test_the_two_directions_do_not_share_state():
+    """Load-bearing now, unlike the same test for FinalsOnlySegmenter.
+
+    One instance fed by both directions would interleave two conversations and
+    commit a prefix of neither.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    assert segmenter.feed(
+        _interim("this is english,", 10.0, direction=Direction.OUT)
+    ) == []

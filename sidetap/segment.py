@@ -96,3 +96,64 @@ class FinalsOnlySegmenter:
         if not result.text.strip():
             return []
         return [Unit.from_result(result)]
+
+
+class LocalAgreementSegmenter:
+    """Commit the longest word prefix two consecutive interims agree on.
+
+    **One instance per direction, never shared.** Unlike FinalsOnlySegmenter
+    this really does hold state, and one instance fed by both directions would
+    interleave two conversations and commit a prefix of neither.
+
+    Two agreements, not configurable, and the count is measured rather than
+    taken from the name: the final in Experiment 6 inserted a word thirteen
+    from the end of text that had already appeared in one interim. Two
+    agreements leave that tail uncommitted; one would have spoken text the
+    final then contradicted, and a synthesised voice cannot take a word back.
+    """
+
+    def __init__(self):
+        self._previous: list[tuple[str, str]] = []
+        self._previous_t_end = 0.0
+        # The tokens already emitted for the utterance in progress. Kept as
+        # tokens rather than a count so a final can be checked against them.
+        self._committed: list[tuple[str, str]] = []
+        self._span_start = 0.0
+
+    def feed(self, result: AsrResult) -> list[Unit]:
+        if result.is_final:
+            return self._finalise(result)
+        return self._interim(result)
+
+    def _interim(self, result: AsrResult) -> list[Unit]:
+        previous, previous_t_end = self._previous, self._previous_t_end
+        current = _tokens(result.text)
+        self._previous, self._previous_t_end = current, result.t_end
+
+        agreed = _agreed(previous, current)
+        if agreed <= len(self._committed):
+            return []
+        growth = current[len(self._committed) : agreed]
+
+        # t_end is the OLDER hypothesis's audio position, because that is the
+        # point through which this text is confirmed - not where the speaker
+        # has since got to. The transcript's latency column is the spec's
+        # stated evidence for this whole change, so overstating freshness here
+        # would corrupt the one number it is judged by.
+        unit = self._emit(result.direction, growth, previous_t_end, continues=True)
+        self._committed = self._committed + growth
+        return [unit]
+
+    def _emit(self, direction, tokens, t_end, *, continues):
+        unit = Unit(
+            direction=direction,
+            text=" ".join(surface for surface, _ in tokens),
+            t_start=self._span_start,
+            t_end=t_end,
+            continues=continues,
+        )
+        self._span_start = t_end
+        return unit
+
+    def _finalise(self, result: AsrResult) -> list[Unit]:
+        return []
