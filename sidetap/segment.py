@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from .types import AsrResult, Unit
+from .types import AsrResult, Direction, Unit
 
 # Only the EDGES. Stripping punctuation throughout would collapse "1.2" and
 # "12" to the same key, and two numbers that differ by a factor of ten would
@@ -144,7 +144,20 @@ class LocalAgreementSegmenter:
         self._committed = self._committed + growth
         return [unit]
 
-    def _emit(self, direction, tokens, t_end, *, continues):
+    def _emit(
+        self,
+        direction: Direction,
+        tokens: list[tuple[str, str]],
+        t_end: float,
+        *,
+        continues: bool,
+    ) -> Unit:
+        """Build the Unit and advance the span watermark past it.
+
+        Not a pure constructor: the caller must not call this speculatively or
+        discard the result, or the next unit will claim to start where this one
+        did and the two spans will overlap.
+        """
         unit = Unit(
             direction=direction,
             text=" ".join(surface for surface, _ in tokens),

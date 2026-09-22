@@ -135,6 +135,23 @@ def test_a_committed_prefix_is_not_committed_again():
     assert [u.text for u in units] == ["несколько важных задач,"]
 
 
+def test_spans_are_contiguous_across_two_commits():
+    """The second commit starts where the first one ended.
+
+    Without that, every unit of a monologue would claim to start at the
+    beginning of the session, and the transcript would show a pile of
+    overlapping spans instead of a sequence.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    first = segmenter.feed(_interim("что у нас есть, несколько важных задач,", 10.0))[0]
+    second = segmenter.feed(
+        _interim("что у нас есть, несколько важных задач, которые нужно", 15.0)
+    )[0]
+    assert (first.t_start, first.t_end) == (0.0, 5.0)
+    assert (second.t_start, second.t_end) == (5.0, 10.0)
+
+
 def test_a_committed_prefix_says_more_is_coming():
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
