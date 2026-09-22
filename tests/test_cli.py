@@ -392,3 +392,13 @@ def test_the_lag_cap_help_does_not_hardcode_the_default():
     )
     assert f"{LAG_CAP_S:g}" in action.help
     assert action.default is None, "None distinguishes unset from an explicit 12"
+
+
+def test_early_commit_is_on_by_default():
+    args = build_parser().parse_args(_RUN)
+    assert args.no_early_commit is False
+
+
+def test_early_commit_can_be_turned_off():
+    args = build_parser().parse_args(_RUN + ["--no-early-commit"])
+    assert args.no_early_commit is True

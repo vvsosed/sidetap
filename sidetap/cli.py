@@ -197,6 +197,14 @@ def build_parser() -> argparse.ArgumentParser:
         f"oldest (default {LAG_CAP_S:g}). Raising it means hearing more while "
         "falling further behind; it does not stop the backlog growing.",
     )
+    out.add_argument(
+        "--no-early-commit",
+        action="store_true",
+        help="wait for a complete utterance before translating, instead of "
+        "committing a stable prefix part-way through. Early committing only "
+        "engages after roughly 11 s of continuous speech, so this changes "
+        "nothing for ordinary conversation.",
+    )
     out.add_argument("--no-tui", action="store_true", help="plain console logging")
     out.add_argument("-v", "--verbose", action="store_true")
     return parser

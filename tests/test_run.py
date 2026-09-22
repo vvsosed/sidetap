@@ -25,7 +25,7 @@ def _args(**kwargs):
         mt_model="general/translation-llm", tts_region="eu", model="chirp_3",
         phrases=None, out=Path("transcripts"), lag_cap=None, no_tui=True, verbose=False,
         speaking_rate_in=1.0, speaking_rate_out=1.0,
-        voice_in_gender=None, voice_out_gender=None,
+        voice_in_gender=None, voice_out_gender=None, no_early_commit=False,
     )
     base.update(kwargs)
     return argparse.Namespace(**base)
@@ -631,3 +631,49 @@ def test_both_directions_default_to_neutral():
     configs = build_direction_configs(_args())
     assert configs[Direction.IN].speaking_rate == 1.0
     assert configs[Direction.OUT].speaking_rate == 1.0
+
+
+def test_the_default_segmenter_commits_early(tmp_path, routing_graph):
+    from sidetap.segment import LocalAgreementSegmenter
+
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    try:
+        for direction in Direction:
+            assert isinstance(
+                session.pipelines[direction]._segmenter, LocalAgreementSegmenter
+            )
+    finally:
+        session.shutdown()
+
+
+def test_no_early_commit_selects_the_finals_only_segmenter(tmp_path, routing_graph):
+    from sidetap.segment import FinalsOnlySegmenter
+
+    session = _session(tmp_path, routing_graph, no_early_commit=True)
+    session.setup()
+    try:
+        for direction in Direction:
+            assert isinstance(
+                session.pipelines[direction]._segmenter, FinalsOnlySegmenter
+            )
+    finally:
+        session.shutdown()
+
+
+def test_the_two_directions_get_their_own_segmenter(tmp_path, routing_graph):
+    """LocalAgreementSegmenter holds per-utterance state.
+
+    One instance shared between directions would interleave two conversations
+    and commit a prefix of neither - which is why segment.py tells you not to
+    hoist it out of the loop.
+    """
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    try:
+        assert (
+            session.pipelines[Direction.IN]._segmenter
+            is not session.pipelines[Direction.OUT]._segmenter
+        )
+    finally:
+        session.shutdown()
