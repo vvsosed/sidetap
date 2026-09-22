@@ -17,6 +17,36 @@ from __future__ import annotations
 from .types import AsrResult, Unit
 
 
+def _tokens(text: str) -> list[tuple[str, str]]:
+    """Split into (surface, key) pairs. Only the key is ever compared.
+
+    The surface keeps case and punctuation, because it is what reaches the
+    translator. The key drops both, because Experiment 6 observed both
+    changing between two hypotheses whose words were otherwise identical -
+    "Что" to "что", "сверхурочно." to "сверхурочно,". Comparing surfaces finds
+    a common prefix of zero characters on the real capture.
+
+    A token whose surface is punctuation alone keeps an empty key. It still
+    occupies a position, so a dash present in one hypothesis and absent from
+    the next ends the agreement there rather than silently shifting it - which
+    errs toward committing less.
+    """
+    return [
+        (surface, "".join(ch for ch in surface.lower() if ch.isalnum()))
+        for surface in text.split()
+    ]
+
+
+def _agreed(previous: list[tuple[str, str]], current: list[tuple[str, str]]) -> int:
+    """How many leading words two hypotheses agree on, by key."""
+    n = 0
+    for (_, previous_key), (_, current_key) in zip(previous, current):
+        if previous_key != current_key:
+            break
+        n += 1
+    return n
+
+
 class FinalsOnlySegmenter:
     """One Unit per final result. Interims are discarded.
 

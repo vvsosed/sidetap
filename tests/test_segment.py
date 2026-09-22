@@ -1,4 +1,4 @@
-from sidetap.segment import FinalsOnlySegmenter
+from sidetap.segment import FinalsOnlySegmenter, _agreed, _tokens
 from sidetap.types import AsrResult, Direction
 
 
@@ -51,3 +51,29 @@ def test_directions_do_not_share_state():
     segmenter.feed(_result(direction=Direction.IN, is_final=False, text="ru"))
     units = segmenter.feed(_result(direction=Direction.OUT, text="en"))
     assert [(u.direction, u.text) for u in units] == [(Direction.OUT, "en")]
+
+
+def test_the_key_ignores_case_and_punctuation():
+    """Both were observed changing between two interims of one utterance.
+
+    docs/experiments/06-interim-cadence.md finding 6: "Что" became "что", and
+    "сверхурочно." became "сверхурочно,". Comparing surfaces would read either
+    as a disagreement and commit nothing for the whole monologue.
+    """
+    assert [k for _, k in _tokens("Что сверхурочно.")] == ["что", "сверхурочно"]
+
+
+def test_the_surface_form_keeps_case_and_punctuation():
+    """It is what gets translated, so it must stay intact."""
+    assert [s for s, _ in _tokens("Что сверхурочно.")] == ["Что", "сверхурочно."]
+
+
+def test_agreement_counts_words_not_characters():
+    a = _tokens("Что у нас есть")
+    b = _tokens("что у нас было")
+    assert _agreed(a, b) == 3
+
+
+def test_a_word_extended_in_the_next_hypothesis_ends_the_agreement():
+    """A truncated trailing word needs no special case: its key differs."""
+    assert _agreed(_tokens("без поним"), _tokens("без понимания")) == 1
