@@ -160,6 +160,7 @@ class Playout:
         self._offset = 0
         self._starved_ticks = 0
         self._continuation = False
+        self._hold_ticks = 0
 
     @property
     def duck(self) -> DuckControl | None:
@@ -264,6 +265,7 @@ class Playout:
             # away - and set_suppressed() flushes on both edges, so this is
             # also what stops a hold surviving a whole bypass.
             self._continuation = False
+            self._hold_ticks = 0
             return count
 
     def _trim_locked(self) -> list[tuple[Utterance, float, int]]:
@@ -404,14 +406,26 @@ class Playout:
         hears as one sentence, roughly every five seconds of a monologue
         (docs/experiments/06-interim-cadence.md).
 
-        Bounded by the same STARVE_LIMIT_TICKS as every other reason the duck
-        stays shut, so a producer that dies mid-run cannot hold it closed for
-        the rest of the call. That bound is not optional: a duck stuck closed
-        silences the person you are talking to, which this module treats as
-        worse than not working.
+        Bounded by STARVE_LIMIT_TICKS on a counter of its own, reset on every
+        call so each newly committed clause re-arms with a full budget instead
+        of inheriting whatever the last gap spent. Sharing `_starved_ticks`
+        with the starvation arms instead let a hold spend the next clause's
+        start budget: a gap that had already run 90 ticks left a clause
+        arriving perfectly normally 10 ticks before it was force-closed as
+        truncated, losing the rest of it.
+
+        The bound is per reason, not per call. A starving utterance abandoned
+        at its own deadline, followed by a hold running to its own, shuts the
+        duck for roughly two bounds with a single 20 ms opening between them.
+        What is guaranteed is that every arm fails open on its own deadline -
+        not that the duck cannot be shut for longer than one bound across two
+        consecutive failures. That guarantee is still the one that matters: a
+        duck stuck closed silences the person you are talking to, which this
+        module treats as worse than not working.
         """
         with self._lock:
             self._continuation = value
+            self._hold_ticks = 0
 
     def _startable_locked(self, item: Utterance) -> bool:
         """Hold a new utterance until it can absorb a stall.
@@ -535,8 +549,10 @@ class Playout:
             # quiet with nothing on screen explaining why.
             #
             # A hold means the listener is mid-run and this is the gap before
-            # the next clause, not the quiet before the first one. The duck
-            # stays shut across it, under the same bound as everything else.
+            # the next clause, not the quiet before the first one, so the duck
+            # stays shut across it. Only the duck: this head keeps its own
+            # full `_starved_ticks` budget, which is why the hold counts on
+            # `_hold_ticks` instead of adding to this one.
             starved = self._continuation
             self._starved_ticks += 1
             if self._starved_ticks >= STARVE_LIMIT_TICKS:
@@ -555,24 +571,32 @@ class Playout:
                 self._queue[0].truncated = True
                 self._starved_ticks = 0
         else:
+            # Nothing playing and nothing queued: `_starved_ticks` has no
+            # subject, so it resets here whether or not a hold is running.
+            # Letting a gap carry it forward is the leak `_hold_ticks` exists
+            # to close - the next clause would be force-closed as truncated
+            # after whatever the gap left of its budget.
+            self._starved_ticks = 0
             if self._continuation:
                 # Nothing queued at all, but the producer says more of this
-                # run is coming. Hold the duck shut across the gap, bounded
-                # exactly as above so it always fails open.
+                # run is coming. Hold the duck shut across the gap, on this
+                # arm's own copy of the bound so it always fails open.
                 starved = True
-                self._starved_ticks += 1
-                if self._starved_ticks >= STARVE_LIMIT_TICKS:
+                self._hold_ticks += 1
+                if self._hold_ticks >= STARVE_LIMIT_TICKS:
                     log.warning(
                         "%s playout: expected continuation never arrived in "
                         "%.1fs; reopening the duck",
                         self.direction.value,
                         STARVE_LIMIT_TICKS * CHUNK_MS / 1000,
                     )
+                    # Disarm, do not merely pause: left set, the hold re-arms
+                    # on the next tick and the duck sawtooths - open for one
+                    # 20 ms tick, shut for two more seconds - for the rest of
+                    # the call.
                     self._continuation = False
-                    self._starved_ticks = 0
+                    self._hold_ticks = 0
                     starved = False
-            else:
-                self._starved_ticks = 0
         return chunk, finished, starved
 
     def tick(self) -> bool:

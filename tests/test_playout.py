@@ -1078,3 +1078,68 @@ def test_an_expired_hold_does_not_re_arm_itself():
     for _ in range(STARVE_LIMIT_TICKS * 2):
         playout.tick()
         assert duck.is_open is True
+
+
+def test_a_hold_does_not_spend_the_next_clause_s_start_budget():
+    """Two different failures must not share one deadline.
+
+    A hold that has already run most of its bound used to leave a freshly
+    queued clause only the remainder before force-closing it as truncated -
+    losing the rest of a clause that was arriving perfectly normally.
+    """
+    playout = Playout(Direction.IN, FakeAudioSink())
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+
+    for _ in range(STARVE_LIMIT_TICKS - 10):  # 1.8s of gap, most of the bound
+        assert playout.tick() is False
+
+    clause = playout.begin(_unit(), "next clause")
+    playout.append(clause, b"\x01\x02" * int(TTS_BYTES_PER_S * 0.1 / 2))
+
+    # Its own full budget, counted from where it was queued rather than from
+    # where the gap left off: one tick short of the bound it is still intact.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        assert playout.tick() is False
+    assert clause.closed is False
+    assert clause.truncated is False
+
+    # Which is what the budget is for: the producer is still allowed to
+    # deliver the rest of it. A force-closed head refuses every later append.
+    rest = b"\x01\x02" * int(TTS_BYTES_PER_S * 0.4 / 2)
+    assert playout.append(clause, rest) is True
+    assert playout.tick() is True
+
+
+def test_re_arming_gives_the_next_gap_a_full_budget():
+    """Each committed clause re-arms the hold from zero.
+
+    Inheriting the previous gap's count makes the bound cumulative across a
+    monologue instead of per gap: after a couple of ordinary gaps it expires
+    part-way through the next one and the duck opens mid-sentence anyway -
+    the exact burst of untranslated original the hold exists to prevent.
+    """
+    volume = FakeVolumeControl()
+    duck = DuckControl(volume, 42)
+    playout = Playout(Direction.IN, FakeAudioSink(), duck=duck)
+
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    playout.tick()
+    playout.tick()
+    for _ in range(STARVE_LIMIT_TICKS - 10):  # most of the first gap's budget
+        playout.tick()
+    assert duck.is_open is False
+
+    # The next clause lands and the producer re-arms for the gap behind it.
+    playout.submit(_translated(0.04))
+    playout.expect_continuation(True)
+    assert playout.tick() is True
+    assert playout.tick() is True
+
+    # A full bound of gap, not the 10 ticks left over from the first one.
+    for _ in range(STARVE_LIMIT_TICKS - 1):
+        assert playout.tick() is False
+    assert duck.is_open is False
