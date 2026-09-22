@@ -68,6 +68,16 @@ def test_the_surface_form_keeps_case_and_punctuation():
     assert [s for s, _ in _tokens("Что сверхурочно.")] == ["Что", "сверхурочно."]
 
 
+def test_two_different_numbers_do_not_agree():
+    """Stripping punctuation throughout would key "1.2" and "12" the same.
+
+    Numbers are the one place a wrong commit is unrecoverable in a way the
+    listener notices: an amount or a time gets spoken, and nothing can take it
+    back. Only edge punctuation is dropped, so interior separators survive.
+    """
+    assert _agreed(_tokens("about 1.2 million"), _tokens("about 12 million")) == 1
+
+
 def test_agreement_counts_words_not_characters():
     a = _tokens("Что у нас есть")
     b = _tokens("что у нас было")
