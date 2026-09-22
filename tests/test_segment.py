@@ -428,6 +428,12 @@ def test_the_real_capture_commits_nothing_the_final_contradicted():
 
     The final inserted "а" into "сверхурочно, результат", text that had already
     appeared in one interim. One agreement would have spoken it. Two must not.
+
+    Weaker than it looks under mutation: dropping to one agreement still never
+    produces this literal substring, but for an unrelated reason - the
+    mutated segmenter locks in the earlier hypothesis's "сверхурочно." before
+    the comma form ever arrives. The unit-count, word-list and span tests are
+    what actually catch that mutation; this one should not be trusted alone.
     """
     spoken = " ".join(u.text for u in _replay("monologue"))
     assert "сверхурочно, результат" not in spoken
@@ -437,15 +443,29 @@ def test_the_real_capture_survives_the_case_change():
     """"Что" became "что" between two hypotheses whose words were identical.
 
     A surface comparison finds a common prefix of zero here and commits
-    nothing for the entire monologue - so this is the test that fails if the
-    key ever stops being lowercased.
+    nothing for the entire monologue. But the phrase's mere presence in the
+    output does not pin that: with `.lower()` removed, agreement on this pair
+    stalls for exactly one round and "несколько важных задач" still turns up
+    a round later, folded into a longer unit. What pins the one-round delay
+    `.lower()` prevents is the exact text of the SECOND unit - lowering is
+    what lets it close after just one more interim instead of two.
     """
     units = _replay("monologue")
-    assert "несколько важных задач" in " ".join(u.text for u in units)
+    assert units[1].text == (
+        "что у нас есть несколько важных задач, которые нужно решить как можно быстрее."
+    )
 
 
 def test_the_real_capture_loses_no_words():
-    """Committing early must not drop or duplicate text."""
+    """Nothing is dropped or duplicated when no final revises a commit.
+
+    Not the general invariant it looks like: _finalise deliberately drops
+    words when a final revises text already committed, and this capture never
+    triggers that - the inserted "а" lands in the uncommitted remainder, not
+    inside the committed prefix. The intentional-drop path is covered by
+    test_a_final_that_revises_committed_text_emits_from_the_commit_point and
+    its neighbours.
+    """
     final_text = [r["text"] for r in _capture("monologue") if r["final"]]
     expected = re.findall(r"\w+", " ".join(final_text).lower())
     got = re.findall(r"\w+", " ".join(u.text for u in _replay("monologue")).lower())
