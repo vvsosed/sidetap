@@ -88,3 +88,18 @@ def test_full_synthesis_time_is_recorded_but_not_counted_as_felt_latency():
     latency = Latency(asr_ms=100.0, mt_ms=50.0, tts_ms=200.0, tts_total_ms=2339.0)
     # total_ms is what the listener waited, not what synthesis cost.
     assert latency.total_ms == 350.0
+
+
+def test_a_unit_does_not_continue_by_default():
+    """FinalsOnlySegmenter emits whole utterances, so nothing follows them.
+
+    The flag is opt-in for exactly that reason: a segmenter that does not know
+    about speech runs cannot accidentally hold the duck closed.
+    """
+    result = AsrResult(
+        direction=Direction.IN, text="hi", is_final=True, t_start=1.0, t_end=2.0
+    )
+    assert Unit.from_result(result).continues is False
+    assert Unit(
+        direction=Direction.IN, text="hi", t_start=1.0, t_end=2.0, continues=True
+    ).continues is True

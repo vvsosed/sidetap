@@ -96,6 +96,12 @@ class Unit:
     text: str
     t_start: float
     t_end: float
+    # More of this speech run is on its way: a committed clause that is not
+    # the end of its utterance. Playout uses it to keep the duck closed across
+    # the gap before the next clause, rather than reading an empty queue as
+    # "the translation is over" and letting the original through mid-sentence.
+    # False for FinalsOnlySegmenter, which only ever emits whole utterances.
+    continues: bool = False
 
     @classmethod
     def from_result(cls, result: AsrResult) -> Unit:
