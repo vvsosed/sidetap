@@ -1,4 +1,7 @@
+import json
 import logging
+import re
+from pathlib import Path
 
 from sidetap.segment import FinalsOnlySegmenter, LocalAgreementSegmenter, _agreed, _tokens
 from sidetap.types import AsrResult, Direction
@@ -384,3 +387,100 @@ def test_an_ordinary_final_logs_no_revision(caplog):
     with caplog.at_level(logging.DEBUG):
         segmenter.feed(_final_result("что у нас есть, несколько задач.", 15.0))
     assert "revised" not in caplog.text
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "chirp_interims.json"
+
+
+def _capture(name):
+    for probe in json.loads(FIXTURE.read_text()):
+        if probe["name"] == name:
+            return probe["results"]
+    raise AssertionError(f"no {name!r} in the capture")
+
+
+def _replay(name):
+    segmenter = LocalAgreementSegmenter()
+    units = []
+    for row in _capture(name):
+        result = AsrResult(
+            direction=Direction.IN, text=row["text"], is_final=row["final"],
+            t_start=row["end_offset"], t_end=row["end_offset"],
+        )
+        units.extend(segmenter.feed(result))
+    return units
+
+
+def test_the_real_monologue_is_committed_in_pieces_instead_of_one_block():
+    """Today's behaviour on this capture is two units, 29.3 s apart.
+
+    Six is pinned rather than bounded: this capture is fixed, so the number is
+    a fact about it, and a range would hide a segmenter that started
+    committing twice as often or half as often.
+    """
+    units = _replay("monologue")
+    assert len(units) == 6
+    assert [u.continues for u in units] == [False, True, True, True, True, False]
+
+
+def test_the_real_capture_commits_nothing_the_final_contradicted():
+    """The measured justification for the "-2".
+
+    The final inserted "а" into "сверхурочно, результат", text that had already
+    appeared in one interim. One agreement would have spoken it. Two must not.
+    """
+    spoken = " ".join(u.text for u in _replay("monologue"))
+    assert "сверхурочно, результат" not in spoken
+
+
+def test_the_real_capture_survives_the_case_change():
+    """"Что" became "что" between two hypotheses whose words were identical.
+
+    A surface comparison finds a common prefix of zero here and commits
+    nothing for the entire monologue - so this is the test that fails if the
+    key ever stops being lowercased.
+    """
+    units = _replay("monologue")
+    assert "несколько важных задач" in " ".join(u.text for u in units)
+
+
+def test_the_real_capture_loses_no_words():
+    """Committing early must not drop or duplicate text."""
+    final_text = [r["text"] for r in _capture("monologue") if r["final"]]
+    expected = re.findall(r"\w+", " ".join(final_text).lower())
+    got = re.findall(r"\w+", " ".join(u.text for u in _replay("monologue")).lower())
+    assert got == expected
+
+
+def test_the_real_short_turns_commit_nothing_early():
+    """They produce no interims at all, so LocalAgreement-2 cannot engage.
+
+    This is what makes ordinary conversation byte-identical to today.
+    """
+    units = _replay("turns")
+    assert all(u.continues is False for u in units)
+    assert len(units) == 4
+
+
+def test_the_real_medium_utterance_commits_nothing_early():
+    """7.9 s produces one interim - not enough to agree with."""
+    units = _replay("medium")
+    assert [u.continues for u in units] == [False]
+
+
+def test_the_real_monologues_spans_match_the_measured_capture():
+    """The transcript's latency column is built from these spans.
+
+    Pinned to the six (t_start, t_end) pairs measured against this capture -
+    each interim's end_offset once the two hypotheses feeding a commit have
+    both arrived, and the closing final's end_offset for the last unit.
+    """
+    spans = [(u.t_start, u.t_end) for u in _replay("monologue")]
+    assert spans == [
+        (0.0, 6.04),
+        (6.04, 11.12),
+        (11.12, 16.12),
+        (16.12, 21.12),
+        (21.12, 26.12),
+        (26.12, 34.7),
+    ]
