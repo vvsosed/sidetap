@@ -336,6 +336,14 @@ as a style preference and this is not one.
   stripped only at a token's edges, because stripping it throughout would key
   `1.2` and `12` the same and commit a number the recogniser had not settled
   on. It picks the cut point; it never decides agreement.
+- **`MIN_ANCHOR = 8` (`segment.py`) is a safety floor, not a knob for
+  repeats.** `_overlap`'s third arm matches a tail of what was already spoken
+  ANYWHERE in the candidate and drops everything in front of it - what catches
+  Chirp re-windowing back past an utterance's first commit, which re-spoke 64
+  words on a real call. Lower the floor to catch shorter re-windows and an
+  ordinary phrase that recurs in new speech anchors instead, silently dropping
+  the new words before it; coincidental runs on that call reached 6 words. A
+  few repeated words from a re-window shorter than 8 are the intended cost.
 - **`Playout.expect_continuation` is the only thing keeping the duck shut
   between committed clauses, and it has its own deadline.** `tick()` opens the
   duck whenever the queue drains and nothing is starved, and "starved" means an

@@ -142,16 +142,54 @@ def _agreed(previous: list[tuple[str, str]], current: list[tuple[str, str]]) -> 
 _SPOKEN_LIMIT = 400
 
 
-def _overlap(spoken: list[tuple[str, str]], candidate: list[tuple[str, str]]) -> int:
-    """How many of the candidate's leading tokens the listener already heard.
+# The shortest run of already-spoken words the third arm of `_overlap` will
+# anchor on. It is the whole of that arm's safety argument, so read this
+# before moving it in either direction.
+#
+# The first two arms only ever skip text the listener heard, in the order they
+# heard it: a candidate opening on the tail of what was spoken, or lying
+# wholly inside it. The third matches a run ANYWHERE in the candidate and
+# drops everything in front of it, so a phrase that merely recurs in genuinely
+# new speech would anchor there and throw away the new words before it, with
+# nothing audible to say so.
+#
+# Measured, not chosen: every row of the real call's transcript, searched for
+# the speech emitted before it. Where the sharing was coincidental, the
+# longest shared run was 6 words (a speaker reusing a sentence frame with a
+# different verb), and the longest that was a TAIL of what had been spoken -
+# the only thing this arm matches - was 4 (a speaker quoting their own last
+# words back). The one genuine re-window matched 64. A second call over the
+# same material measured the same 6 and 4. Eight clears the longest
+# coincidence of any kind by two words and sits far below the re-window.
+#
+# Which way each error fails. Too LOW, and ordinary phrasing anchors: the new
+# speech in front of it is dropped silently, which is the worse failure - a
+# repeat is at least heard, where a drop exists only in the log. Too HIGH, and
+# a re-window re-covering fewer spoken words than this falls through to the
+# zero alignment and repeats them: audible, and bounded by this number. That
+# call had one such, over four spoken words, and this still repeats it - as
+# it must, since by length alone four words is a coincidence.
+MIN_ANCHOR = 8
 
-    The largest k for which the LAST k keys of `spoken` equal the FIRST k keys
-    of `candidate` - the candidate picking up where speech stopped. Content,
-    not position: Chirp re-windows its hypothesis mid-utterance, dropping
-    words off the front of what it reports, and any rule that slices by a
-    count re-emits whatever that shift exposes. On the first real call that
-    cost roughly 15% of everything the listener heard, in bursts of 50 to 110
-    words each.
+
+def _overlap(
+    spoken: list[tuple[str, str]], candidate: list[tuple[str, str]]
+) -> tuple[int, int]:
+    """How many of the candidate's leading tokens not to emit, and why.
+
+    Returns `(k, anchor)`; the caller emits `candidate[k:]`. `anchor` is 0
+    unless the third arm below decided k, and is then the length of the spoken
+    run it matched, with the `k - anchor` tokens in front of that run dropped.
+    k alone cannot tell a skip over words the listener heard from a drop of
+    words they may not have, and `_align` has to report the second.
+
+    First, the largest k for which the LAST k keys of `spoken` equal the FIRST
+    k keys of `candidate` - the candidate picking up where speech stopped.
+    Content, not position: Chirp re-windows its hypothesis mid-utterance,
+    dropping words off the front of what it reports, and any rule that slices
+    by a count re-emits whatever that shift exposes. On the first real call
+    that cost roughly 15% of everything the listener heard, in bursts of 50 to
+    110 words each.
 
     Maximal, so of several possible anchors the LAST one wins. That is the
     direction to fail in: too large a k drops words that were new, too small a
@@ -159,7 +197,7 @@ def _overlap(spoken: list[tuple[str, str]], candidate: list[tuple[str, str]]) ->
     word back. "and then, and then" anchors on the second "and then" and loses
     nothing, because the first is inside the overlap either way.
 
-    The trailing containment check covers the other shape the real call
+    Second, the containment check covers the other shape the real call
     produced: a hypothesis that SHRANK, so the candidate is a run from the
     middle of what was already spoken rather than a continuation of its end.
     Nothing in it is new, so nothing may be emitted - without this the
@@ -168,19 +206,69 @@ def _overlap(spoken: list[tuple[str, str]], candidate: list[tuple[str, str]]) ->
     speaker who repeats a whole phrase verbatim and has it interpreted once;
     that is cheap next to what it prevents, and it can only ever suppress
     words the listener has already heard in that same order.
+
+    Third, and only when both of those find nothing: the longest TAIL of
+    `spoken`, at least MIN_ANCHOR tokens, found anywhere in the candidate, with
+    k just past it (`_anchor`). That is a re-window reaching the other way,
+    back past where the spoken text began. On the call after the fix above,
+    almost all the repeated speech left was one final that opened with three
+    words from before the utterance's first commit and then carried all 64
+    words already spoken: it neither began with a tail of `spoken` nor fitted
+    inside it, so both arms above returned 0 and all 101 words went out again.
+    This arm returns 67 there and emits the 34 that are new. It is the only
+    arm that can drop words the listener never heard, which is why it alone
+    has a floor.
     """
     spoken_keys = [key for _, key in spoken]
     candidate_keys = [key for _, key in candidate]
     for k in range(min(len(spoken_keys), len(candidate_keys)), 0, -1):
         if spoken_keys[len(spoken_keys) - k :] == candidate_keys[:k]:
-            return k
+            return k, 0
     width = len(candidate_keys)
     if width and any(
         spoken_keys[i : i + width] == candidate_keys
         for i in range(len(spoken_keys) - width + 1)
     ):
-        return width
-    return 0
+        return width, 0
+    return _anchor(spoken_keys, candidate_keys)
+
+
+def _anchor(spoken_keys: list[str], candidate_keys: list[str]) -> tuple[int, int]:
+    """`_overlap`'s third arm, as `(k, anchor)`, or `(0, 0)` if it finds nothing.
+
+    Longest first: the run is the longest tail of `spoken_keys` occurring
+    contiguously in the candidate, so a genuine re-window is matched over its
+    whole length rather than on some shorter tail of it that recurs later in
+    new speech.
+
+    Called only once the first arm has failed, so it never matches at index 0:
+    a tail found there would be a prefix of the candidate, which that arm
+    already tried. Every match here therefore has at least one dropped token
+    in front of it - the thing `_align` reports.
+    """
+    end, length = 0, 0
+    # Right to left, replacing only on a STRICTLY longer run, so of two equally
+    # long occurrences the LATER one wins. Both copies are word for word the
+    # last `length` words the listener heard, at least MIN_ANCHOR of them:
+    # anchoring on the earlier copy emits the later one, which is the repeat
+    # this arm exists to stop. The later copy costs the words between the two
+    # only if the speaker really said that same run twice inside one
+    # hypothesis - the price the containment arm already pays for a verbatim
+    # repeat, and the same maximal choice the first arm makes.
+    for stop in range(len(candidate_keys), 0, -1):
+        # How far back from `stop` the candidate matches the END of what was
+        # spoken. Walking back from each position, rather than trying every
+        # tail length against every position, keeps this linear in the
+        # candidate for ordinary text: most positions mismatch at once.
+        run = 0
+        reach = min(len(spoken_keys), stop)
+        while run < reach and spoken_keys[-1 - run] == candidate_keys[stop - 1 - run]:
+            run += 1
+        if run > length:
+            end, length = stop, run
+    if length < MIN_ANCHOR:
+        return 0, 0
+    return end, length
 
 
 class FinalsOnlySegmenter:
@@ -250,19 +338,51 @@ class LocalAgreementSegmenter:
         of the same defect went unnoticed for exactly that long.
         """
         spoken = self._spoken
-        k = _overlap(spoken, candidate)
+        k, anchor = _overlap(spoken, candidate)
         if not spoken or not candidate:
             # Nothing spoken yet is the ordinary start of an utterance, and an
             # empty candidate is an empty final. Neither is a revision, and a
             # signal that fires when nothing went wrong is not a signal.
             return k
-        if k == 0:
+        if anchor:
+            # Tested first, because k here says nothing about how much of
+            # `spoken` aligned - it counts dropped words too, and can exceed
+            # len(spoken) - so the "revised" branch below would misreport it.
+            #
+            # Warning, like the zero alignment below and for the mirror-image
+            # reason: this is the one outcome that throws recognised words
+            # away. On a genuine re-window they come from before the run the
+            # listener just heard, and dropping them is right; on a false
+            # anchor they are new speech, and nothing else will ever say so,
+            # because nobody notices a word that was never played. The two
+            # numbers are how the cases get told apart after the call: a run
+            # far above MIN_ANCHOR with a few words dropped is a re-window, one
+            # near MIN_ANCHOR with a clause dropped needs checking against the
+            # transcript. Not debug, which the session log does not record
+            # without -v, and not info: MIN_ANCHOR rests on measurements of
+            # one speaker's material, the next call is where it is confirmed
+            # or refuted, and it has to surface in the same grep for WARNING
+            # that found the event it replaces. One re-windowed hypothesis can
+            # log this once per interim until its final, since the dropped
+            # words never join `_spoken`; the same dropped count on
+            # consecutive lines is one event, not several.
+            log.warning(
+                "%s: %s dropped %d leading word(s) in front of a run of %d "
+                "already spoken (a re-windowed or revised hypothesis); "
+                "emitting only what follows the run",
+                direction.value,
+                stage,
+                k - anchor,
+                anchor,
+            )
+        elif k == 0:
             # Warning: this is the one outcome that can still put a repeat in
             # the listener's ear. A stream restart lands here and is harmless
             # (nothing of the old utterance is in this text), but so does a
-            # wholesale revision, and then everything emitted below re-covers
-            # ground already spoken. Nothing in the AsrResult tells the two
-            # apart - timestamps stay monotonic across a rotation by
+            # wholesale revision, and so does a re-window that re-covers fewer
+            # than MIN_ANCHOR spoken words; then everything emitted below
+            # re-covers ground already spoken. Nothing in the AsrResult tells
+            # these apart - timestamps stay monotonic across a rotation by
             # construction - so the log is the only evidence the ear-witness
             # in manual-smoke.md will ever have.
             log.warning(
@@ -334,6 +454,11 @@ class LocalAgreementSegmenter:
             return []
 
         if spoken_before and not aligned:
+            # Only a ZERO alignment resets. A non-zero one from `_overlap`'s
+            # anchored arm, however many words it dropped in front, still
+            # emits what follows the run already spoken, so it continues that
+            # run and chains from it like any other.
+            #
             # Nothing of this candidate continues what was spoken (the
             # alignment came back zero), so the span watermark - which
             # describes the end of that spoken text - does not describe this
@@ -425,6 +550,13 @@ class LocalAgreementSegmenter:
         # already spoken chains from it; a zero alignment means this text
         # continues nothing, whether because the utterance is untouched or
         # because the stream restarted under it.
+        #
+        # A final the anchored arm aligned past prepended words chains too,
+        # and should: the remainder follows the spoken run, so it continues
+        # the pieces before it exactly as a final aligned on its first word
+        # would. Dating it result.t_start instead - what the zero alignment
+        # did on the real call - gives a remainder spoken over the last few
+        # seconds a zero-length span at the final's end.
         t_start = self._span_start if aligned else result.t_start
         return [
             self._emit(

@@ -173,7 +173,20 @@ pausing. Nothing in the test suite can reach any of it.
       the N already spoken") the one case where a repeat can still reach the
       ear. Grep the session log for that line after any long monologue: with
       no warnings and a repeat audible, the alignment is wrong; with warnings
-      and no repeat, a stream restarted, which is benign.
+      and no repeat, a stream restarted, which is benign. A repeat of a few
+      words under that warning is expected too: a re-window over fewer than
+      `MIN_ANCHOR` (8) spoken words is repeated by design.
+- [ ] **Nothing new is dropped, and the log says what was.** When a hypothesis
+      re-windows back past where the spoken text began, `segment.py` anchors
+      on the spoken run inside it and drops the words in front, logging at
+      **warning** ("dropped N leading word(s) in front of a run of M already
+      spoken"). This is the one path that can lose speech rather than repeat
+      it, and nobody hears a word that was never played, so check each line
+      against the transcript: the N dropped words should be ones from before
+      the run, not new speech. M far above 8 with N small is a real
+      re-window; M near 8 with a clause dropped is a false anchor, and means
+      `MIN_ANCHOR` is too low. The same N on consecutive lines is one
+      re-window, logged again at each interim until its final.
 - [ ] **The end of a monologue releases the duck promptly.** When the speaker
       stops, the original should become audible again within a second or so -
       not after the 2 s bound, which would mean the final never cleared the

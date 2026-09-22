@@ -317,10 +317,37 @@ trimmed from the front, because the search is quadratic and an utterance on a
 stream that never finalises is unbounded; 400 is nearly six times the largest
 overlap ever measured (69). Cost, stated because it is real: an edit INSIDE
 the spoken text - a word substituted, not appended - breaks the alignment to
-zero and the final goes out whole, where the count rule emitted only the tail.
-That is logged at `warning` and is the one shape where the old rule did
-better; the shape that actually happens on a real call is the re-window, and
-it is the opposite way round.
+zero and the final goes out whole, where the count rule emitted only the tail,
+unless at least `MIN_ANCHOR` unchanged spoken words follow the edit (see the
+third arm, below). That is logged at `warning` and is the one shape where the
+old rule did better; the shape that actually happens on a real call is the
+re-window, and it is the opposite way round.
+
+**A third arm, from the next real call: a re-window reaching BACK.** Repeated
+speech fell from 15% to 5%, and almost all of what was left was one final that
+opened with three words from before the utterance's first commit, then carried
+all 64 words already spoken, then 34 new ones. It neither starts with a tail of
+`_spoken` nor fits inside it, so both arms above returned 0 and all 101 words
+went out again. `_overlap` now tries a third arm when the first two find
+nothing: the longest tail of `_spoken` found ANYWHERE in the candidate, with k
+just past it. On that final it returns 67 and emits the 34. Of two equally
+long copies of the run the later wins, since anchoring on the earlier one
+would emit the later - word for word what was just heard.
+
+Matching anywhere is what makes this arm dangerous where the first two are
+not: a phrase that merely recurs in new speech would anchor there and drop
+the new speech in front of it, silently. So the run must be at least
+`MIN_ANCHOR = 8` words, a measured number: on that call, coincidental runs of
+earlier speech inside later results reached 6 words (a sentence frame reused
+with a different verb), and only 4 as a tail of what was spoken, which is all
+the arm matches; the genuine re-window was 64. Too low drops new speech
+without a sound, the worse failure; too high lets a short re-window repeat a
+few words - that call had one over four spoken words, which is still
+repeated. The arm logs at `warning` with the dropped count and the run
+length, because it is the one path that throws recognised words away and
+those two numbers are how a correct anchor is told from a false one after the
+call. A non-zero anchored alignment chains the span like any other: what it
+emits follows the run already spoken.
 
 **Superseded, and kept for the reasoning: recovery from a stream restart
 mid-utterance.**

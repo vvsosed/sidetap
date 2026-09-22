@@ -7,9 +7,11 @@ import pytest
 
 from sidetap.segment import (
     _SPOKEN_LIMIT,
+    MIN_ANCHOR,
     FinalsOnlySegmenter,
     LocalAgreementSegmenter,
     _agreed,
+    _overlap,
     _tokens,
 )
 from sidetap.types import AsrResult, Direction
@@ -735,6 +737,254 @@ def test_the_spoken_window_is_capped_and_keeps_the_newest_words():
     assert len(segmenter._spoken) == _SPOKEN_LIMIT
     assert [key for _, key in segmenter._spoken[:1]] == ["w600"]
     assert [key for _, key in segmenter._spoken[-1:]] == ["w999"]
+
+
+# --- LocalAgreementSegmenter: a re-window reaching back past what was spoken -
+
+# The wording in this section is its own. The real call these shapes come from
+# was someone else's lecture, and that transcript is not in this repository.
+
+_RIVER = "the river rises every spring, so the farmers move their herds uphill,"
+
+
+def _speak_the_river(segmenter):
+    """Commit `_RIVER`'s twelve words in two pieces, spans (0, 5) and (5, 10).
+
+    Ending on a boundary keeps the cut from holding any of it back, so what is
+    in `_spoken` afterwards is exactly those twelve words.
+    """
+    segmenter.feed(_interim("the river rises every spring, so the farmers move", 5.0))
+    first = segmenter.feed(_interim(_RIVER, 10.0))
+    second = segmenter.feed(_interim(_RIVER + " before the", 15.0))
+    assert [u.text for u in first + second] == [
+        "the river rises every spring,",
+        "so the farmers move their herds uphill,",
+    ]
+
+
+def test_a_final_that_prepends_words_before_the_spoken_run_emits_only_the_new_tail(
+    caplog,
+):
+    """The event behind almost all the repeats left after content alignment.
+
+    Chirp's final opened with words from BEFORE the utterance's first commit
+    and then carried everything already spoken. It neither starts with a tail
+    of what was spoken nor fits inside it, so the first two arms of `_overlap`
+    both return 0 and, before the anchored arm, the whole final went out
+    again. On the real call: 64 words spoken in four pieces, 3 prepended, a
+    101-word final, and 34 of those words new - `_overlap` returned 0 and all
+    101 were spoken, 64 of them a second time. The anchored arm returns 67
+    there and emits the 34. Scaled down here: 12 spoken, 3 prepended, a
+    22-word final, 7 new.
+
+    The warning is asserted with its numbers because it is what the next real
+    call will be judged by: the dropped count and the run length are the only
+    way to tell a genuine re-window from a false anchor after the fact.
+    """
+    segmenter = LocalAgreementSegmenter()
+    _speak_the_river(segmenter)
+
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(
+            _final_result(
+                "as noted earlier. The river rises every spring, so the farmers "
+                "move their herds uphill, before the water reaches the lower "
+                "fields.",
+                20.0,
+            )
+        )
+    assert [u.text for u in units] == ["before the water reaches the lower fields."]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "dropped 3 leading word(s) in front of a run of 12" in caplog.text
+
+
+def test_an_anchored_final_chains_its_span_from_the_pieces_before_it():
+    """Chaining is right here, not a leftover of the stream-restart case.
+
+    What the final emits FOLLOWS the run already spoken, so it continues the
+    pieces before it exactly as a final aligned on its first word would, and
+    its span starts where the last piece ended. Under the zero alignment the
+    real call's final went out whole with a zero-length span at its own end;
+    anchored, its 34 new words chain from the last piece, nine seconds
+    earlier, which is when they began to be spoken.
+    """
+    segmenter = LocalAgreementSegmenter()
+    _speak_the_river(segmenter)
+
+    unit = segmenter.feed(
+        _final_result(
+            "as noted earlier. "
+            + _RIVER
+            + " before the water reaches the lower fields.",
+            20.0,
+        )
+    )[0]
+    assert (unit.t_start, unit.t_end) == (10.0, 20.0)
+    assert unit.continues is False
+
+
+def test_an_anchored_interim_chains_its_span_and_the_final_after_it_does_too(caplog):
+    """The interim half: only a ZERO alignment resets the span watermark.
+
+    The anchored arm's k (15 here) counts the prepended words as well as the
+    twelve spoken, so it is larger than `_spoken` - nothing may read that as
+    anything but "skip this many". The interim emits only the growth past the
+    run, chained from the last piece's end; the final after it re-anchors on
+    the fifteen words now spoken and emits only its own tail.
+
+    The dropped words never join `_spoken`, so the same re-window logs again
+    at the final, with the same dropped count and a longer run. That is how
+    one event reads in the log - the count repeating, not the line count.
+    """
+    prepended = "as noted earlier. " + _RIVER
+    segmenter = LocalAgreementSegmenter()
+    _speak_the_river(segmenter)
+
+    # The hypothesis re-windows back past the first commit and stays there, so
+    # it takes two interims before the re-windowed text agrees with itself.
+    assert segmenter.feed(_interim(prepended + " before the water", 20.0)) == []
+    interim = segmenter.feed(_interim(prepended + " before the water reaches", 25.0))
+    assert [(u.text, u.t_start, u.t_end) for u in interim] == [
+        ("before the water", 10.0, 20.0)
+    ]
+
+    with caplog.at_level(logging.DEBUG):
+        final = segmenter.feed(
+            _final_result(
+                prepended + " before the water reaches the lower fields.", 30.0
+            )
+        )
+    assert [(u.text, u.t_start, u.t_end) for u in final] == [
+        ("reaches the lower fields.", 20.0, 30.0)
+    ]
+    assert "dropped 3 leading word(s) in front of a run of 15" in caplog.text
+
+
+def test_a_short_phrase_recurring_in_new_speech_does_not_anchor(caplog):
+    """Coincidental phrasing must never cost the new words in front of it.
+
+    On the real call the speaker reused a six-word sentence frame one sentence
+    later with a different verb - the longest coincidental run measured
+    anywhere on it. Here the frame sits at the END of what was spoken, which
+    is the only place the anchored arm can see it, and the new sentence
+    reuses it after a stream restart left the old text in `_spoken`. Anchored
+    on those six words, the arm would emit only "argue about it." and silently
+    drop the ten words before it, every one of them new speech; below
+    MIN_ANCHOR it does not, the alignment is zero, and the final goes out
+    whole with the usual warning.
+
+    Dropping is the worse failure of the two a threshold can make: a repeat is
+    at least heard, a drop is only in the log.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("a name for a colour gives us all a way to", 5.0))
+    committed = segmenter.feed(
+        _interim("a name for a colour gives us all a way to talk about it", 10.0)
+    )
+    assert [u.text for u in committed] == ["a name for a colour gives us all a way to"]
+
+    new_speech = "Knowing its name also gives us all a way to argue about it."
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(_final_result(new_speech, 240.0))
+    assert [u.text for u in units] == [new_speech]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "shares no words" in caplog.text
+
+
+def test_a_run_of_eight_spoken_words_anchors_and_seven_does_not():
+    """The boundary, in literal lengths rather than MIN_ANCHOR arithmetic.
+
+    Literal on purpose: the threshold is a measurement (see MIN_ANCHOR's
+    comment), and a test that followed the constant would let it move
+    without anyone re-reading why it is 8. Both candidates open on words that
+    were never spoken, so only the anchored arm can align them at all.
+    """
+    spoken = _tokens("we walked along the canal as far as the old mill")
+
+    # "the canal as far as the old mill": the last 8 spoken, after "to" where
+    # the spoken text had "along".
+    eight = _tokens("down to the canal as far as the old mill and back")
+    assert _overlap(spoken, eight) == (10, 8)
+
+    # "canal as far as the old mill": the last 7, after "a" instead of "the".
+    seven = _tokens("down by a canal as far as the old mill and back")
+    assert _overlap(spoken, seven) == (0, 0)
+
+    # Last, so that moving the constant fails on the behaviour above first.
+    assert MIN_ANCHOR == 8
+
+
+def test_a_spoken_run_found_twice_anchors_on_the_later_copy():
+    """Of two equally long copies of the run, the later one wins.
+
+    Both copies are word for word the last eleven words the listener heard.
+    Anchoring on the earlier copy emits the later one - eleven words spoken
+    twice, the repeat the anchored arm exists to stop. The later copy costs
+    the words between the two only if the speaker really did say the same run
+    twice inside one hypothesis, which is the price the containment arm
+    already pays for a verbatim repeat.
+    """
+    spoken = _tokens("we walked along the canal as far as the old mill")
+    candidate = _tokens(
+        "so we walked along the canal as far as the old mill "
+        "and then we walked along the canal as far as the old mill again"
+    )
+    assert _overlap(spoken, candidate) == (25, 11)
+
+
+def test_a_revision_inside_a_long_spoken_text_anchors_past_it(caplog):
+    """The anchored arm narrows a cost the content alignment used to pay.
+
+    A word substituted INSIDE the spoken text breaks both of the first two
+    arms, and before this arm the whole final went out again
+    (test_a_final_that_revises_inside_the_spoken_text_is_emitted_whole, which
+    still holds there: four spoken words are below MIN_ANCHOR). With at least
+    MIN_ANCHOR unchanged words after the substitution, the run after it
+    anchors and only the new tail is emitted.
+
+    The revision itself is not honoured - "rose" is dropped, the listener
+    having heard "rises" - which is what the count-based version did too, and
+    the only alternative is repeating the sentence.
+    """
+    segmenter = LocalAgreementSegmenter()
+    _speak_the_river(segmenter)
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(
+            _final_result(
+                "the river rose every spring, so the farmers move their herds "
+                "uphill, before the water reaches the lower fields.",
+                20.0,
+            )
+        )
+    assert [u.text for u in units] == ["before the water reaches the lower fields."]
+    assert "dropped 3 leading word(s) in front of a run of 9" in caplog.text
+
+
+def test_an_anchor_aligning_fewer_words_than_were_spoken_is_still_reported_as_a_drop(
+    caplog,
+):
+    """The anchored report must come before the "revised" one, not after it.
+
+    Here the hypothesis both re-windowed forward past "the river" and revised
+    the word before the run, so k (10) counts one dropped word plus a 9-word
+    run and comes out SMALLER than the 12 spoken. Checked in the other order,
+    that reads as "10 of 12 spoken word(s) still align" - nothing lost, at
+    debug, which the session log does not record - when a word has in fact
+    been thrown away.
+    """
+    segmenter = LocalAgreementSegmenter()
+    _speak_the_river(segmenter)
+    with caplog.at_level(logging.DEBUG):
+        units = segmenter.feed(
+            _final_result(
+                "rising every spring, so the farmers move their herds uphill, "
+                "before the water reaches the lower fields.",
+                20.0,
+            )
+        )
+    assert [u.text for u in units] == ["before the water reaches the lower fields."]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "dropped 1 leading word(s) in front of a run of 9" in caplog.text
 
 
 # --- replayed against the real Chirp capture (chirp_interims.json) -----------
