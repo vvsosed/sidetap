@@ -139,6 +139,40 @@ underrun is audible where the old 1.3 s buffer was merely slow.
       you still hear is the 441 ms experiment 2 measured already sitting
       inside pw-cat, which cannot be recalled.
 
+## Committing early (`LocalAgreementSegmenter`)
+
+Everything below needs someone willing to talk for half a minute without
+pausing. Nothing in the test suite can reach any of it.
+
+- [ ] **A monologue keeps being spoken, instead of stopping.** Have the other
+      party talk continuously for 30 s. The first sentence arrives at the same
+      time it always did - what should change is that translation keeps coming
+      every few seconds afterwards, rather than going silent until they stop
+      and then delivering a wall of speech. Compare directly against
+      `--no-early-commit`.
+- [ ] **The duck does not flap between clauses.** This is the check that
+      decides whether the feature ships on by default. Listen for the original
+      bleeding through *inside* the monologue, in the gap between one
+      committed clause and the next. It should not be audible at all. If it
+      is, `Playout.expect_continuation` is not being armed.
+- [ ] **Ordinary conversation is unchanged.** Normal turn-taking produces no
+      interim results, so nothing should sound or read differently from
+      before. If short sentences start arriving in fragments, the segmenter is
+      committing on one hypothesis instead of two.
+- [ ] **The transcript reads as clauses, not as a jumble.** A monologue should
+      render as several rows whose text joins back into the whole utterance,
+      with no word repeated and none missing. Word order across a clause
+      boundary is the quality cost the design named, and this is the only
+      place it can be judged.
+- [ ] **The end of a monologue releases the duck promptly.** When the speaker
+      stops, the original should become audible again within a second or so -
+      not after the 2 s bound, which would mean the final never cleared the
+      hold.
+- [ ] **A translator or synthesis failure mid-monologue does not silence the
+      call.** The duck must reopen within about two seconds of the last audio
+      actually played. If the far end goes quiet for longer than that, the
+      hold is being armed on a failure path.
+
 ## Lag and drops
 
 - [ ] Have the remote party talk continuously for two minutes.

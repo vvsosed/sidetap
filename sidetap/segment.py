@@ -1,15 +1,21 @@
 """The seam between recognition and translation.
 
 A Segmenter turns AsrResults into Units - the things worth paying to translate
-and speak. v1 ships FinalsOnlySegmenter, which waits for a complete utterance.
+and speak. Two ship: FinalsOnlySegmenter waits for a complete utterance,
+LocalAgreementSegmenter commits a stable prefix part-way through.
 
-The alternative this boundary exists for is LocalAgreement-2: commit the
-longest common prefix of two consecutive interim hypotheses, cut at clause
-boundaries, and start speaking while the other party is still talking. It buys
-roughly 0.5-1 s at the cost of more synthesis calls on shorter strings and
-awkward output where EN/RU word order diverges mid-clause. The spec's decision
-was to measure first - which is why every Unit carries a span the transcript
-turns into a latency figure.
+What LocalAgreement-2 buys here is NOT the "roughly 0.5-1 s on a normal
+sentence" the research describes, and an earlier version of this docstring
+claimed. Chirp emits no interim results at all for short turn-taking
+utterances (docs/experiments/06-interim-cadence.md), so there is nothing for a
+prefix comparison to work on and ordinary conversation is untouched. What it
+buys is the monologue: 34.8 s of continuous speech measured as one final after
+29.3 s of silence, which this turns into a commit roughly every 5 s.
+
+It is self-limiting with no constant to tune. Interims arrive once per 5 s of
+sent audio, so two agreeing hypotheses need ~11 s of continuous speech; below
+that both classes behave identically. Do not add a length threshold - it would
+be a second, worse copy of a bound the API already imposes.
 """
 
 from __future__ import annotations
