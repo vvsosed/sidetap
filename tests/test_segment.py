@@ -280,8 +280,13 @@ def test_one_interim_after_a_final_commits_nothing():
     """A new utterance starts from nothing agreed, like any other.
 
     This does NOT prove the committed list was reset - one interim cannot,
-    because the previous-hypothesis reset alone forces the same answer. See
-    test_a_new_utterance_is_not_offset_by_the_last_one, which feeds two.
+    because the previous-hypothesis reset alone forces the same answer. Nor
+    does test_a_new_utterance_is_not_offset_by_the_last_one, despite feeding
+    two - its new utterance shares no vocabulary with the old commit, so
+    _interim's own stale-commit discard covers for a missing reset there too.
+    What actually pins the reset is
+    test_a_final_resets_the_committed_state_even_when_the_next_utterance_overlaps,
+    which defeats that discard on purpose.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
@@ -327,11 +332,20 @@ def test_a_final_that_revises_committed_text_emits_from_the_commit_point():
 
 
 def test_a_new_utterance_is_not_offset_by_the_last_one():
-    """Two interims after the final, not one - one cannot see the leak.
+    """Two interims after the final, not one - one interim proves nothing.
 
-    Without the reset, the stale committed count offsets the new utterance's
-    growth slice and silently eats its opening words. One interim hides it,
-    because the first interim of any utterance commits nothing anyway.
+    This is not the reset-in-_finalise regression test it looks like. The new
+    utterance ("совсем другое...") shares no leading word with the old commit
+    ("что у нас есть,..."), so _interim's own stale-commit discard (agreement
+    == 0 against self._committed, added in a later commit than this test)
+    would clean up a missing _finalise reset on its own - confirmed by
+    mutation-testing this test against that exact removal, which it does not
+    catch. What this test actually pins is narrower: that an unrelated new
+    utterance is not offset, one interim hides nothing because the first
+    interim of any utterance commits nothing anyway. See
+    test_a_final_resets_the_committed_state_even_when_the_next_utterance_overlaps
+    for the case _interim's discard cannot cover, where the reset is load-
+    bearing.
     """
     segmenter = LocalAgreementSegmenter()
     segmenter.feed(_interim("что у нас есть,", 5.0))
@@ -341,6 +355,34 @@ def test_a_new_utterance_is_not_offset_by_the_last_one():
     segmenter.feed(_interim("совсем другое, но нужно", 20.0))
     units = segmenter.feed(_interim("совсем другое, но нужно сказать", 25.0))
     assert [u.text for u in units] == ["совсем другое,"]
+
+
+def test_a_final_resets_the_committed_state_even_when_the_next_utterance_overlaps():
+    """The reset in _finalise, pinned where _interim cannot cover for it.
+
+    _interim's stale-commit discard only fires on ZERO agreement with the old
+    commit. A new utterance that happens to open with the same word as the
+    one just committed ("что", below) slips past that guard, so only
+    _finalise's own `self._committed = []` stands between this and a growth
+    slice offset by the stale commit's length.
+
+    Without the reset: after committing 4 words ("что у нас есть,"), the new
+    utterance's two interims agree on 5 words - more than the stale count -
+    so `growth = current[len(self._committed):agreed]` slices from index 4,
+    keeping only the new utterance's 5th word and silently dropping its own
+    first four ("что случилось вчера вечером"). With the reset, the slice
+    starts from 0 and the new utterance commits its own opening whole.
+    """
+    segmenter = LocalAgreementSegmenter()
+    segmenter.feed(_interim("что у нас есть,", 5.0))
+    segmenter.feed(_interim("что у нас есть, ладно", 10.0))
+    segmenter.feed(_final_result("что у нас есть, всё.", 15.0))
+
+    segmenter.feed(_interim("что случилось вчера вечером дома", 20.0))
+    units = segmenter.feed(
+        _interim("что случилось вчера вечером дома, кажется", 25.0)
+    )
+    assert [u.text for u in units] == ["что случилось вчера вечером дома,"]
 
 
 def test_a_final_that_emits_nothing_still_advances_the_span():
