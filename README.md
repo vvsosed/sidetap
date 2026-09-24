@@ -7,7 +7,7 @@ language and you hear yours; you speak yours and they hear theirs. Neither
 side installs anything or changes platform.
 
 It is a cascaded pipeline run twice, once per direction, entirely on Google
-Cloud: Speech-to-Text v2 (Chirp 3, streaming) → Cloud Translation v3 →
+Cloud: Speech-to-Text v2 (`chirp_2`, streaming) → Cloud Translation v3 →
 Text-to-Speech (Chirp 3 HD, streaming synthesis).
 
 ## Why PipeWire
@@ -298,7 +298,7 @@ aspirational TODOs.
   automatically on error, and `--mt-model general/nmt` switches it by hand.
 - **Felt latency is dominated by ASR and MT, not synthesis.** The same wait
   for a finalised result that sets the cadence above also sets the latency
-  floor: nothing downstream of recognition starts until Chirp 3 declares a
+  floor: nothing downstream of recognition starts until Chirp declares a
   result final. Synthesis itself is not the bottleneck —
   `DirectionPipeline._speak` already starts playout at time-to-first-chunk
   rather than the whole utterance (271 ms saved on a short sentence, 2109 ms

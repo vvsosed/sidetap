@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 sidetap is a real-time two-way voice interpreter for any call on Linux —
 Zoom, Viber, Telegram, Discord, Slack huddles — built by tapping **PipeWire**
 instead of integrating with each platform's API. It runs a cascaded pipeline
-twice, once per direction: Speech-to-Text v2 (Chirp 3, streaming) → Cloud
+twice, once per direction: Speech-to-Text v2 (`chirp_2`, streaming) → Cloud
 Translation v3 → Text-to-Speech (Chirp 3 HD, streaming synthesis). Routing is
 **full replacement** — each party hears only the translation, never the
 original and the translation at once — so pipeline health is not a diagnostic
@@ -15,7 +15,7 @@ detail, it is the only thing standing between the conversation and silence.
 
 sidetap started from `meetscribe` (a call transcriber, same author): the
 input side — PipeWire graph parsing, the additive per-application tap,
-`pw-record` framing, VAD gating, stream rotation, Chirp 3 streaming
+`pw-record` framing, VAD gating, stream rotation, Chirp streaming
 recognition — was **ported**, copied and adapted with its tests, not
 imported. The two repositories share no runtime dependency.
 
@@ -150,7 +150,7 @@ second implementation.
 | `capture.py` | owns recorders, queues and capture threads |
 | `vad.py` | `SilenceGate` — drops silence, keeps a tail so utterances finalise |
 | `rotation.py` | `StreamClock`, `AudioTimeline` — offsets across rotated streams |
-| `asr.py` | Chirp 3 streaming recognition, `RecognitionWorker` |
+| `asr.py` | `chirp_2` streaming recognition, `RecognitionWorker` |
 | `segment.py` | the `Segmenter` seam; finals-only, or LocalAgreement-2 prefixes |
 | `translate.py` | Cloud Translation v3 adapter, NMT fallback |
 | `tts.py` | Chirp 3 HD streaming synthesis adapter |
@@ -210,7 +210,7 @@ as a style preference and this is not one.
   second case, which is the one that ends a call's recognition mid-way with a
   409 "stream timed out" and nothing forwarding it.
 - **Audio time is not elapsed time.** The silence gate drops blocks before
-  they are sent, so Chirp 3's `result_end_offset` is a position in the audio
+  they are sent, so Chirp's `result_end_offset` is a position in the audio
   actually sent, not real time. `AudioTimeline` (`rotation.py`) maps a sent
   position back to when it was captured by recording each sent block's real
   timestamp; `StreamClock`, which only adds a flat offset, must never be
@@ -271,7 +271,7 @@ as a style preference and this is not one.
   `routing.py`'s `_route_locked` for the full comment.
 - **`SILENCE_TAIL_BLOCKS = 5` and `aggressiveness = 2`** (`vad.py`) were
   inherited from meetscribe, a transcriber with no latency budget, and have
-  not been remeasured against Chirp 3 or against sidetap's two very different
+  not been remeasured against Chirp or against sidetap's two very different
   input signals (a raw mic vs. audio already processed by the far end). See
   `docs/manual-smoke.md`'s "Tuning constants that were inherited, not
   measured" before treating either as settled.
@@ -363,11 +363,18 @@ as a style preference and this is not one.
 
 ## Things that bite at runtime
 
-- **`europe-west3` works for Speech-to-Text but not for Cloud Translation.**
-  Translation accepts only `global` or `us-central1`. This is why `--region`,
-  `--mt-region` and `--tts-region` are three separate flags rather than one
-  shared `--region` — collapsing them back into one is a regression, not a
-  simplification. See `docs/experiments/03-translation-llm.md`.
+- **No two of the three services share a region.** `chirp_2` does not exist
+  in `europe-west3` (400 "does not exist in this location"), so `--region`
+  defaults to `europe-west4`; Cloud Translation accepts only `global` or
+  `us-central1`; and TTS has no Frankfurt single-region, so `--tts-region`
+  uses the `eu` multi-region. Three services, three different answers — which
+  is why `--region`, `--mt-region` and `--tts-region` are three separate flags
+  rather than one shared `--region`, and collapsing them back into one is a
+  regression, not a simplification. The tempting mistake is Frankfurt, because
+  it is nearest and `long` works there for `en-US` — and then returns 400 for
+  `ru-RU`, so it fails only once audio is already flowing. See `asr.py`'s
+  module docstring, which records the measured grid, and
+  `docs/experiments/03-translation-llm.md`.
 - **Headphones matter for the same reason they do in meetscribe:** without
   them your own speakers re-enter your microphone and get recognised as your
   own speech.
