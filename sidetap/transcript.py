@@ -23,7 +23,7 @@ def hhmmss(seconds: float) -> str:
 def record_to_dict(record: Record) -> dict:
     """One JSONL row.
 
-    NOTE: do NOT infer a duration from `t_end - t`. Chirp 3 gives no word
+    NOTE: do NOT infer a duration from `t_end - t`. Chirp gives no word
     timestamps in streaming mode (setting enable_word_time_offsets is a fatal
     InvalidArgument), so an utterance's only timestamp is its end offset, and
     the two fields mean different things depending on how the row was cut:

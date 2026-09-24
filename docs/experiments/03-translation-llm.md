@@ -107,3 +107,34 @@ near-indistinguishable ("Можно ли перенести" vs "Можем ли
 `TranslateConfig.model` default to `general/nmt` in Task 16 and note it in
 `README.md`. If it works but is more than ~150 ms slower than NMT, keep it
 anyway — the quality matters more at this granularity — but record the figure.
+
+## Addendum, 2026-09-24 — "STT stays on `europe-west3`" did not survive
+
+Consequence 1 above ends "STT stays on `europe-west3`", and the finding it
+rests on — that Speech-to-Text v2 *does* accept `europe-west3` — was true of
+the **API location** when it was measured, and is still true of the location.
+It stopped being true of sidetap three days later, and the sentence has been
+quietly wrong ever since.
+
+What changed is the model, not the region. Measured against the live API on
+2026-09-18 and recorded in `sidetap/asr.py`'s module docstring:
+
+    chirp_3  any region      -> 403 "no longer generally available"
+    chirp_2  europe-west3    -> 400 "does not exist in this location"
+    chirp_2  europe-west4    -> works, and is the closest region that does
+    long     europe-west3    -> works for en-US, but 400 for ru-RU
+
+Google withdrew Chirp 3 from general availability after this experiment ran.
+The replacement, `chirp_2`, is not served from Frankfurt at all, so `--region`
+defaults to `europe-west4` and the "STT stays on `europe-west3`" half of
+consequence 1 is void. What consequence 1 was actually *for* — that the two
+services need separate region settings — survives intact, and is now true for
+two unrelated reasons rather than one.
+
+This is worth stating rather than editing out, because the wrong half
+propagated: it reached `CLAUDE.md` as "`europe-west3` works for Speech-to-Text"
+and `translate.py` as "STT does accept europe-west3", and both read as
+permission to do the one thing `asr.py` warns against. Frankfurt is the
+tempting mistake — it is nearest, and `long` works there for `en-US` before
+returning 400 for `ru-RU`, so it fails only once audio is already flowing.
+Both have been corrected.

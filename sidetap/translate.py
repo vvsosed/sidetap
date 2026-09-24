@@ -94,9 +94,12 @@ def short_code(language_code: str) -> str:
 class TranslateConfig:
     project_id: str
     # NOT europe-west3. Cloud Translation rejects it outright ("Must be
-    # 'us-central1' or 'global'") - measured, not guessed. STT does accept
-    # europe-west3, which is why these are separate settings rather than one
-    # shared region. See docs/experiments/03-translation-llm.md.
+    # 'us-central1' or 'global'") - measured, not guessed. STT cannot use it
+    # either, for a different reason: chirp_2 does not exist there (see
+    # asr.py), so --region is europe-west4. Two services, two unrelated
+    # answers, which is why these are separate settings rather than one
+    # shared region. See docs/experiments/03-translation-llm.md and its
+    # addendum.
     region: str = "global"
     model: str = TRANSLATION_LLM_MODEL
 

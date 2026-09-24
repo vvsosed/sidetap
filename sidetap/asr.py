@@ -92,7 +92,7 @@ class SessionTime(Protocol):
       AudioTimeline.absolute() indexes into the recorded capture time of each
                                block actually sent.
 
-    Chirp 3's result_end_offset is a position in the audio we SENT, and the
+    Chirp's result_end_offset is a position in the audio we SENT, and the
     silence gate drops blocks before sending - so in any real conversation
     that position is not elapsed time. Only AudioTimeline compensates for the
     gap. Passing a StreamClock here would understate every timestamp by
@@ -132,7 +132,7 @@ def result_from_response(response_result, clock: SessionTime, direction: Directi
         direction=direction,
         text=text,
         is_final=bool(response_result.is_final),
-        # Chirp 3 gives no word timings in streaming mode, so the utterance's
+        # Chirp gives no word timings in streaming mode, so the utterance's
         # end offset is the only timestamp there is.
         t_start=end,
         t_end=end,
@@ -367,7 +367,7 @@ class GoogleRecognizer:
             # ambiguity about which way to translate.
             language_codes=[self._config.language_code],
             model=self._config.model,
-            # No enable_word_time_offsets: Chirp 3 rejects it outright in
+            # No enable_word_time_offsets: Chirp rejects it outright in
             # streaming mode, a fatal InvalidArgument that ends the run before
             # a single word is transcribed.
             features=cs.RecognitionFeatures(enable_automatic_punctuation=True),
