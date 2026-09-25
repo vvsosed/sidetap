@@ -1,13 +1,10 @@
 """Real implementations of every port except Recognizer.
 
-Every subprocess on the *audio path* is started here, behind a port, which is
-what lets the rest of the package be tested against fakes with no hardware.
-
-Two modules deliberately step outside that: `recorder.py`, which owns the
-pw-record lifecycle it was split out to manage, and `doctor.py`, which probes
-the environment before any port exists to inject. Neither is on the audio path,
-and both are reached only from a command the user ran explicitly. Anything that
-moves audio belongs here.
+Every subprocess on the audio path starts here, behind a port, so the rest of
+the package can be tested against fakes with no hardware. The deliberate
+exceptions are `recorder.py`, which owns pw-record's lifecycle, and
+`doctor.py`, which probes the environment before any port exists; neither is
+on the audio path.
 """
 
 from __future__ import annotations
@@ -39,10 +36,8 @@ INSTALL_HINT = (
 MIN_PW_VERSION = (0, 3, 60)
 STDERR_TAIL_BYTES = 8192
 LINK_TIMEOUT_S = 5
-# Not LINK_TIMEOUT_S. This runs synchronously on the playout thread, the same
-# one feeding pw-cat's stdin, so a stall here freezes audio output rather than
-# merely delaying a link. Better to give up on the duck than to glitch the
-# call.
+# Shorter than LINK_TIMEOUT_S: this runs on the playout thread, so a stall
+# freezes audio output. Better to lose the duck than glitch the call.
 VOLUME_TIMEOUT_S = 0.3
 
 
@@ -69,12 +64,9 @@ def classify_link_output(returncode: int, stderr: str) -> LinkResult:
     if returncode == 0:
         return LinkResult.LINKED
     lowered = stderr.lower()
-    # "File exists" means we already linked this pair. "No such link" comes
-    # back from `pw-link -d` when the link is already gone. Both describe the
-    # desired end state holding, so neither is a failure.
-    # Matching "no such link" specifically (not a bare "no such") keeps a
-    # real failure like "No such port" - linking to a port that does not
-    # exist - from being absorbed as a no-op too.
+    # "File exists" (already linked) and "No such link" (`pw-link -d` on a link
+    # already gone) both mean the desired state holds. Matching "no such link"
+    # exactly keeps a real failure like "No such port" from passing as a no-op.
     if "exists" in lowered or "no such link" in lowered:
         return LinkResult.ALREADY_LINKED
     return LinkResult.FAILED
@@ -146,11 +138,9 @@ class PopenWriter:
             self._process.stdin.close()
         except (OSError, ValueError, AttributeError):
             pass
-        # Closing stdin alone is a polite EOF: a well-behaved pw-cat drains
-        # its buffer and exits on its own (observed ~0.4s). Give it a real
-        # chance to do that before escalating - without this wait, the
-        # killpg below fires within milliseconds, every time, and anything
-        # still buffered is cut off rather than played out.
+        # Closing stdin is a polite EOF: a well-behaved pw-cat drains its
+        # buffer and exits (~0.4 s). Wait for that before escalating, or
+        # anything still buffered is cut off.
         try:
             self._process.wait(timeout=0.5)
             return
@@ -176,12 +166,10 @@ class PopenWriter:
 class SubprocessLauncher:
     def spawn(self, argv: Sequence[str]) -> PopenProcess:
         resolved = [require_tool(argv[0]), *argv[1:]]
-        # stderr goes to a temp file, never a pipe. Nothing reads a pipe until
-        # the process has already exited, so a chatty pw-record - an inherited
-        # PIPEWIRE_DEBUG is enough - fills the 64 KB buffer and blocks forever
-        # on write. That stalls stdout too, since it blocks in the same call
-        # stack, so capture goes silent with poll() still returning None and
-        # even the dead-track check never fires.
+        # stderr goes to a temp file, never a pipe: nothing reads a pipe until
+        # exit, so a chatty pw-record (an inherited PIPEWIRE_DEBUG will do)
+        # fills it and blocks, stalling stdout while poll() still reports the
+        # process alive.
         stderr_file = tempfile.TemporaryFile()
         process = subprocess.Popen(
             resolved,
@@ -194,9 +182,7 @@ class SubprocessLauncher:
 
     def spawn_writer(self, argv: Sequence[str]) -> PopenWriter:
         resolved = [require_tool(argv[0]), *argv[1:]]
-        # Same reasoning as spawn(): stderr to a temp file, never a pipe. A
-        # chatty pw-cat filling a 64 KB pipe buffer would block on write and
-        # stall playout with poll() still returning None.
+        # stderr to a temp file, never a pipe, for the same reason as spawn().
         stderr_file = tempfile.TemporaryFile()
         process = subprocess.Popen(
             resolved,
@@ -218,8 +204,8 @@ class PwLinkLinker:
                 timeout=LINK_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired:
-            # Called inside AppTap's poll loop; a hang here would stall the
-            # watcher for the rest of the meeting.
+            # Called from poll loops; a hang would stall the watcher for the
+            # rest of the call.
             return LinkResult.FAILED
         return classify_link_output(result.returncode, result.stderr or "")
 
@@ -265,29 +251,20 @@ PW_LOOPBACK = "pw-loopback"
 WPCTL = "wpctl"
 
 
-# 16 KiB of stdin pipe plus a 20 ms node latency. MEASURED, not guessed.
+# A 16 KiB stdin pipe plus a 20 ms node latency, measured.
 #
-# Playout writes silence continuously between utterances, so whatever the pipe
-# holds sits AHEAD of every real utterance. At the default 64 KiB that is over
-# a second of queued silence added to glass-to-glass latency.
-#
+# Playout writes silence between utterances, so whatever the pipe holds sits
+# ahead of every utterance; the default 64 KiB adds over a second of latency.
 # Steady-state buffering, three 12 s runs each at 24 kHz:
 #
-#     8 KiB  (171 ms cap)   -57, +129, +139 ms   <- starves; the negative run
-#                                                   means the writer fell
-#                                                   behind and the buffer ran
-#                                                   dry, which is audible
+#     8 KiB  (171 ms cap)   -57, +129, +139 ms   <- runs dry: audible underruns
 #    16 KiB  (341 ms cap)  +299, +299, +299 ms   <- chosen: zero variance
 #    32 KiB  (683 ms cap)  +609, +609, +609 ms
 #    64 KiB (1365 ms cap) +1259,+1259,+1249 ms   <- the default
 #
-# So this buys about 960 ms. 8 KiB's lower median is not worth a buffer that
-# demonstrably runs dry - underruns crackle, and a crackle is worse than
-# 300 ms.
-#
-# --latency alone does nothing: at the default pipe size it measured 1180 ms,
-# because the OS pipe is the buffer, not pw-cat's node latency. Both are
-# needed. See docs/experiments/02-pwcat-playback.md.
+# --latency alone does nothing (1180 ms at the default pipe size), because the
+# OS pipe is the buffer. Both are needed; see
+# docs/experiments/02-pwcat-playback.md.
 PIPE_BYTES = 16384
 PW_CAT_LATENCY = "20ms"
 F_SETPIPE_SZ = 1031
@@ -296,8 +273,8 @@ F_SETPIPE_SZ = 1031
 def pwcat_argv(*, target: int | None, rate: int) -> list[str]:
     """One long-lived playback process, fed raw PCM on stdin.
 
-    PipeWire does the resampling, exactly as pw-record does on the way in,
-    which is what keeps numpy out of this project entirely.
+    PipeWire does the resampling, as pw-record does on the way in, so Python
+    never has to.
     """
     argv = [
         PW_CAT,
@@ -348,12 +325,10 @@ class WpctlVolumeControl:
     def set_volume(self, object_id: int, fraction: float) -> bool:
         """Returns False rather than raising.
 
-        `object_id` is PipeWire's global object.id, not object.serial - wpctl
-        resolves against the id. See docs/experiments/01-tap-volume.md.
-
-        This runs inside the playout loop on every duck transition. A raise
-        here would kill playout for the rest of the call over a node that
-        momentarily went away.
+        `object_id` is PipeWire's object.id, not object.serial: wpctl resolves
+        against the id (docs/experiments/01-tap-volume.md). This runs in the
+        playout loop, where a raise would kill playout for the rest of the
+        call over a node that briefly went away.
         """
         try:
             result = subprocess.run(
@@ -403,14 +378,13 @@ class PwCatSink:
             self._process.stdin.write(pcm)
             self._process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
-            # pw-cat died. Playout must keep draining its queue rather than
-            # deadlocking; the health flag is what the TUI turns red.
+            # pw-cat died. Playout must keep draining rather than deadlock;
+            # the health flag is what the TUI turns red.
             self.failed = True
-            # The exit code, not just stderr: pw-cat killed by a signal exits
-            # silently, so "playout sink died: " with nothing after it was all
-            # the user got - and that is the common case, because killing
-            # sidetap kills its process group. A negative code is a signal and
-            # means somebody stopped it; anything else is a real crash.
+            # Report the exit code: a pw-cat killed by a signal - the common
+            # case, since killing sidetap kills its process group - writes
+            # nothing to stderr. Negative means a signal, anything else a
+            # crash.
             code = self._process.poll()
             detail = (self._process.stderr_text() or "").strip()
             if code is not None and code < 0:

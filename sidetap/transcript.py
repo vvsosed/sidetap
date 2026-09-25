@@ -23,23 +23,18 @@ def hhmmss(seconds: float) -> str:
 def record_to_dict(record: Record) -> dict:
     """One JSONL row.
 
-    NOTE: do NOT infer a duration from `t_end - t`. Chirp gives no word
-    timestamps in streaming mode (setting enable_word_time_offsets is a fatal
-    InvalidArgument), so an utterance's only timestamp is its end offset, and
-    the two fields mean different things depending on how the row was cut:
+    Do NOT infer a duration from `t_end - t`. Chirp gives no word timestamps
+    in streaming mode, so the two fields mean different things by row:
 
-      - A whole utterance - every row under --no-early-commit, and every row
-        for an utterance LocalAgreementSegmenter committed nothing early for,
-        which is all of ordinary turn-taking conversation - carries that one
-        end offset in BOTH fields, so `t_end - t` is zero and every such row
-        would read as instantaneous.
-      - A clause committed early carries the PREVIOUS clause's end offset in
-        `t`, so `t_end - t` is the gap between two recognition hypotheses
-        (~5 s, whatever Chirp's interim cadence was), not how long the clause
-        took to say.
+      - A whole utterance (every row under --no-early-commit, and ordinary
+        turn-taking under the default) carries its one end offset in both,
+        so `t_end - t` is zero.
+      - A clause committed early carries the previous clause's end in `t`,
+        so `t_end - t` is the gap between two hypotheses (~5 s), not how long
+        the clause took to say.
 
-    The duration of the SPOKEN audio is derivable from the synthesised PCM
-    instead, via Translated.audio_s.
+    The spoken duration comes from the synthesised PCM instead, via
+    Translated.audio_s.
     """
     return {
         "t": record.unit.t_start,
@@ -70,17 +65,11 @@ def render_markdown(session: str, records: list[Record]) -> str:
             lines.append(f"**{label}** _{hhmmss(record.unit.t_start)}_")
             last_label = label
         if record.dropped:
-            # Bypass and the lag cap both produce a dropped record, so this
-            # must not name either mechanism specifically - "backlog
-            # dropped" used to read as the lag cap even when the user had
-            # pressed bypass and the backlog never fired.
+            # Bypass, mute and the lag cap all drop records, so name none.
             suffix = "  _(not spoken)_"
         elif record.truncated and record.latency.tts_ms == 0.0:
-            # Playout gave up before it ever accepted anything: nothing was
-            # heard. "Cut short" implies a beginning this utterance never
-            # had - tts_ms == 0.0 is exactly the signal that distinguishes
-            # it from the case below, since the jsonl already carries that
-            # distinction and the markdown otherwise renders both the same.
+            # Playout gave up before accepting anything, so nothing was heard;
+            # tts_ms == 0.0 is what tells this apart from a cut-short one.
             suffix = "  _(not spoken: synthesis stalled)_"
         elif record.truncated:
             suffix = "  _(cut short before the end)_"
@@ -94,8 +83,8 @@ def render_markdown(session: str, records: list[Record]) -> str:
 class BilingualTranscript:
     def __init__(self, outdir: Path, session: str | None = None):
         outdir.mkdir(parents=True, exist_ok=True)
-        # Sub-second resolution: meetscribe used whole seconds and two runs
-        # started within the same second appended into one file.
+        # Sub-second resolution, so two runs started in the same second do not
+        # append into one file.
         self.session = session or datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.jsonl_path = outdir / f"{self.session}.jsonl"
         self.md_path = outdir / f"{self.session}.md"
@@ -107,14 +96,10 @@ class BilingualTranscript:
     def write(self, record: Record) -> None:
         with self._lock:
             if self._closed:
-                # Session.shutdown() joins the workers on a shared 3 s deadline
-                # and then restores the graph whether or not they stopped - the
-                # graph matters more than a tidy exit. So a playout thread can
-                # still be alive here and still call on_dropped. Writing to the
-                # closed handle would raise ValueError inside a daemon thread,
-                # printing a traceback over the "Saved:" line in headless mode
-                # and over the TUI in the other. The record is already in the
-                # rendered Markdown either way.
+                # Shutdown restores the graph after a bounded join, so a
+                # playout thread may still be alive and call on_dropped.
+                # Writing to the closed handle would raise in a daemon thread
+                # and print a traceback over the output.
                 log.debug("transcript write after close, ignored: %r", record)
                 return
             self._records.append(record)

@@ -58,9 +58,8 @@ class ManagedProcess(Protocol):
 class WritableProcess(Protocol):
     """A process we write to. pw-cat --playback and pw-loopback.
 
-    Separate from ManagedProcess rather than one type with both pipes: the
-    ported capture code only ever reads, and widening its Protocol would let a
-    stdin-less fake satisfy a consumer that needs one.
+    Separate from ManagedProcess: capture only ever reads, and one type with
+    both pipes would let a stdin-less fake satisfy a consumer that needs one.
     """
 
     @property
@@ -95,12 +94,10 @@ class VolumeControl(Protocol):
     def set_volume(self, object_id: int, fraction: float) -> bool:
         """`object_id` is the PipeWire global object.id, NOT object.serial.
 
-        wpctl resolves against the id; the serial is a separate counter and
-        yields "Object not found". This does not contradict the project's
-        "identify nodes by object.serial" rule - that is about DURABLE
-        references (the routing journal, the tap's dedup keys) where ids get
-        recycled over time. See docs/experiments/01-tap-volume.md, which hit
-        this exact trap.
+        wpctl resolves against the id; a serial yields "Object not found".
+        Durable references (the routing journal, the tap's dedup keys) still
+        use serials, because ids are recycled. See
+        docs/experiments/01-tap-volume.md.
         """
         ...
 
@@ -132,10 +129,9 @@ class Synthesizer(Protocol):
     ) -> Iterator[bytes]:
         """The rate is per call, for the same reason the voice is.
 
-        The two directions translate opposite ways, so their useful rates are
-        inverses of each other: if the target language is 1.23x the length of
-        the source one way, it is 0.81x the other. One shared rate makes one
-        direction right and the other needlessly fast.
+        The directions translate opposite ways, so their useful rates are
+        inverses (1.23x one way is about 0.81x the other); one shared rate
+        would suit only one direction.
         """
         ...
 
@@ -156,10 +152,8 @@ class Clock(Protocol):
     def wait(self, event: threading.Event, timeout: float) -> bool:
         """Block until `event` is set or `timeout` elapses.
 
-        Returns whether `event` was set (mirrors threading.Event.wait).
-        Unlike `sleep`, a real implementation wakes as soon as `event` is set
-        from another thread rather than only at the end of `timeout` - that
-        promptness is the whole point of using this instead of `sleep` in a
-        poll loop that a shutdown needs to interrupt.
+        Returns whether `event` was set, like threading.Event.wait. Unlike
+        `sleep` it wakes as soon as `event` is set from another thread, which
+        is why poll loops that shutdown must interrupt use it.
         """
         ...

@@ -20,10 +20,8 @@ def format_properties(props: dict[str, str]) -> str:
     """Render the --properties argument.
 
     PipeWire parses this as JSON-ish. Every value must stay quoted: an
-    unquoted space inside a value splits the property and it is dropped
-    without any error message. Callers must also ensure no key or value
-    contains a double quote - nothing here escapes them, and the result
-    would be malformed in the same silent way.
+    unquoted space splits the property, which is then dropped silently.
+    Nothing escapes double quotes, so no key or value may contain one.
     """
     body = " ".join(f'{key}="{value}"' for key, value in props.items())
     return "{ " + body + " }"

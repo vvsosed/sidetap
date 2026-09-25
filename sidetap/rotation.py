@@ -42,15 +42,13 @@ class StreamClock:
 class AudioTimeline:
     """Maps a position in the audio we sent back to when it was captured.
 
-    The silence gate drops blocks, so an engine's result offsets count the
-    audio it received, not elapsed time. Adding a real-time offset to an
-    audio-relative position stamps the transcript early by however much
-    silence was dropped - and the two tracks drop different amounts, so they
-    drift apart from each other as well, which scrambles the order of the
-    saved Markdown.
+    The silence gate drops blocks, so result offsets count audio received,
+    not elapsed time. A flat real-time offset would stamp the transcript
+    early by the silence dropped, and because the two tracks drop different
+    amounts, the saved Markdown's order would scramble.
 
-    One entry per block sent, so a four-minute stream holds at most ~2400
-    floats and is discarded at each rotation.
+    One entry per block sent: at most ~2400 floats per four-minute stream,
+    discarded at each rotation.
     """
 
     def __init__(self, offset: float = 0.0):

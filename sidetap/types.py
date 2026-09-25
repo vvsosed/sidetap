@@ -21,26 +21,19 @@ MIC = "mic"
 
 # Seconds of un-spoken audio past which playout starts dropping the oldest.
 #
-# A dropped utterance is a sentence the user never hears, which is a harder
-# failure than briefly trailing the conversation, so the cap errs toward
-# holding audio rather than discarding it. It is a ceiling on transient
-# spikes, not a cure for a backlog that grows: if the translated language
-# runs longer than its source, only --speaking-rate-in can make it drain, and
-# a higher cap merely postpones the first drop.
-#
-# Not measured against a real two-way call - at this setting a reply arrives
-# up to 20 s after what it answers, which is past conversational. Lower it
-# with --lag-cap when keeping pace matters more than hearing every sentence.
+# A dropped sentence is worse than briefly trailing the conversation, so this
+# errs toward holding audio. It caps transient spikes; a backlog that keeps
+# growing because the translation runs longer than its source only drains
+# with --speaking-rate-in. Not measured on a real two-way call: 20 s is past
+# conversational, so lower it with --lag-cap when pace matters more.
 LAG_CAP_S = 20.0
 # Seconds of continuous outbound speech with nothing reaching the virtual mic
 # before the dead-air alarm fires.
 DEAD_AIR_S = 6.0
 
-# No audio at all reaching a capture queue for this long. Distinct from
-# DEAD_AIR_S, which is about a finished utterance producing nothing: this is
-# the upstream failure, where an unlinked capture node delivers ZERO BYTES
-# rather than silence, so the silence gate sees nothing to gate and every
-# downstream stage sits idle looking healthy.
+# No audio at all reaching a capture queue for this long. Unlike DEAD_AIR_S,
+# this is the upstream failure: an unlinked capture node delivers zero bytes,
+# not silence, so every downstream stage sits idle looking healthy.
 NO_AUDIO_S = 15.0
 
 
@@ -87,21 +80,19 @@ class AsrResult:
 class Unit:
     """A translatable unit emitted by the segmenter.
 
-    With LocalAgreementSegmenter, the default, this is one per committed
-    clause: a long utterance becomes several, which is the entire reason this
-    type is distinct from AsrResult. With FinalsOnlySegmenter (--no-early-commit)
-    it is one per final AsrResult.
+    With LocalAgreementSegmenter, the default, one per committed clause, so a
+    long utterance becomes several - the reason this is not just AsrResult.
+    With FinalsOnlySegmenter (--no-early-commit), one per final AsrResult.
     """
 
     direction: Direction
     text: str
     t_start: float
     t_end: float
-    # More of this speech run is on its way: a committed clause that is not
-    # the end of its utterance. Playout uses it to keep the duck closed across
-    # the gap before the next clause, rather than reading an empty queue as
-    # "the translation is over" and letting the original through mid-sentence.
-    # False for FinalsOnlySegmenter, which only ever emits whole utterances.
+    # More of this speech run is coming: a committed clause that does not end
+    # its utterance. Playout keeps the duck closed across the gap before the
+    # next clause rather than letting the original through. Always False for
+    # FinalsOnlySegmenter.
     continues: bool = False
 
     @classmethod
@@ -137,22 +128,12 @@ class Translated:
 class Latency:
     asr_ms: float = 0.0
     mt_ms: float = 0.0
-    # This CHANGED MEANING when playout started streaming: it used to be the
-    # full synthesis wall time, and is now the wait until playout accepted
-    # the first chunk. A transcript recorded before that change and one
-    # recorded after are not comparable on this field, and nothing in a
-    # .jsonl says which era it came from - the presence of a non-zero
-    # tts_total_ms beside it is the only hint.
+    # Time until playout accepted the first synthesised chunk: what the
+    # listener actually waited for.
     tts_ms: float = 0.0
-    # Full synthesis wall time. Deliberately NOT part of total_ms: once
-    # playout starts on the first chunk instead of waiting for the whole
-    # utterance, what the listener waited for is tts_ms, and adding the rest
-    # back would make the TUI overstate felt latency by exactly what
-    # streaming saves. _speak populates both: tts_ms when playout ACCEPTS
-    # the first chunk - not merely when one arrives, since playout can refuse
-    # it - and this when the loop ends, by exhaustion or by that refusal.
-    # Kept because full synthesis time is still the throughput and cost
-    # signal, which tts_ms no longer carries.
+    # Full synthesis wall time, the throughput and cost signal. Not part of
+    # total_ms: playout starts on the first chunk, so adding it would
+    # overstate felt latency by exactly what streaming saves.
     tts_total_ms: float = 0.0
 
     @property

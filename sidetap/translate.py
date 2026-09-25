@@ -9,25 +9,21 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-# Pure Python, no network and no credentials required to import - unlike the
-# SDK client below, so this one is fine unlazy. asr.py already does the same
-# for the same reason.
+# Needs no network or credentials to import, unlike the SDK client below, so
+# it need not be lazy.
 from google.api_core import exceptions as gexc
 
 log = logging.getLogger(__name__)
 
-# Better on conversational register, and roughly cost-equivalent to NMT
-# ($10 in + $10 out vs $20 per 1M characters). Its region and language-pair
-# coverage is narrower, which is what the fallback below exists for - see
-# docs/experiments/03-translation-llm.md.
+# Better on conversational register and roughly cost-equivalent to NMT ($10 in
+# + $10 out vs $20 per 1M characters), but with narrower region and language
+# coverage, hence the fallback (docs/experiments/03-translation-llm.md).
 TRANSLATION_LLM_MODEL = "general/translation-llm"
 NMT_MODEL = "general/nmt"
 
-# Only these mean "this model is not available here". Everything else -
-# ServiceUnavailable, DeadlineExceeded, ResourceExhausted, a dropped
-# connection - is transient: fall back for THIS utterance so the turn is not
-# dropped, but do NOT downgrade the rest of the session. One blip would
-# otherwise cost idiom quality for a whole conversation, invisibly.
+# Only these mean "this model is not available here". Anything else is
+# transient: fall back for this utterance only, so one blip does not silently
+# cost idiom quality for the rest of the session.
 PERMANENT_ERRORS = (
     gexc.InvalidArgument,
     gexc.NotFound,
@@ -45,33 +41,27 @@ def model_path(project_id: str, region: str, model: str) -> str:
 
 
 # Verified against get_supported_languages on 2026-09-18 (196 codes).
-# Bare primary subtags Cloud Translation does not accept as-is; map to the
-# code it does.
+# Bare primary subtags Cloud Translation rejects, mapped to the code it wants.
 LANGUAGE_ALIASES = {"nb": "no", "nn": "no"}
 
-# Regional variants Cloud Translation treats as distinct codes rather than
-# folding into the bare primary subtag - stripping the region here would
-# silently switch to the wrong variant (fr -> France, pt -> Brazil).
+# Regional variants Cloud Translation treats as distinct codes; stripping the
+# region would silently switch variant (fr -> France, pt -> Brazil).
 REGIONAL_VARIANTS = {"fr-CA", "pt-PT"}
 
-# Script-variant codes such as ms-Arab, pa-Arab and mni-Mtei are not handled:
-# their primary subtags are unlikely to appear in a voice call, and whether
-# the bare forms (ms, pa, mni) even exist as supported codes has not been
-# verified. sr-Latn is not a supported code either way - the API only offers
-# bare "sr" (Cyrillic), which is already what stripping the region produces,
-# so it needs no special case.
+# Script variants (ms-Arab, pa-Arab, mni-Mtei) are not handled: unlikely in a
+# voice call, and whether their bare forms are supported is unverified.
+# sr-Latn needs nothing: the API offers only "sr" (Cyrillic), which stripping
+# the region already produces.
 
 
 def short_code(language_code: str) -> str:
     """BCP-47 -> the code Cloud Translation expects.
 
-    Speech-to-Text wants "ru-RU"; Translation wants "ru" and rejects the
-    regioned form with a 400 for most languages - but not all of them.
-    zh-TW, fr-CA and pt-PT are themselves distinct supported codes, and
-    folding them down to the bare primary subtag would silently change the
-    variant (zh -> Simplified, fr -> France, pt -> Brazil) rather than
-    erroring, so those are preserved. nb (Norwegian Bokmal) isn't a
-    supported code at all and gets rejected outright; the API wants "no".
+    Speech-to-Text wants "ru-RU"; Translation wants "ru" and rejects most
+    regioned forms with a 400. zh-TW, fr-CA and pt-PT are distinct supported
+    codes, and folding them would silently switch variant (zh -> Simplified,
+    fr -> France, pt -> Brazil), so they are kept. nb is not supported at
+    all; the API wants "no".
     """
     parts = language_code.replace("_", "-").split("-")
     primary = parts[0].lower()
@@ -93,13 +83,10 @@ def short_code(language_code: str) -> str:
 @dataclass(frozen=True)
 class TranslateConfig:
     project_id: str
-    # NOT europe-west3. Cloud Translation rejects it outright ("Must be
-    # 'us-central1' or 'global'") - measured, not guessed. STT cannot use it
-    # either, for a different reason: chirp_2 does not exist there (see
-    # asr.py), so --region is europe-west4. Two services, two unrelated
-    # answers, which is why these are separate settings rather than one
-    # shared region. See docs/experiments/03-translation-llm.md and its
-    # addendum.
+    # NOT europe-west3: Cloud Translation accepts only "global" or
+    # "us-central1". STT cannot use it either, for an unrelated reason (see
+    # asr.py), which is why the regions are separate settings. See
+    # docs/experiments/03-translation-llm.md.
     region: str = "global"
     model: str = TRANSLATION_LLM_MODEL
 
@@ -113,15 +100,13 @@ class GoogleTranslator:
     ):
         self._config = config
         self._client = client
-        # Set once the preferred model has proved PERMANENTLY unavailable -
-        # see PERMANENT_ERRORS. A transient error falls back for one
-        # utterance without touching this, so a single blip doesn't cost
-        # idiom quality for the rest of the session.
+        # Downgraded only once the preferred model is PERMANENTLY unavailable
+        # (see PERMANENT_ERRORS); a transient error falls back for one
+        # utterance without touching this.
         self._model = config.model
-        # Fires once, with the new model name, when the sticky downgrade
-        # happens. Task 25 wires this to metrics so the TUI can show which
-        # model is actually in use - without it the downgrade is invisible:
-        # the next successful NMT call still reports mt=Health.OK.
+        # Fires once, with the new model name, on the sticky downgrade, so the
+        # TUI can show it: the next successful NMT call still reports
+        # mt=Health.OK.
         self._on_downgrade = on_downgrade
 
     def _request(self, text: str, src: str, tgt: str, model: str) -> dict:
@@ -180,9 +165,8 @@ def build_translator(
 ) -> GoogleTranslator:
     """Google's SDK is imported lazily so the suite needs no credentials.
 
-    `on_downgrade` fires when the sticky fallback to NMT happens, so the
-    session can surface which model is actually in use. Without a destination
-    the downgrade is undetectable from outside this module.
+    `on_downgrade` fires on the sticky fallback to NMT; without it the
+    downgrade is invisible outside this module.
     """
     from google.cloud import translate
 

@@ -106,10 +106,8 @@ class DroppingQueue:
     def __init__(self, maxsize: int = QUEUE_BLOCKS):
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self.dropped = 0
-        # Arrivals, not just losses. A track that has gone quiet because its
-        # capture node was unlinked delivers zero bytes, not silence, so
-        # nothing downstream can tell it apart from nobody talking - this
-        # counter is the only place that difference is visible.
+        # Arrivals, not just losses: an unlinked capture node delivers zero
+        # bytes rather than silence, and only this counter shows it.
         self.accepted = 0
 
     def put(self, item) -> bool:
@@ -223,9 +221,9 @@ class PipeWireCapture:
         self.stop.set()
         for recorder in self.recorders.values():
             recorder.stop()
-        # One shared budget rather than a fresh timeout per thread: joining
-        # three threads at 2 s each would stall Ctrl-C for six seconds. Real
-        # time, not the injected clock - these are real threads.
+        # One shared budget, not a timeout per thread, so Ctrl-C is not
+        # stalled for seconds. Real time, not the injected clock: these are
+        # real threads.
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         for thread in self._threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))

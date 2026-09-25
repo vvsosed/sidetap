@@ -1,21 +1,14 @@
 """The seam between recognition and translation.
 
-A Segmenter turns AsrResults into Units - the things worth paying to translate
-and speak. Two ship: FinalsOnlySegmenter waits for a complete utterance,
+A Segmenter turns AsrResults into Units - the text worth translating and
+speaking. FinalsOnlySegmenter waits for a complete utterance;
 LocalAgreementSegmenter commits a stable prefix part-way through.
 
-What LocalAgreement-2 buys here is NOT the "roughly 0.5-1 s on a normal
-sentence" the research describes, and an earlier version of this docstring
-claimed. Chirp emits no interim results at all for short turn-taking
-utterances (docs/experiments/06-interim-cadence.md), so there is nothing for a
-prefix comparison to work on and ordinary conversation is untouched. What it
-buys is the monologue: 34.8 s of continuous speech measured as one final after
-29.3 s of silence, which this turns into a commit roughly every 5 s.
-
-It is self-limiting with no constant to tune. Interims arrive once per 5 s of
-sent audio, so two agreeing hypotheses need ~11 s of continuous speech; below
-that both classes behave identically. Do not add a length threshold - it would
-be a second, worse copy of a bound the API already imposes.
+Chirp sends no interims for short utterances and one per ~5 s of sent audio
+otherwise (docs/experiments/06-interim-cadence.md), so LocalAgreement-2 only
+helps monologues: two hypotheses need ~11 s of speech before they can agree.
+There is deliberately no length threshold - it would duplicate a bound the API
+already imposes.
 """
 
 from __future__ import annotations
@@ -27,42 +20,24 @@ from .types import AsrResult, Direction, Unit
 
 log = logging.getLogger(__name__)
 
-# Only the EDGES. Stripping punctuation throughout would collapse "1.2" and
-# "12" to the same key, and two numbers that differ by a factor of ten would
-# compare as agreed - committed, translated and spoken, with no way to take a
-# spoken number back. Both revisions Experiment 6 actually observed were at a
-# token's edge ("сверхурочно." to "сверхурочно,"), so the edges are all that
-# needs to go.
+# Edges only: stripping punctuation throughout would key "1.2" and "12" alike
+# and commit a number the recogniser had not settled on.
 _EDGE_PUNCTUATION = re.compile(r"^\W+|\W+$", re.UNICODE)
 
 
 def _tokens(text: str) -> list[tuple[str, str]]:
     """Split into (surface, key) pairs. Only the key is ever compared.
 
-    The surface keeps case and punctuation, because it is what reaches the
-    translator. The key drops case entirely and punctuation only at the edges,
-    because Experiment 6 observed both changing between two hypotheses whose
-    words were otherwise identical - "Что" to "что", "сверхурочно." to
-    "сверхурочно,". Comparing surfaces finds a common prefix of zero
-    characters on the real capture. Interior punctuation stays, because it can
-    be load-bearing - "1.2" and "12" are different numbers, and collapsing
-    them to the same key would commit, translate and speak one before the
-    recogniser had settled on which.
+    The surface keeps case and punctuation, because it is what the translator
+    gets. The key is lowercased and edge-stripped, because both change between
+    hypotheses of the same words ("Что"/"что", "сверхурочно."/"сверхурочно,");
+    comparing surfaces finds almost no common prefix on real speech.
 
-    A sign is the one case this does not catch: "-12" keys to "12", so a
-    negative and a positive still agree. Left alone deliberately rather than
-    special-cased, because a leading "-" is indistinguishable here from an
-    ordinary edge dash, and conversational speech in either language tends to
-    render a negative as a word ("минус пять", "minus five") rather than as a
-    signed digit.
-
-    A token whose surface is punctuation alone keeps an empty key. It still
-    occupies a position, so a dash present in one hypothesis and absent from
-    the next ends the agreement there rather than silently shifting it - which
-    errs toward committing less. Two *different* punctuation-only tokens at
-    the same position - "-" and "..." both key to "" - compare as agreeing,
-    but the impact is bounded: what gets committed on a false agreement there
-    is a piece of punctuation, not a word.
+    Accepted gaps: "-12" keys like "12", since a leading "-" cannot be told
+    from an edge dash and speech usually says "minus" anyway. A
+    punctuation-only token keys to "" but keeps its position, so one present
+    in only one hypothesis ends the agreement; two different ones agree, which
+    at worst commits a punctuation mark.
     """
     return [
         (surface, _EDGE_PUNCTUATION.sub("", surface.lower()))
@@ -70,40 +45,27 @@ def _tokens(text: str) -> list[tuple[str, str]]:
     ]
 
 
-# What ends a clause. Interims carry punctuation (Experiment 6 finding 7), so
-# a boundary is almost always available inside five seconds of speech.
+# What ends a clause. Interims carry punctuation, so a boundary is usually
+# available within five seconds of speech.
 #
-# The em dash is deliberately NOT here, though Russian uses it to separate
-# clauses. It also stands in for the missing copula - "Москва - столица" - and
-# cutting there would hand the translator a subject with no predicate, which
-# is precisely the mid-clause fragment this function exists to prevent. Since
-# nothing distinguishes the two uses from the text alone, the safe reading is
-# to treat it as no boundary.
+# No em dash: in Russian it also stands in for a missing copula ("Москва -
+# столица"), and cutting there hands the translator a subject with no
+# predicate. If a dash is the only candidate, _cut commits the growth uncut,
+# which is still a complete thought.
 #
-# Note what that does when the dash is the only candidate in the growth: the
-# fallback below commits the whole growth UNCUT this round. Not later, not
-# held back - the opposite. That is still the outcome to want, because an
-# uncut span is a complete thought, where a cut at a copula would hand the
-# translator a subject with no predicate.
-#
-# Only the token's LAST character is tested, so "..." needs no entry of its
-# own - it ends in "." already. A closing quote or bracket with no punctuation
-# after it ("(да)") is missed for the same reason, and costs a later commit
-# rather than a wrong one.
+# Only a token's last character is tested, so "..." is covered by ".". A
+# closing quote or bracket with nothing after it is missed, which costs a later
+# commit rather than a wrong one.
 _BOUNDARY = ",.;:!?…"
 
 
 def _cut(tokens: list[tuple[str, str]]) -> int:
     """How many of these tokens to commit now.
 
-    Everything up to and including the last clause boundary, so a fragment
-    does not reach the translator mid-clause - the word-order cost the v1 spec
-    named as LocalAgreement-2's main downside.
-
-    With no boundary anywhere, commit the lot. Holding it back would reproduce
-    the stall this exists to remove: five seconds of speech with no punctuation
-    is precisely where waiting hurts. One rule, no constant, and it fails
-    toward speaking.
+    Up to and including the last clause boundary, so the translator never
+    gets a fragment cut mid-clause. With no boundary, commit everything:
+    holding back unpunctuated speech would bring back the stall this exists
+    to remove.
     """
     for i in range(len(tokens) - 1, -1, -1):
         if tokens[i][0][-1:] in _BOUNDARY:
@@ -114,61 +76,32 @@ def _cut(tokens: list[tuple[str, str]]) -> int:
 def _agreed(previous: list[tuple[str, str]], current: list[tuple[str, str]]) -> int:
     """How many leading words two hypotheses agree on, by key.
 
-    A prefix, not a tally: it stops at the first mismatch rather than counting
-    every position that happens to match. Everything counted here gets
-    committed, translated and spoken, so a false "agreed" is the direction
-    that costs something - a missed one only delays.
+    A prefix, not a tally. A false agreement gets spoken; a missed one only
+    delays.
     """
     n = 0
     for (_, previous_key), (_, current_key) in zip(previous, current):
         if previous_key != current_key:
-            # Stop, do not skip: a later word that matches again must not
-            # count, or words the recogniser never settled on get spoken.
+            # Stop, do not skip: a later match is not settled text.
             break
         n += 1
     return n
 
 
-# How many spoken tokens one utterance keeps for the alignment below. The
-# search is quadratic in this number, so it cannot be unbounded on a stream
-# that never finalises - but it must stay comfortably above any overlap that
-# can really occur, because a token trimmed out of the window can no longer be
-# recognised as already spoken, and the next hypothesis that re-covers it gets
-# it spoken a second time. That is the regression this whole rule exists to
-# stop. The largest overlap ever measured on a real call was 69 words; 400 is
-# nearly six times that and more words than any single Chirp utterance
-# observed (the 34.8 s monologue of Experiment 6 ran to about 100), so the
-# window can only bite on a stream that has gone minutes without a final.
+# How many spoken tokens one utterance keeps for alignment. Bounded because the
+# search is quadratic; far above the largest real overlap (69 words), because a
+# token trimmed out can no longer be recognised as spoken and gets repeated.
 _SPOKEN_LIMIT = 400
 
 
-# The shortest run of already-spoken words the third arm of `_overlap` will
-# anchor on. It is the whole of that arm's safety argument, so read this
-# before moving it in either direction.
+# The shortest run of already-spoken words `_overlap`'s third arm anchors on.
+# That arm drops everything in front of its match, so a phrase that merely
+# recurs in new speech would silently discard the new words before it.
 #
-# The first two arms only ever skip text the listener heard, in the order they
-# heard it: a candidate opening on the tail of what was spoken, or lying
-# wholly inside it. The third matches a run ANYWHERE in the candidate and
-# drops everything in front of it, so a phrase that merely recurs in genuinely
-# new speech would anchor there and throw away the new words before it, with
-# nothing audible to say so.
-#
-# Measured, not chosen: every row of the real call's transcript, searched for
-# the speech emitted before it. Where the sharing was coincidental, the
-# longest shared run was 6 words (a speaker reusing a sentence frame with a
-# different verb), and the longest that was a TAIL of what had been spoken -
-# the only thing this arm matches - was 4 (a speaker quoting their own last
-# words back). The one genuine re-window matched 64. A second call over the
-# same material measured the same 6 and 4. Eight clears the longest
-# coincidence of any kind by two words and sits far below the re-window.
-#
-# Which way each error fails. Too LOW, and ordinary phrasing anchors: the new
-# speech in front of it is dropped silently, which is the worse failure - a
-# repeat is at least heard, where a drop exists only in the log. Too HIGH, and
-# a re-window re-covering fewer spoken words than this falls through to the
-# zero alignment and repeats them: audible, and bounded by this number. That
-# call had one such, over four spoken words, and this still repeats it - as
-# it must, since by length alone four words is a coincidence.
+# Measured on real calls: coincidental shared runs reached 6 words, while a
+# genuine re-window matched 64. Too low, and new speech is dropped silently;
+# too high, and a short re-window is repeated audibly. A repeat is at least
+# heard, so err high.
 MIN_ANCHOR = 8
 
 
@@ -178,46 +111,26 @@ def _overlap(
     """How many of the candidate's leading tokens not to emit, and why.
 
     Returns `(k, anchor)`; the caller emits `candidate[k:]`. `anchor` is 0
-    unless the third arm below decided k, and is then the length of the spoken
-    run it matched, with the `k - anchor` tokens in front of that run dropped.
-    k alone cannot tell a skip over words the listener heard from a drop of
-    words they may not have, and `_align` has to report the second.
+    unless the third arm decided k, and is then the length of the spoken run
+    it matched, with the `k - anchor` tokens before it dropped. `_align` needs
+    it because k alone cannot tell skipped heard words from dropped new ones.
 
-    First, the largest k for which the LAST k keys of `spoken` equal the FIRST
-    k keys of `candidate` - the candidate picking up where speech stopped.
-    Content, not position: Chirp re-windows its hypothesis mid-utterance,
-    dropping words off the front of what it reports, and any rule that slices
-    by a count re-emits whatever that shift exposes. On the first real call
-    that cost roughly 15% of everything the listener heard, in bursts of 50 to
-    110 words each.
+    Alignment is by content, not position, because Chirp re-windows its
+    hypothesis mid-utterance and a positional slice re-emits whatever the
+    shift exposes. First match wins:
 
-    Maximal, so of several possible anchors the LAST one wins. That is the
-    direction to fail in: too large a k drops words that were new, too small a
-    one speaks words already spoken, and a synthesised voice cannot take a
-    word back. "and then, and then" anchors on the second "and then" and loses
-    nothing, because the first is inside the overlap either way.
-
-    Second, the containment check covers the other shape the real call
-    produced: a hypothesis that SHRANK, so the candidate is a run from the
-    middle of what was already spoken rather than a continuation of its end.
-    Nothing in it is new, so nothing may be emitted - without this the
-    agreement between two early-diverging interims is spoken again in full,
-    which is the same 50-word repeat by a different door. Its one cost is a
-    speaker who repeats a whole phrase verbatim and has it interpreted once;
-    that is cheap next to what it prevents, and it can only ever suppress
-    words the listener has already heard in that same order.
-
-    Third, and only when both of those find nothing: the longest TAIL of
-    `spoken`, at least MIN_ANCHOR tokens, found anywhere in the candidate, with
-    k just past it (`_anchor`). That is a re-window reaching the other way,
-    back past where the spoken text began. On the call after the fix above,
-    almost all the repeated speech left was one final that opened with three
-    words from before the utterance's first commit and then carried all 64
-    words already spoken: it neither began with a tail of `spoken` nor fitted
-    inside it, so both arms above returned 0 and all 101 words went out again.
-    This arm returns 67 there and emits the 34 that are new. It is the only
-    arm that can drop words the listener never heard, which is why it alone
-    has a floor.
+    1. The largest k for which the last k keys of `spoken` equal the first k
+       of `candidate` - the candidate continuing where speech stopped. Largest,
+       so of several possible anchors the last wins: a synthesised voice
+       cannot take a repeated word back, and "and then, and then" loses
+       nothing either way.
+    2. The candidate lies wholly inside `spoken` - a hypothesis that shrank.
+       Nothing is new, so nothing is emitted; the cost is that a phrase
+       repeated verbatim is interpreted once.
+    3. The longest tail of `spoken`, at least MIN_ANCHOR tokens, found
+       anywhere in the candidate, with k just past it (`_anchor`). This is a
+       re-window reaching back before the utterance's first commit. It is the
+       only arm that can drop unheard words, hence the floor.
     """
     spoken_keys = [key for _, key in spoken]
     candidate_keys = [key for _, key in candidate]
@@ -236,30 +149,17 @@ def _overlap(
 def _anchor(spoken_keys: list[str], candidate_keys: list[str]) -> tuple[int, int]:
     """`_overlap`'s third arm, as `(k, anchor)`, or `(0, 0)` if it finds nothing.
 
-    Longest first: the run is the longest tail of `spoken_keys` occurring
-    contiguously in the candidate, so a genuine re-window is matched over its
-    whole length rather than on some shorter tail of it that recurs later in
-    new speech.
-
-    Called only once the first arm has failed, so it never matches at index 0:
-    a tail found there would be a prefix of the candidate, which that arm
-    already tried. Every match here therefore has at least one dropped token
-    in front of it - the thing `_align` reports.
+    Longest run first, so a genuine re-window matches over its whole length
+    rather than on a shorter tail that recurs later in new speech. Never
+    matches at index 0, which the first arm already tried, so every match
+    drops at least one token.
     """
     end, length = 0, 0
-    # Right to left, replacing only on a STRICTLY longer run, so of two equally
-    # long occurrences the LATER one wins. Both copies are word for word the
-    # last `length` words the listener heard, at least MIN_ANCHOR of them:
-    # anchoring on the earlier copy emits the later one, which is the repeat
-    # this arm exists to stop. The later copy costs the words between the two
-    # only if the speaker really said that same run twice inside one
-    # hypothesis - the price the containment arm already pays for a verbatim
-    # repeat, and the same maximal choice the first arm makes.
+    # Right to left, replacing only on a strictly longer run, so of two equal
+    # runs the later wins: anchoring on the earlier would re-emit the later.
     for stop in range(len(candidate_keys), 0, -1):
-        # How far back from `stop` the candidate matches the END of what was
-        # spoken. Walking back from each position, rather than trying every
-        # tail length against every position, keeps this linear in the
-        # candidate for ordinary text: most positions mismatch at once.
+        # Walk back from `stop` while the candidate matches the end of what
+        # was spoken; linear for ordinary text, which mismatches at once.
         run = 0
         reach = min(len(spoken_keys), stop)
         while run < reach and spoken_keys[-1 - run] == candidate_keys[stop - 1 - run]:
@@ -274,12 +174,8 @@ def _anchor(spoken_keys: list[str], candidate_keys: list[str]) -> tuple[int, int
 class FinalsOnlySegmenter:
     """One Unit per final result. Interims are discarded.
 
-    **One instance per direction, never shared.** This implementation is
-    stateless, so sharing would work today - but LocalAgreement-2 holds the
-    previous hypothesis and the words it has already spoken as instance state,
-    and one instance fed by both directions would interleave two conversations
-    and emit nonsense. DirectionPipeline constructs one per direction; do not
-    "hoist the constant out of the loop".
+    **One instance per direction, never shared.** This one is stateless, but
+    LocalAgreementSegmenter is not, and the two must stay interchangeable.
     """
 
     def feed(self, result: AsrResult) -> list[Unit]:
@@ -293,32 +189,24 @@ class FinalsOnlySegmenter:
 class LocalAgreementSegmenter:
     """Commit the longest word prefix two consecutive interims agree on.
 
-    **One instance per direction, never shared.** Unlike FinalsOnlySegmenter
-    this really does hold state, and one instance fed by both directions would
-    interleave two conversations and commit a prefix of neither.
+    **One instance per direction, never shared.** It holds per-utterance
+    state, and a shared instance would interleave two conversations.
 
-    Two agreements, not configurable, and the count is measured rather than
-    taken from the name: the final in Experiment 6 inserted a word thirteen
-    from the end of text that had already appeared in one interim. Two
-    agreements leave that tail uncommitted; one would have spoken text the
-    final then contradicted, and a synthesised voice cannot take a word back.
+    Two agreements, not configurable: in Experiment 6 the final inserted a
+    word thirteen from the end of text an interim had already shown. One
+    agreement would have spoken text the final then contradicted.
 
-    What keeps a clause from being spoken twice is `_spoken` and nothing else.
-    Every candidate - an interim's growth or a final's text - is aligned by
-    CONTENT against the words this utterance has already put through the
-    translator, and only the part past that alignment is emitted. There is no
-    second notion of "how far we got" to fall out of step with it: the first
-    real call ran a count-based prefix instead, and Chirp re-windowing its
-    hypothesis mid-utterance turned that into roughly 15% of the call being
-    verbatim repeats of speech from up to a minute earlier.
+    `_spoken` alone prevents repeats. Every candidate is aligned by content
+    against what this utterance has already emitted, and only the part past
+    that alignment is emitted. A positional count would fall out of step
+    whenever Chirp re-windows its hypothesis.
     """
 
     def __init__(self):
         self._previous: list[tuple[str, str]] = []
         self._previous_t_end = 0.0
-        # Everything this utterance has actually emitted, in order. Tokens
-        # rather than a count, because a count can only be spent positionally
-        # and a re-windowed hypothesis moves every position.
+        # Everything this utterance has emitted, in order - tokens, not a
+        # count, because a re-windowed hypothesis moves every position.
         self._spoken: list[tuple[str, str]] = []
         self._span_start = 0.0
 
@@ -330,42 +218,23 @@ class LocalAgreementSegmenter:
     def _align(
         self, candidate: list[tuple[str, str]], direction: Direction, stage: str
     ) -> int:
-        """`_overlap` against what was spoken, plus the one report of it.
-
-        Logged here rather than at the call sites so both paths report the
-        same event in the same words - the previous version logged a revision
-        on the final path only for its first three weeks, and the interim half
-        of the same defect went unnoticed for exactly that long.
-        """
+        """`_overlap` against what was spoken, logged in one place for both
+        the interim and the final path."""
         spoken = self._spoken
         k, anchor = _overlap(spoken, candidate)
         if not spoken or not candidate:
-            # Nothing spoken yet is the ordinary start of an utterance, and an
-            # empty candidate is an empty final. Neither is a revision, and a
-            # signal that fires when nothing went wrong is not a signal.
+            # The start of an utterance, or an empty final: not a revision.
             return k
         if anchor:
-            # Tested first, because k here says nothing about how much of
-            # `spoken` aligned - it counts dropped words too, and can exceed
-            # len(spoken) - so the "revised" branch below would misreport it.
+            # Tested first: k here counts dropped words too and can exceed
+            # len(spoken), which the branches below would misreport.
             #
-            # Warning, like the zero alignment below and for the mirror-image
-            # reason: this is the one outcome that throws recognised words
-            # away. On a genuine re-window they come from before the run the
-            # listener just heard, and dropping them is right; on a false
-            # anchor they are new speech, and nothing else will ever say so,
-            # because nobody notices a word that was never played. The two
-            # numbers are how the cases get told apart after the call: a run
-            # far above MIN_ANCHOR with a few words dropped is a re-window, one
-            # near MIN_ANCHOR with a clause dropped needs checking against the
-            # transcript. Not debug, which the session log does not record
-            # without -v, and not info: MIN_ANCHOR rests on measurements of
-            # one speaker's material, the next call is where it is confirmed
-            # or refuted, and it has to surface in the same grep for WARNING
-            # that found the event it replaces. One re-windowed hypothesis can
-            # log this once per interim until its final, since the dropped
-            # words never join `_spoken`; the same dropped count on
-            # consecutive lines is one event, not several.
+            # Warning, because this is the only outcome that discards
+            # recognised words - right for a re-window, silent loss for a false
+            # anchor. The two numbers tell them apart afterwards: a run far
+            # above MIN_ANCHOR with few words dropped is a re-window, one near
+            # it with a clause dropped needs checking. A re-windowed hypothesis
+            # can log this once per interim until its final.
             log.warning(
                 "%s: %s dropped %d leading word(s) in front of a run of %d "
                 "already spoken (a re-windowed or revised hypothesis); "
@@ -376,15 +245,10 @@ class LocalAgreementSegmenter:
                 anchor,
             )
         elif k == 0:
-            # Warning: this is the one outcome that can still put a repeat in
-            # the listener's ear. A stream restart lands here and is harmless
-            # (nothing of the old utterance is in this text), but so does a
-            # wholesale revision, and so does a re-window that re-covers fewer
-            # than MIN_ANCHOR spoken words; then everything emitted below
-            # re-covers ground already spoken. Nothing in the AsrResult tells
-            # these apart - timestamps stay monotonic across a rotation by
-            # construction - so the log is the only evidence the ear-witness
-            # in manual-smoke.md will ever have.
+            # Warning, because this is the only outcome that can repeat speech.
+            # A stream restart lands here harmlessly, but so does a wholesale
+            # revision or a re-window shorter than MIN_ANCHOR, and nothing in
+            # the AsrResult tells them apart.
             log.warning(
                 "%s: %s shares no words with the %d already spoken (stream "
                 "restart, or a re-windowed hypothesis); emitting it whole",
@@ -393,11 +257,7 @@ class LocalAgreementSegmenter:
                 len(spoken),
             )
         elif k < len(spoken):
-            # Debug: the alignment found the seam and trimmed to it, so
-            # nothing is repeated and nothing is lost. It still means Chirp
-            # revised or re-windowed, which the offline experiment never saw,
-            # so it is worth a line - just not one that competes with the
-            # case above.
+            # Trimmed to the seam, so nothing is repeated or lost; debug only.
             log.debug(
                 "%s: %s revised text already spoken; %d of %d spoken word(s) "
                 "still align, emitting only what is past them",
@@ -409,10 +269,7 @@ class LocalAgreementSegmenter:
         return k
 
     def _remember(self, tokens: list[tuple[str, str]]) -> None:
-        # Trim from the FRONT. The alignment anchors on the END of what was
-        # spoken, so the oldest tokens are the only ones it can afford to
-        # lose; trimming the other end would discard exactly what the next
-        # hypothesis is about to be matched against.
+        # Trim from the front: alignment matches against the end.
         self._spoken = (self._spoken + tokens)[-_SPOKEN_LIMIT:]
 
     def _interim(self, result: AsrResult) -> list[Unit]:
@@ -424,57 +281,32 @@ class LocalAgreementSegmenter:
         if not agreed:
             return []
 
-        # The whole agreed prefix, not a slice of it. What has already been
-        # said is decided by content below, so there is nothing here for a
-        # position to be right or wrong about.
+        # The whole agreed prefix: alignment by content decides what is new.
         candidate = current[:agreed]
         spoken_before = len(self._spoken)
         aligned = self._align(candidate, result.direction, "interim")
         growth = candidate[aligned:]
         if not growth:
-            # Two hypotheses agreeing on nothing the listener has not already
-            # heard. Common while a re-windowed hypothesis catches back up,
-            # and the reason the count-based version spoke clauses twice.
+            # Agreement on nothing new, common while a re-windowed hypothesis
+            # catches back up.
             return []
         growth = growth[: _cut(growth)]
         if not growth:
-            # Unreachable today: `growth` is non-empty here and _cut never
-            # returns 0 for a non-empty list. Kept because nothing downstream
-            # can be counted on to catch an empty Unit instead. _speak
-            # (pipeline.py) calls translate() before checking its result, and
-            # only GoogleTranslator's own internal empty-string check
-            # (translate.py) stops it there with no network call; the
-            # Translator Protocol makes no such promise, and FakeTranslator
-            # (tests/conftest.py) returns a non-empty marker for "" - which
-            # would carry a sourceless Unit past _speak's
-            # `if not target_text.strip()` bail into a synthesized, recorded
-            # transcript row with nothing behind it. The invariant that rules
-            # this branch out lives in _cut, a different function from this
-            # one, so a change there could quietly make it reachable.
+            # Unreachable while _cut never returns 0 for a non-empty list.
+            # Kept because nothing downstream reliably rejects an empty Unit.
             return []
 
         if spoken_before and not aligned:
-            # Only a ZERO alignment resets. A non-zero one from `_overlap`'s
-            # anchored arm, however many words it dropped in front, still
-            # emits what follows the run already spoken, so it continues that
-            # run and chains from it like any other.
-            #
-            # Nothing of this candidate continues what was spoken (the
-            # alignment came back zero), so the span watermark - which
-            # describes the end of that spoken text - does not describe this
-            # either. A stream restart is the case that matters: chaining
-            # across it dates the new utterance's first clause to before the
-            # break, and render_markdown sorts on t_start, so the bilingual
-            # transcript interleaves it among rows from minutes earlier.
-            # Anchoring on this unit's own t_end gives it the "one timestamp,
-            # no duration" shape a whole-utterance final carries.
+            # A zero alignment continues nothing spoken, so the span watermark
+            # no longer applies. Chaining across a stream restart would date
+            # the new clause before the break and misorder the transcript,
+            # which sorts on t_start. An anchored (non-zero) alignment still
+            # continues the spoken run and chains normally.
             self._span_start = previous_t_end
 
-        # t_end is the OLDER hypothesis's audio position, because that is the
-        # point through which this text is confirmed - not where the speaker
-        # has since got to. The transcript's latency column is the spec's
-        # stated evidence for this whole change, so overstating freshness here
-        # would corrupt the one number it is judged by.
+        # t_end is the older hypothesis's position - the point through which
+        # this text is confirmed. The newer one would understate latency in
+        # the transcript.
         unit = self._emit(
             result.direction,
             growth,
@@ -496,18 +328,13 @@ class LocalAgreementSegmenter:
     ) -> Unit:
         """Build the Unit and advance the span watermark past it.
 
-        `t_start` is the caller's to choose, and the choice is not cosmetic.
-        A clause committed part-way through an utterance chains from the
-        previous clause's t_end, so the pieces read as a sequence. An
-        utterance that committed nothing early must instead carry
-        `result.t_start`, which asr.py makes equal to t_end - anything else
-        makes the default segmenter disagree with FinalsOnlySegmenter on every
-        row of an ordinary call, and render_markdown sorts on t_start, so the
-        bilingual transcript comes out in the wrong order.
+        The caller chooses `t_start`. A clause committed mid-utterance chains
+        from the previous clause's t_end. An utterance that committed nothing
+        early carries `result.t_start` (equal to t_end, see asr.py), matching
+        FinalsOnlySegmenter, since the transcript sorts on t_start.
 
-        Not a pure constructor: the caller must not call this speculatively or
-        discard the result, or the next unit will claim to start where this one
-        did and the two spans will overlap.
+        Not a pure constructor: never call it speculatively or discard the
+        result, or the next unit's span will overlap this one.
         """
         unit = Unit(
             direction=direction,
@@ -525,38 +352,22 @@ class LocalAgreementSegmenter:
 
         self._previous = []
         self._previous_t_end = 0.0
-        # Per-utterance. Carrying it into the next utterance would let that
-        # one's opening word anchor on this one's last - "всё." closing one
-        # sentence and opening the next - and the alignment would then eat a
-        # word nobody has heard and chain a span across the gap between them.
+        # Per-utterance: carried over, the next utterance's first word could
+        # anchor on this one's last ("всё.") and be eaten.
         self._spoken = []
 
-        # A final is never cut: nothing is left to wait for, so nothing is
-        # held back.
+        # A final is never cut: there is nothing left to wait for.
         remainder = tokens[aligned:]
 
         if not remainder:
-            # Nothing further to say - the final only repeated what was
-            # already spoken, or carried less than it, which _align has
-            # already logged. The span still advances, so the next utterance's
-            # first commit does not claim to start back here.
+            # Nothing new. Still advance the span, so the next utterance does
+            # not claim to start back here.
             self._span_start = result.t_end
             return []
 
-        # An utterance that committed nothing early is one whole utterance,
-        # and must be indistinguishable from what FinalsOnlySegmenter would
-        # have produced - span included, since that is what the transcript is
-        # sorted and timed by. Only a final that actually continues text
-        # already spoken chains from it; a zero alignment means this text
-        # continues nothing, whether because the utterance is untouched or
-        # because the stream restarted under it.
-        #
-        # A final the anchored arm aligned past prepended words chains too,
-        # and should: the remainder follows the spoken run, so it continues
-        # the pieces before it exactly as a final aligned on its first word
-        # would. Dating it result.t_start instead - what the zero alignment
-        # did on the real call - gives a remainder spoken over the last few
-        # seconds a zero-length span at the final's end.
+        # Chain from the span only if this continues spoken text (any non-zero
+        # alignment, anchored included). A zero alignment - nothing committed
+        # early, or a stream restart - must match FinalsOnlySegmenter's span.
         t_start = self._span_start if aligned else result.t_start
         return [
             self._emit(

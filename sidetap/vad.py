@@ -24,14 +24,12 @@ SpeechDetector = Callable[[bytes], bool]
 def webrtc_detector(aggressiveness: int = 2) -> SpeechDetector | None:
     """Real detector, or None when webrtcvad is unavailable.
 
-    `aggressiveness` runs 0-3, higher filtering more non-speech. 2 is a
-    middle setting chosen for meeting audio, where fans and keyboards are
-    common but clipping a quiet speaker costs more than a little extra
-    streamed silence. It is a starting point, not a measured optimum.
+    `aggressiveness` runs 0-3, higher filtering more non-speech. 2 is an
+    unmeasured middle setting for meeting audio: clipping a quiet speaker
+    costs more than streaming a little extra silence.
 
-    Note the returned closure is stateful: webrtcvad adapts to the noise
-    floor across calls, so give each track its own detector rather than
-    sharing one.
+    The returned closure is stateful (webrtcvad adapts to the noise floor),
+    so give each track its own detector.
     """
     try:
         import webrtcvad
@@ -70,8 +68,7 @@ class SilenceGate:
             self._silence_run = 0
             return True
         self._silence_run += 1
-        # Past the tail we send nothing. Keeping the stream alive through the
-        # silence is RecognitionWorker's job (asr.py:KEEPALIVE_S), not the
-        # gate's - blocks stop arriving entirely when the tapped node goes
-        # away, and the gate never sees that.
+        # Past the tail, send nothing. Keeping the stream alive is
+        # RecognitionWorker's job (asr.py:KEEPALIVE_S), because the gate never
+        # sees blocks that stop arriving altogether.
         return self._silence_run <= self._tail_blocks

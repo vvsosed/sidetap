@@ -36,10 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     devices = sub.add_parser(
         "devices", help="list sinks, sources and apps currently playing audio"
     )
-    # Every subcommand takes -v, including this one: main()'s catch-all uses
-    # it to decide between one clean line and a real traceback, and `devices`
-    # is the first command a user runs, so it is where an unexpected error is
-    # most likely to need debugging.
+    # Every subcommand takes -v: main() uses it to choose between one clean
+    # line and a full traceback.
     devices.add_argument("-v", "--verbose", action="store_true")
 
     doctor = sub.add_parser("doctor", help="check the environment before a call")
@@ -53,14 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-api-check", action="store_true", help="skip the three cloud API checks"
     )
     doctor.add_argument("--project", help="GCP project id")
-    # Three, because they are genuinely three different settings: Cloud
-    # Translation rejects europe-west3 outright. Defaults match `run`.
+    # Three regions, because the three services accept different ones.
+    # Defaults match `run`.
     doctor.add_argument("--region", default="europe-west4", help="Speech-to-Text region")
     doctor.add_argument("--mt-region", default="global", help="Translation region")
     doctor.add_argument("--tts-region", default="eu", help="Text-to-Speech region")
-    # The languages you will actually run with. Without them doctor can only
-    # prove the API is reachable, which it was in the case that motivated this:
-    # chirp_3 returned 403 for every locale while list_recognizers said OK.
+    # The languages you will run with: without them doctor only proves the API
+    # is reachable, not that the model serves those locales.
     doctor.add_argument("--their-lang", metavar="BCP47", help="check this language too")
     doctor.add_argument("--my-lang", metavar="BCP47", help="check this language too")
     doctor.add_argument("--model", default="chirp_2", help="Speech-to-Text model")
@@ -90,13 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--my-lang", required=True, metavar="BCP47",
         help="what you speak, e.g. en-US",
     )
-    # Naming a voice and asking for a gender are mutually exclusive rather
-    # than one quietly winning. Silently dropping a flag the user typed is the
-    # same class of failure run.py's VOICES table exists to prevent, and a
-    # warning would not rescue it: with the TUI up, Textual owns the screen
-    # and nothing logged is visible, which is why the stderr handler is only
-    # added under --no-tui. argparse rejects this at parse time instead,
-    # before any cloud call.
+    # A voice and a gender are mutually exclusive rather than one silently
+    # winning. A warning would not help, since nothing logged is visible under
+    # the TUI; argparse rejects the pair before any cloud call.
     voice_in = langs.add_mutually_exclusive_group()
     voice_in.add_argument(
         "--voice-in", default="", metavar="VOICE",
@@ -140,12 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="general/translation-llm (better on idiom) or general/nmt "
         "(~195 ms faster). Falls back to nmt automatically on error.",
     )
-    # Per direction, with no shared flag, for the same reason there is no
-    # --voice: the two directions translate opposite ways, so their useful
-    # rates are inverses. A pair whose target runs 1.23x the length of its
-    # source one way runs about 0.81x the other, so a single value applied to
-    # both fixes one direction and makes the other needlessly fast. Mirrors
-    # --voice-in / --voice-out exactly.
+    # Per direction, with no shared flag: the directions translate opposite
+    # ways, so their useful rates are inverses (a pair running 1.23x one way
+    # runs about 0.81x the other).
     cloud.add_argument(
         "--speaking-rate-in",
         type=speaking_rate,
@@ -183,11 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     out = run.add_argument_group("output")
     out.add_argument("--out", type=Path, default=Path("transcripts"))
-    # default=None, not LAG_CAP_S: it lets run.py tell "the user did not pass
-    # this" from "the user passed 12", so the constant stays the single source
-    # of the value rather than being shadowed by a copy here. The help text is
-    # derived from it for the same reason - written out by hand it would go on
-    # claiming 12 after someone changed the constant.
+    # default=None, so run.py can tell "not passed" from a value and LAG_CAP_S
+    # stays the single source; the help text is derived from it too.
     out.add_argument(
         "--lag-cap",
         type=float,
@@ -229,26 +216,19 @@ def session_name() -> str:
 def _configure_logging(args, level: int) -> tuple[Path | None, str | None]:
     """stderr, unless Textual is about to take the terminal away.
 
-    This is not a tidiness question. Textual paints over the whole screen, so
-    with a stderr handler every log line is destroyed as it is written - and
-    that includes "this direction is now dead", the one line that explains why
-    nothing is being translated. A real run failed exactly this way: both
-    directions died on a 403 at the first block, the panes went red, and the
-    reason existed nowhere the user could reach it.
+    Textual paints over the whole screen, destroying every line logged to
+    stderr - including "this direction is now dead", the one line that
+    explains why nothing is being translated.
 
-    Either way a `run` also writes a log file next to its transcript, named
-    after the same session, so a finished call leaves one set of files that
-    explain each other. Returns that path and the session name.
+    A `run` also writes a log file beside its transcript, named after the
+    same session, so a call leaves one set of files that explain each other.
+    Returns that path and the session name.
     """
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     root = logging.getLogger()
-    # -v raises SIDETAP's verbosity, not the whole process's. Setting the root
-    # logger to DEBUG turns on debug output for every library in it: urllib3
-    # narrating each OAuth token fetch, asyncio announcing its selector, grpc.
-    # This is the log a user reads precisely because the TUI has hidden
-    # everything else, and burying sidetap's own lines in third-party chatter
-    # defeats the point of writing it. Third-party WARNING and above still
-    # come through, because those can matter.
+    # -v raises sidetap's verbosity, not the whole process's: a DEBUG root
+    # would bury sidetap's lines under urllib3, asyncio and grpc chatter.
+    # Third-party WARNING and above still come through.
     root.setLevel(logging.WARNING)
     logging.getLogger("sidetap").setLevel(level)
     for handler in list(root.handlers):
@@ -260,9 +240,8 @@ def _configure_logging(args, level: int) -> tuple[Path | None, str | None]:
         root.addHandler(stream)
         return None, None
 
-    # Textual paints over the whole screen, so a stderr handler under the TUI
-    # writes into a terminal that is being overwritten. Without the TUI it is
-    # still wanted: the file is the durable copy, stderr is the live one.
+    # Under the TUI a stderr handler writes into a terminal being painted
+    # over. Without it, stderr is the live copy and the file the durable one.
     if getattr(args, "no_tui", False):
         stream = logging.StreamHandler(sys.stderr)
         stream.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
@@ -376,9 +355,8 @@ def _doctor(args, graph: GraphSource, launcher, linker, clock) -> int:
     credentials = check_credentials(args.project)
     checks.append(credentials)
     if not args.no_api_check and credentials.ok:
-        # check_credentials only reports ok once one of these two is set,
-        # so the fallback is unreachable - but a KeyError here would surface
-        # as an unexpected crash rather than a clear message.
+        # check_credentials is only ok once one of these is set; the fallback
+        # just avoids a KeyError crash.
         project = args.project or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
         languages = tuple(
             lang for lang in (args.their_lang, args.my_lang) if lang
@@ -461,10 +439,9 @@ def main(
         print(str(exc), file=sys.stderr)
         return 1
     except Exception as exc:
-        # Everything the outside world throws: Google auth and gRPC, a dead
-        # pw-dump, a full disk. None subclass RuntimeError, so an allowlist
-        # misses exactly the failures a first run hits. -v re-raises so a real
-        # traceback is one flag away.
+        # Google auth and gRPC, a dead pw-dump, a full disk: none subclass
+        # RuntimeError, and they are exactly what a first run hits. -v
+        # re-raises for the real traceback.
         if getattr(args, "verbose", False):
             raise
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)

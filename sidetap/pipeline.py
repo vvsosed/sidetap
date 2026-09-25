@@ -35,8 +35,8 @@ class DirectionConfig:
     source_lang: str
     target_lang: str
     voice: str
-    # Per direction, because the two translate opposite ways and their useful
-    # rates are inverses. See the Synthesizer port.
+    # Per direction: the two translate opposite ways, so their useful rates
+    # are inverses. See the Synthesizer port.
     speaking_rate: float = 1.0
 
 
@@ -44,17 +44,12 @@ class DeadAirWatch:
     """Fires when you have spoken and nothing has reached the other party.
 
     Deliberately narrow: it watches the gap between a finished OUT utterance
-    and audio actually being queued for the virtual mic, which catches
-    translation failure, synthesis failure and a dead sink. Recognition being
-    dead is a different failure, already surfaced by Metrics.set_health from
-    RecognitionWorker - keeping that out of here is what stops this reaching
-    into the ported audio path.
+    and audio actually being queued for the virtual mic, catching translation,
+    synthesis and sink failures. Dead recognition is already surfaced by
+    RecognitionWorker's health, which keeps this out of the audio path.
 
-    Not wired to the IN direction, deliberately: on IN a stalled pipeline is
-    not silent the way OUT's is. Playout there just goes idle, the duck
-    opens back up, and you start hearing the remote party's untranslated
-    voice coming through - a louder, faster signal than any alarm this watch
-    could raise, and one that needs no wiring to notice.
+    Not wired to IN: a stalled IN pipeline is not silent. The duck opens and
+    you hear the remote party untranslated, a faster signal than any alarm.
     """
 
     def __init__(self, clock: Clock, threshold_s: float = DEAD_AIR_S):
@@ -64,7 +59,7 @@ class DeadAirWatch:
 
     def heard_speech(self) -> None:
         # Only the first unanswered result starts the timer; resetting it on
-        # each one would let a steady stream of failures never alarm.
+        # each would let a steady stream of failures never alarm.
         if self._pending_since is None:
             self._pending_since = self._clock.monotonic()
 
@@ -111,47 +106,35 @@ class DirectionPipeline:
     def handle(self, result: AsrResult) -> None:
         direction = self._config.direction
 
-        # Interims feed the TUI - the user's only "they are talking right
-        # now" signal. Finals get their `interim` field cleared by
-        # Metrics.set_final instead, once translation succeeds.
+        # Interims feed the TUI's "they are talking" line. Finals clear it via
+        # Metrics.set_final once translation succeeds.
         if not result.is_final:
             self._metrics.set_interim(direction, result.text)
 
-        # EVERY result goes to the segmenter, interims included. The finality
-        # filter lives in the segmenter, NOT here - FinalsOnlySegmenter drops
-        # interims itself. This matters: LocalAgreement-2, the entire reason
-        # this seam exists, works by comparing consecutive INTERIM hypotheses.
-        # Returning early on interims would make the seam decorative, because
-        # no future segmenter could ever see the input its algorithm needs.
+        # EVERY result goes to the segmenter, interims included: the finality
+        # filter belongs to the segmenter, and LocalAgreement-2 works by
+        # comparing consecutive interims.
         #
-        # One reading per result, shared by every unit it commits. Moving this
-        # inside the loop would fold _speak's own translate-and-synthesise time
-        # into the second and later units' asr_ms, which is not what that
-        # column measures.
+        # One reading per result, shared by all its units; inside the loop it
+        # would fold _speak's own time into later units' asr_ms.
         arrived = self._clock.monotonic() - self._session_t0
 
         for unit in self._segmenter.feed(result):
             if self._dead_air is not None:
                 self._dead_air.heard_speech()
-            # Per unit, not per result. A committed prefix is confirmed only
-            # through the OLDER hypothesis's audio position, so its content is
-            # seconds older than the result that triggered it - reading
-            # result.t_end here reports a clause as ~1 s old when it is ~6 s
-            # old, and the transcript's latency column is the stated evidence
-            # for the whole commit-early decision. Identical under
-            # FinalsOnlySegmenter, where unit.t_end IS result.t_end.
+            # Per unit, not per result: a committed prefix is confirmed only
+            # through the older hypothesis's position, so result.t_end would
+            # understate its age by seconds. Identical under
+            # FinalsOnlySegmenter, where unit.t_end is result.t_end.
             #
-            # Rounded to a tenth of a ms: these are wall-clock subtractions,
-            # so raw floats carry binary rounding noise (10.2 - 10.0 ==
-            # 0.19999... not 0.2) that a millisecond-scale metric has no
-            # business showing.
+            # Rounded to 0.1 ms to hide float noise (10.2 - 10.0 != 0.2).
             asr_ms = round(max(0.0, (arrived - unit.t_end) * 1000), 1)
             self._speak(unit, asr_ms)
 
         if result.is_final:
-            # Ends the duck hold with the sentence, including when the final
-            # committed nothing new because the last interim already covered
-            # it. Without this the hold would sit until the starvation bound.
+            # End the duck hold with the sentence, even when the final
+            # committed nothing new; otherwise it would sit until the
+            # starvation bound.
             self._playout.expect_continuation(False)
 
     def _speak(self, unit: Unit, asr_ms: float) -> None:
@@ -164,10 +147,8 @@ class DirectionPipeline:
             )
             self._metrics.set_health(direction, mt=Health.OK)
         except Exception as exc:
-            # Survivable: the direction keeps running, and a later success
-            # clears this health flag. There is no billing call on this path
-            # (or on the synthesis failure path below) - only a successful
-            # call produces text/audio worth paying for.
+            # Survivable: the direction keeps running and a later success
+            # clears the health flag. Failed calls are not billed.
             log.error("translation failed (%s): %s", direction.value, exc)
             self._metrics.set_health(direction, mt=Health.FAILED)
             return
@@ -184,13 +165,9 @@ class DirectionPipeline:
         truncated = False
         refused = False
         try:
-            # Inside the try, not before it: the Synthesizer port is typed as
-            # an Iterator, which permits a non-generator implementation whose
-            # call itself can raise before any iteration happens. A raise
-            # anywhere in here - at call time or mid-iteration - must still
-            # reach finally below, or the utterance it opened is orphaned:
-            # open forever, blocking the queue head and switching the lag cap
-            # off for this direction until the starvation bound closes it.
+            # Inside the try: an Iterator-typed synthesizer may raise at call
+            # time, and every raise must reach finally, or the opened
+            # utterance stays open and blocks the queue head.
             chunks = self._synthesizer.synthesize(
                 target_text, self._config.voice, self._config.speaking_rate
             )
@@ -199,27 +176,20 @@ class DirectionPipeline:
                     continue
                 produced = True
                 if not self._playout.append(handle, chunk):
-                    # Playout will not take any more: either something
-                    # flushed the queue - bypass engaging, or the
-                    # drop-backlog hotkey called directly, both funnel
-                    # through flush() - or playout gave the utterance up at
-                    # the starvation bound. Either way, stop paying for audio
-                    # nobody will hear, and end the gRPC stream rather than
-                    # leave it to garbage collection. The Synthesizer port is
-                    # typed as an Iterator, which need not have close(), so
-                    # this is a capability check and not an assumption.
+                    # Playout will take no more: it was flushed (bypass, mute
+                    # or the drop-backlog hotkey) or given up at the
+                    # starvation bound. Stop paying for audio nobody will hear
+                    # and end the gRPC stream. close() is optional on an
+                    # Iterator, hence the check.
                     closer = getattr(chunks, "close", None)
                     if closer is not None:
                         closer()
                     refused = True
                     break
                 if first_ms is None:
-                    # Set only once playout has actually taken the chunk -
-                    # not when the synthesizer produced it. Setting it
-                    # earlier would call a chunk playout immediately refused
-                    # "heard", which flows into a latency figure, a
-                    # transcript row and dead_air.spoke() for audio nobody
-                    # was ever played.
+                    # Only once playout has accepted a chunk: a refused chunk
+                    # was never heard and must not count as latency, a
+                    # transcript row or dead_air.spoke().
                     first_ms = round((self._clock.monotonic() - started) * 1000, 1)
         except Exception as exc:
             log.error("synthesis failed (%s): %s", direction.value, exc)
@@ -227,44 +197,29 @@ class DirectionPipeline:
             truncated = True
         else:
             if not refused:
-                # Only a generator that ran to completion says TTS is well.
-                # Reaching here after a refusal means playout gave up on this
-                # utterance at the starvation bound, or flush() threw it away
-                # - bypass engaging, or the drop-backlog hotkey called
-                # directly - neither is evidence of health, and painting the
-                # TUI green right after a stall cost the listener half a
-                # sentence is the opposite of what that indicator is for.
+                # Only a generator that ran to completion shows TTS is
+                # healthy; a refusal after a stall or flush is no evidence of
+                # health.
                 self._metrics.set_health(direction, tts=Health.OK)
         finally:
-            # Pairs with begin() on every path, including the raise-at-call
-            # exception above. An utterance left open blocks the queue head
-            # and switches the lag cap off for this direction until the
-            # starvation bound closes it.
+            # Pairs with begin() on every path. An utterance left open blocks
+            # the queue head and disables the lag cap until the starvation
+            # bound closes it.
             self._playout.finish(handle, truncated=truncated)
 
-        # After finish(), the handle is the single source of truth. Playout
-        # sets truncated itself when it abandons an utterance at the
-        # starvation bound, and finish() ORs rather than overwrites, so this
-        # picks up a cut-off the producer never saw. Reading the local
-        # variable instead would silently report a sentence the listener
-        # heard cut in half as a clean completion.
+        # Read back from the handle: playout sets truncated itself when it
+        # abandons a stalled utterance, which the producer never saw.
         truncated = handle.truncated
 
         if produced:
-            # Billed once the synthesizer has produced audio, not on what was
-            # heard afterward: Chirp 3 HD sends the whole input string before
-            # the first chunk comes back, so Google bills the request as soon
-            # as it has produced anything, regardless of which refusal (or
-            # none) follows. A synthesis that raises before producing any
-            # audio at all is not billed - see the exception path above.
+            # Billed once any audio is produced: Chirp 3 HD takes the whole
+            # input before the first chunk, so the request is billed whatever
+            # happens afterwards.
             self._metrics.add_cost(self._rates.synthesis_usd(len(target_text)))
 
         if handle.dropped:
-            # flush() threw the queue away - bypass engaging, or the
-            # drop-backlog hotkey called directly. Record it as dropped
-            # rather than returning silently - losing the row loses the
-            # SOURCE line too, and the remote party's sentence would read as
-            # if never spoken.
+            # Flushed (bypass, mute or the drop-backlog hotkey). Record it as
+            # dropped: losing the row would lose the source line too.
             if self._on_record is not None:
                 self._on_record(
                     Record(unit=unit, target_text=target_text, dropped=True)
@@ -272,32 +227,17 @@ class DirectionPipeline:
             return
 
         if produced and handle.truncated and first_ms is None:
-            # Playout gave up on this utterance at the starvation bound
-            # before it ever accepted anything from it, so nothing was heard
-            # - but the sentence was said, and was billed. Losing the row
-            # would lose the source line with it, exactly as on the
-            # handle.dropped path above. No latency: there is nothing to
-            # report a wait for.
-            # Leave it that way - render_markdown (transcript.py) tells this
-            # case apart from a cut-short utterance by testing
-            # `latency.tts_ms == 0.0`, so attaching an asr/mt latency here
-            # for debugging, without also keeping tts_ms at 0.0, would
-            # silently reword every stalled utterance in the transcript as
-            # "cut short before the end" instead.
+            # Playout gave up at the starvation bound before accepting
+            # anything, so nothing was heard - but it was said and billed,
+            # so keep the row, as on the dropped path above.
             #
-            # `and handle.truncated` is redundant given the other two: every
-            # playout-side close that leaves first_ms unset (the starvation
-            # bound on a still-queued, never-started utterance) sets
-            # truncated in the same breath, so `produced and first_ms is
-            # None and not handle.dropped` already implies it. Kept anyway,
-            # spelled out, as defence against a future playout path that
-            # closes an utterance without setting the flag.
+            # No latency: render_markdown tells this case apart from a
+            # cut-short utterance by `latency.tts_ms == 0.0`.
             #
-            # `first_ms is None` is what scopes this to that case alone: a
-            # synthesis that fails after some audio was already accepted
-            # also produces and also ends up truncated, but first_ms is set
-            # by then, and that case belongs to the full record below, with
-            # the latency the listener actually experienced attached to it.
+            # `handle.truncated` is implied by the other two conditions but
+            # spelled out in case a future playout path closes without it.
+            # `first_ms is None` excludes a synthesis that failed after audio
+            # was accepted; that gets the full record below, with latency.
             if self._on_record is not None:
                 self._on_record(
                     Record(unit=unit, target_text=target_text, truncated=True)
@@ -310,16 +250,12 @@ class DirectionPipeline:
             return
 
         if unit.continues:
-            # Armed only here, on the path where playout actually accepted
-            # audio. Arming it on a failure path would let a direction whose
-            # translator is down re-arm every five seconds and hold the duck
-            # shut for the whole call with silence behind it.
+            # Armed only once playout has accepted audio, so a direction
+            # whose translator is down cannot keep re-arming the hold.
             #
-            # This call only ever arms; clearing is handle()'s job alone, and
-            # it clears on result.is_final, not on unit.continues. A future
-            # segmenter that emitted a non-continuing unit from an INTERIM,
-            # not only from a final, would leave an already-armed hold
-            # standing, because handle()'s clear never runs on an interim.
+            # Only ever armed here; handle() clears it on a final. A segmenter
+            # emitting a non-continuing unit from an interim would leave the
+            # hold standing.
             self._playout.expect_continuation(True)
 
         tts_total_ms = round((self._clock.monotonic() - started) * 1000, 1)
@@ -346,11 +282,8 @@ class DirectionPipeline:
     def consume(self, results_q: queue_module.Queue, stop: threading.Event) -> None:
         """Drain `results_q` until it is empty AND `stop` is set.
 
-        Checking `stop` before trying to get an item (rather than after) would
-        drop results still sitting in the queue at the moment `stop` flips -
-        exactly the trailing finals RecognitionWorker emits on its way out
-        after Ctrl-C, per the comment in asr.py. So this only gives up once a
-        get() has timed out with nothing waiting AND `stop` is set.
+        Stopping as soon as `stop` flips would drop the trailing finals
+        RecognitionWorker emits on its way out after Ctrl-C.
         """
         while True:
             try:
