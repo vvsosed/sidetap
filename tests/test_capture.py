@@ -306,3 +306,39 @@ def test_the_queue_counts_arrivals_as_well_as_drops():
     assert q.put(b"c") is False, "the queue was meant to be full here"
     assert q.accepted == 2, "a dropped block is not an arrival"
     assert q.dropped == 1
+
+
+def test_the_virtual_mic_as_default_input_is_refused_with_a_way_out(routing_graph):
+    """Recording sidetap's own output instead of the user.
+
+    Their voice never reached recognition, the other party heard nothing for
+    the whole call, and no alarm fired because audio kept arriving.
+    """
+    from dataclasses import replace
+
+    graph = replace(routing_graph, default_source="sidetap_virtmic")
+    with pytest.raises(CaptureError) as excinfo:
+        plan_recorders(graph, CaptureConfig(app="zoom"))
+    assert "--mic" in str(excinfo.value)
+
+
+def test_a_mic_substring_never_matches_sidetaps_own_virtual_mic(routing_graph):
+    """"sidetap Virtual Mic" matches "Mic", and it registers first at startup."""
+    from dataclasses import replace
+
+    virtmic = routing_graph.node_by_name("sidetap_virtmic")
+    graph = replace(
+        routing_graph,
+        nodes=(virtmic,) + tuple(n for n in routing_graph.nodes if n is not virtmic),
+    )
+    specs = plan_recorders(graph, CaptureConfig(app="zoom", mic="Mic"))
+    assert specs[0].target == 1002, "the USB microphone, not the virtual mic"
+
+
+def test_no_default_microphone_says_so_instead_of_matching_none(idle_graph):
+    from dataclasses import replace
+
+    graph = replace(idle_graph, default_source=None)
+    with pytest.raises(CaptureError) as excinfo:
+        plan_recorders(graph, CaptureConfig())
+    assert "None" not in str(excinfo.value)

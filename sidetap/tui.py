@@ -104,6 +104,11 @@ class SidetapApp(App):
         # but before the timer stops; return rather than raise NoMatches.
         if not self.is_running:
             return
+        if self._session is not None and self._session.stop.is_set():
+            # A signal, or both directions dead. Nothing else would end the
+            # app, and the graph is only restored once it does.
+            self.exit()
+            return
         snapshot = self._metrics.snapshot()
         for direction, state in snapshot.directions.items():
             suffix = direction.value
@@ -113,7 +118,9 @@ class SidetapApp(App):
             # Named, not just coloured: NO AUDIO means nothing is arriving,
             # DEAD AIR means an utterance produced nothing, and the user has to
             # tell them apart to act.
-            if state.no_audio:
+            if state.playback_failed:
+                alarm = "  PLAYBACK FAILED"
+            elif state.no_audio:
                 alarm = "  NO AUDIO ARRIVING"
             elif state.dead_air:
                 alarm = "  DEAD AIR"
@@ -126,7 +133,9 @@ class SidetapApp(App):
                 f"{format_latency(state.latency)}{alarm}"
             )
             pane = self.query_one(f"#pane-{suffix}")
-            pane.set_class(state.dead_air or state.no_audio, "alarm")
+            pane.set_class(
+                state.dead_air or state.no_audio or state.playback_failed, "alarm"
+            )
 
         # Shown because a sticky downgrade to NMT is otherwise invisible: the
         # health dots stay green while quality drops.

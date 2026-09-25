@@ -10,7 +10,7 @@ import time
 
 from .adapters import PwCatSink, PwLoopbackFactory, WpctlVolumeControl
 from .asr import AsrConfig, RecognitionWorker, build_recognizer_factory, project_from_environment
-from .capture import CaptureConfig, CaptureError, PipeWireCapture
+from .capture import CaptureConfig, CaptureError, PipeWireCapture, resolve_mic
 from .cost import Rates
 from .metrics import Health, Metrics
 from .pipeline import DeadAirWatch, DirectionConfig, DirectionPipeline
@@ -27,6 +27,12 @@ from .vad import SilenceGate, webrtc_detector
 log = logging.getLogger(__name__)
 
 SHUTDOWN_JOIN_S = 3.0
+
+# Every signal that asks the process to end. SIGHUP is closing the terminal:
+# left at its default it kills Python without running a single finally, so the
+# graph is never restored and the call stays routed into a duck that may be at
+# 0%.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 
 # One male and one female voice per language this has been run against. Any
 # other language must name its voice explicitly, because an invalid voice is a
@@ -322,7 +328,7 @@ class Session:
         # A stream that restarts mid-call would otherwise be autoconnected to
         # the speakers, unducked and unjournalled.
         self._spawn(self.router.run, (self.stop,), "routing-watch")
-        self._spawn(self._poll_capture_health, (self.stop,), "capture-health")
+        self._spawn(self._poll_health, (self.stop,), "health")
         results: dict[Direction, queue.Queue] = {d: queue.Queue() for d in Direction}
 
         for direction, pipeline in self.pipelines.items():
@@ -383,8 +389,8 @@ class Session:
             log.error("both directions are dead; stopping")
             self.stop.set()
 
-    def _poll_capture_health(self, stop: threading.Event) -> None:
-        """Watch for two capture failures nothing else can see.
+    def _poll_health(self, stop: threading.Event) -> None:
+        """Watch for failures nothing else can see.
 
         Drops: DroppingQueue only logs, so an overflow would leave a gap that
         reads as nobody talking. The lag cap's on_dropped covers the playout
@@ -393,10 +399,19 @@ class Session:
         No audio: an unlinked capture node delivers zero bytes, not silence,
         so every pane stays green while that direction is deaf. A stalled
         arrival counter is the only evidence.
+
+        Dead playback: PwCatSink only logs, to a log the TUI hides.
+
+        Dead air: consume() checks it only between results, so a stage hung
+        inside handle() would otherwise never raise the alarm.
         """
         seen = {d: (0, self._clock.monotonic()) for d in Direction}
         while not stop.is_set():
             now = self._clock.monotonic()
+            for direction, playout in self.playouts.items():
+                self.metrics.set_playback_failed(direction, playout.sink_failed)
+            for pipeline in self.pipelines.values():
+                pipeline.check_dead_air()
             for direction in Direction:
                 track_queue = self.capture.queues.get(direction.track)
                 if track_queue is None:
@@ -439,9 +454,9 @@ class Session:
     def _set_bypass_locked(self, value: bool) -> None:
         self._apply_suppression_locked(value)
         if value:
-            # Open the duck directly rather than via tick(): a playout whose
-            # sink has died never ticks again, and bypass - the escape hatch -
-            # would leave the duck shut.
+            # Open the duck directly rather than via tick(): a playout thread
+            # blocked in a sink write cannot tick, and bypass - the escape
+            # hatch - would leave the duck shut.
             for playout in self.playouts.values():
                 if playout.duck is not None:
                     playout.duck.open()
@@ -506,11 +521,17 @@ class Session:
             return
         snapshot = self._graph.snapshot()
         virtmic = snapshot.node_by_name(VIRTMIC_SINK)
-        mic = snapshot.node_by_name(snapshot.default_source or "")
+        try:
+            # The mic capture uses, and never the virtual mic itself: linking
+            # that into its own sink would loop sidetap's output back in.
+            mic = resolve_mic(snapshot, self._args.mic)
+        except CaptureError as exc:
+            log.warning("%s", exc)
+            mic = None
         if virtmic is None or mic is None:
             log.warning(
-                "bypass could not find the default microphone, so the other "
-                "party will hear nothing from you until you toggle it back"
+                "bypass could not find your microphone, so the other party "
+                "will hear nothing from you until you toggle it back"
             )
             return
         outputs = snapshot.ports_of(mic.id, "out")
@@ -625,11 +646,18 @@ def run_session(args, *, graph, launcher, linker, clock, recognizer_factory=None
         session.stop.set()
 
     # Installed before setup(), which rewires the graph and then waits on a
-    # network round-trip to warm TTS; a Ctrl-C there should request a stop,
-    # not raise mid-setup.
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    # network round-trip to warm TTS; a signal there should request a stop,
+    # not raise mid-setup. Put back afterwards, for callers that live on.
+    previous = {sig: signal.signal(sig, handle_signal) for sig in STOP_SIGNALS}
+    try:
+        return _run(session, args)
+    finally:
+        for sig, handler in previous.items():
+            if handler is not None:
+                signal.signal(sig, handler)
 
+
+def _run(session: Session, args) -> int:
     try:
         session.setup()
     except BaseException:
@@ -642,14 +670,16 @@ def run_session(args, *, graph, launcher, linker, clock, recognizer_factory=None
     # thread exists (a capture-node timeout, a SpeechClient that fails to
     # build), which must not leave the call routed into the duck.
     try:
-        session.start()
+        # A stop requested during setup means quit, not start the pipeline.
+        if not session.stop.is_set():
+            session.start()
 
-        if args.no_tui:
-            _run_headless(session)
-        else:
-            from .tui import run_tui
+            if args.no_tui:
+                _run_headless(session)
+            else:
+                from .tui import run_tui
 
-            run_tui(session)
+                run_tui(session)
     finally:
         session.shutdown()
 

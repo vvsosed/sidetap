@@ -9,6 +9,7 @@ from typing import Iterator, Sequence
 
 import pytest
 
+from sidetap import routing as _routing
 from sidetap.graph import PwGraph, parse_graph
 from sidetap.ports import LinkResult, LoopbackSpec
 from sidetap.types import AsrResult
@@ -312,3 +313,17 @@ def zoom_graph() -> PwGraph:
 @pytest.fixture
 def routing_graph() -> PwGraph:
     return load_graph("pw_dump_routing.json")
+
+
+# Saved before any test patches it, for tests of the real naming.
+REAL_NEW_DUCK_NAME = _routing._new_duck_name
+
+
+@pytest.fixture(autouse=True)
+def fixed_duck_name(monkeypatch):
+    """Name every Router's duck `sidetap_duck`, as the fixtures do.
+
+    Production appends a random suffix per session; a test of that patches
+    REAL_NEW_DUCK_NAME back in.
+    """
+    monkeypatch.setattr(_routing, "_new_duck_name", lambda: _routing.DUCK_NODE)

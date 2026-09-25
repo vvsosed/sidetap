@@ -146,3 +146,34 @@ def test_the_real_fixture_carries_no_identifying_data():
                     token in line
                     for token in ('"user"', '"host"', "0000", "redacted", ": 1000")
                 ), f"{key} looks unscrubbed: {line.strip()}"
+
+
+def test_links_are_parsed_from_a_real_dump():
+    """The router breaks and restores these, so they must come from pw-dump."""
+    graph = parse_graph((FIXTURES / "pw_dump_real.json").read_text())
+    assert len(graph.links) == 2
+    link = next(l for l in graph.links if l.id == 93)
+    assert (link.output_node, link.output_port, link.input_node, link.input_port) == (
+        95, 91, 62, 56,
+    )
+    assert link.serial == 2138
+
+
+def test_a_link_with_its_endpoints_only_in_props_is_still_parsed():
+    dump = json.dumps([
+        {"id": 7, "type": "PipeWire:Interface:Link",
+         "info": {"props": {"link.output.node": 1, "link.output.port": 2,
+                            "link.input.node": 3, "link.input.port": 4,
+                            "object.serial": 70}}},
+        {"id": 8, "type": "PipeWire:Interface:Link", "info": {"props": {}}},
+    ])
+    (link,) = parse_graph(dump).links
+    ends = (link.output_node, link.output_port, link.input_node, link.input_port)
+    assert ends == (1, 2, 3, 4)
+    assert link.serial == 70
+
+
+def test_sidetaps_own_nodes_are_recognised_by_name():
+    graph = parse_graph((FIXTURES / "pw_dump_routing.json").read_text())
+    own = {n.name for n in graph.nodes if n.is_sidetap}
+    assert own == {"sidetap_duck", "sidetap_tts_sink", "sidetap_virtmic"}

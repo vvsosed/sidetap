@@ -9,7 +9,7 @@ import time
 
 from dataclasses import dataclass
 
-from .graph import SINK, SOURCE, PwGraph
+from .graph import SINK, SOURCE, PwGraph, PwNode
 from .ports import Clock, GraphSource, Linker, ProcessLauncher
 from .recorder import Recorder, RecorderSpec
 from .tap import AppTap
@@ -37,20 +37,40 @@ class CaptureConfig:
     latency: str = "100ms"
 
 
+def resolve_mic(graph: PwGraph, mic: str | None) -> PwNode:
+    """The user's microphone: `mic` if given, else the default source.
+
+    Never one of sidetap's own nodes. The virtual mic is an Audio/Source too,
+    so as the default input, or matched by a substring like "Mic", it would be
+    captured instead of the user: sidetap hears only itself, the other party
+    hears nothing, and no alarm fires because audio keeps arriving.
+    """
+    if mic:
+        candidates = [n for n in graph.by_class(SOURCE) if not n.is_sidetap]
+        node = next((n for n in candidates if n.name == mic), None) or next(
+            (n for n in candidates if n.matches(mic)), None
+        )
+        if node is None:
+            raise CaptureError(f"No microphone matching {mic!r}. Try: sidetap devices")
+        return node
+    node = graph.node_by_name(graph.default_source or "")
+    if node is None:
+        raise CaptureError("No default microphone. Pass --mic; see: sidetap devices")
+    if node.is_sidetap:
+        raise CaptureError(
+            f"Your default input is sidetap's own {node.name}, so sidetap would "
+            "hear itself instead of you. Pass --mic with your real microphone; "
+            "see: sidetap devices"
+        )
+    return node
+
+
 def plan_recorders(graph: PwGraph, config: CaptureConfig) -> list[RecorderSpec]:
     """Pure: work out what to record from one graph snapshot."""
     specs: list[RecorderSpec] = []
 
     if config.mic_enabled:
-        node = (
-            graph.find(config.mic, SOURCE)
-            if config.mic
-            else graph.node_by_name(graph.default_source or "")
-        )
-        if node is None:
-            raise CaptureError(
-                f"No microphone matching {config.mic!r}. Try: sidetap devices"
-            )
+        node = resolve_mic(graph, config.mic)
         specs.append(
             RecorderSpec(track=MIC, target=node.serial, latency=config.latency)
         )

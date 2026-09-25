@@ -24,7 +24,7 @@ imported. The two repositories share no runtime dependency.
 `sidetap/` is the application; see **Architecture** below for the module
 table.
 
-`tests/` holds 555 tests that run with no audio hardware, no network and no
+`tests/` holds 583 tests that run with no audio hardware, no network and no
 credentials — every subprocess, socket and clock the package touches sits
 behind a `Protocol` in `ports.py`, with a real implementation in
 `adapters.py` and a fake in `tests/conftest.py`.
@@ -63,7 +63,7 @@ pw-cli --version                   # needs >= 0.3.60
 pw-dump | head                     # graph as JSON
 wpctl status                       # sinks/sources, incl. sidetap's own nodes
 
-uv run pytest -q                                   # 555 tests, no audio/network/creds needed
+uv run pytest -q                                   # 583 tests, no audio/network/creds needed
 uv run sidetap devices                              # run this MID-CALL, not before
 uv run sidetap doctor                               # environment checks
 uv run sidetap doctor --install                     # write the virtual-mic config (once)
@@ -130,7 +130,7 @@ one asyncio loop. Per direction: a capture thread (in `capture.py`, one per
 track), an ASR worker thread, a translate-and-synthesise worker thread
 (`DirectionPipeline.consume`), and a playout thread, joined by
 `queue.Queue`s. Two more run session-wide: the routing watcher
-(`Router.run`) and the capture health poller.
+(`Router.run`) and the health poller (`Session._poll_health`).
 
 Textual owns the main thread's event loop and **the pipeline never calls into
 it** — worker threads write to a lock-guarded `Metrics` snapshot
@@ -195,7 +195,7 @@ as a style preference and this is not one.
   `google.cloud.translate` client — its `google.api_core.exceptions` import
   stays at module level, since it needs no network or credentials), not at
   module level. `webrtcvad` the same way (`vad.py:webrtc_detector`), with a
-  fallback to a no-op gate if it is missing. This is what lets 555 tests
+  fallback to a no-op gate if it is missing. This is what lets 583 tests
   import the package and run with no credentials configured at all — a
   top-level `from google.cloud import X` would make every test that merely
   imports the module require live credentials to collect.
@@ -244,6 +244,22 @@ as a style preference and this is not one.
   node; the application's link to your speakers is routing.py's concern, not
   the tap's, and stays untouched until `Router.engage()` re-routes it through
   the duck.
+- **Routing breaks the links the app really has, never a guessed one.**
+  `Router._plan` reads the stream's links into real sinks from pw-dump's
+  `Interface:Link` objects and journals exactly those. Assume the default
+  sink instead and an app set to another device keeps playing there
+  unducked, while `restore()` creates links that never existed. It links
+  into the duck before unlinking anything, so a failure leaves the original
+  audible rather than silent, and it re-checks routed streams every poll
+  because WirePlumber may link them again.
+- **Each session's duck has its own name** (`sidetap_duck.<hex>`). A session
+  killed without cleanup leaves its `pw-loopback` running, possibly at 0%;
+  with a shared name the next run would route the call into that leftover
+  and never raise its volume.
+- **Every signal that ends the process is a clean stop**, SIGHUP (closing the
+  terminal) and SIGQUIT included, and the TUI exits once `session.stop` is
+  set. Left at its default, SIGHUP kills Python without running any
+  `finally`, so nothing restores the graph.
 - **`Router.engage()` reuses one snapshot rather than re-reading the graph**
   after spawning the duck loopback, because `spawn_writer()` returns as soon
   as the process forks with no guarantee its nodes are registered yet. A
@@ -268,7 +284,7 @@ as a style preference and this is not one.
   stereo only: `ports_of()` sorts by port *name*, and for 5.1 that
   alphabetizes to FC, FL, FR, LFE, SL, SR — not positional order — so a
   5.1 sink would cross channels. Scoped to stereo/mono for v1; see
-  `routing.py`'s `_route_locked` for the full comment.
+  `routing.py`'s `_plan` for the full comment.
 - **`SILENCE_TAIL_BLOCKS = 5` and `aggressiveness = 2`** (`vad.py`) were
   inherited from meetscribe, a transcriber with no latency budget, and have
   not been remeasured against Chirp or against sidetap's two very different

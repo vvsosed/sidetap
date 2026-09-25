@@ -379,7 +379,7 @@ class PwCatSink:
             self._process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             # pw-cat died. Playout must keep draining rather than deadlock;
-            # the health flag is what the TUI turns red.
+            # Session's health poll reports `failed` and the TUI turns red.
             self.failed = True
             # Report the exit code: a pw-cat killed by a signal - the common
             # case, since killing sidetap kills its process group - writes

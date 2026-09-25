@@ -31,6 +31,7 @@ class DirectionState:
     capture_dropped: int = 0
     dead_air: bool = False
     no_audio: bool = False
+    playback_failed: bool = False
     asr: Health = Health.OK
     mt: Health = Health.OK
     tts: Health = Health.OK
@@ -99,6 +100,11 @@ class Metrics:
         """
         with self._lock:
             self._states[direction].no_audio = value
+
+    def set_playback_failed(self, direction: Direction, value: bool) -> None:
+        """This direction's pw-cat has died, so nothing it plays is heard."""
+        with self._lock:
+            self._states[direction].playback_failed = value
 
     def set_capture_dropped(self, direction: Direction, count: int) -> None:
         """Blocks the CAPTURE queue discarded, as an absolute count.

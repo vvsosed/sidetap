@@ -21,9 +21,11 @@ class FakeTranslationClient:
         self.error = error
         self.fail_first = fail_first
         self.requests = []
+        self.timeouts = []
 
-    def translate_text(self, request):
+    def translate_text(self, request, timeout=None):
         self.requests.append(request)
+        self.timeouts.append(timeout)
         model_should_fail = any(request["model"].endswith(m) for m in self.fail_models)
         call_should_fail = len(self.requests) <= self.fail_first
         if model_should_fail or call_should_fail:
@@ -182,3 +184,20 @@ def test_empty_text_is_not_sent():
     client = FakeTranslationClient()
     assert GoogleTranslator(_config(), client).translate("  ", "en-US", "ru-RU") == ""
     assert client.requests == []
+
+
+def test_every_call_carries_a_short_deadline():
+    """Without one the SDK waits 600 s, twice with the NMT retry.
+
+    A connection that goes silent mid-call held the direction for up to 20
+    minutes, and nothing on screen changed while it did.
+    """
+    from sidetap.translate import TRANSLATE_TIMEOUT_S
+
+    client = FakeTranslationClient(fail_first=1)
+    translator = GoogleTranslator(TranslateConfig(project_id="p"), client)
+    translator.translate("hello", "en-US", "ru-RU")
+
+    assert len(client.timeouts) == 2, "the LLM call and its NMT retry"
+    assert all(t == TRANSLATE_TIMEOUT_S for t in client.timeouts)
+    assert TRANSLATE_TIMEOUT_S <= 10
