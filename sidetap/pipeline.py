@@ -67,9 +67,12 @@ class DeadAirWatch:
         self._pending_since = None
 
     def alarming(self) -> bool:
-        if self._pending_since is None:
+        # Read once: the health poll calls this while the pipeline thread may
+        # be clearing it.
+        pending_since = self._pending_since
+        if pending_since is None:
             return False
-        return (self._clock.monotonic() - self._pending_since) > self._threshold_s
+        return (self._clock.monotonic() - pending_since) > self._threshold_s
 
 
 class DirectionPipeline:
@@ -102,6 +105,13 @@ class DirectionPipeline:
     @property
     def direction(self) -> Direction:
         return self._config.direction
+
+    def check_dead_air(self) -> None:
+        """Publish the dead-air state. Also called by Session's health poll,
+        because consume() cannot while a stage is hung inside handle()."""
+        if self._dead_air is not None:
+            alarming = self._dead_air.alarming()
+            self._metrics.set_dead_air(self._config.direction, alarming)
 
     def handle(self, result: AsrResult) -> None:
         direction = self._config.direction
@@ -291,8 +301,7 @@ class DirectionPipeline:
             except queue_module.Empty:
                 if stop.is_set():
                     return
-                if self._dead_air is not None and self._dead_air.alarming():
-                    self._metrics.set_dead_air(self._config.direction, True)
+                self.check_dead_air()
                 continue
             try:
                 self.handle(result)

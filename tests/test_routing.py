@@ -735,3 +735,247 @@ def test_has_routed_is_false_until_a_stream_is_actually_rewired(
     )
     playing.engage(app_pattern="zoom")
     assert playing.has_routed is True
+
+
+# --- Routing from the links that actually exist --------------------------
+
+from dataclasses import replace  # noqa: E402
+
+from sidetap.graph import PLAYBACK_STREAM, SINK, PwLink, PwNode, PwPort  # noqa: E402
+from tests.conftest import REAL_NEW_DUCK_NAME  # noqa: E402
+
+HEADSET = PwNode(41, 1003, "alsa_output.headset", "Headset", SINK)
+HEADSET_PORTS = (
+    PwPort(411, 41, "playback_FL", "in"),
+    PwPort(412, 41, "playback_FR", "in"),
+)
+TO_HEADSET = (PwLink(95, 1601, 55, 551, 41, 411), PwLink(96, 1602, 55, 552, 41, 412))
+
+
+def _with_headset(graph, links):
+    """The routing fixture plus a non-default headset, with the given links."""
+    return replace(
+        graph,
+        nodes=graph.nodes + (HEADSET,),
+        ports=graph.ports + HEADSET_PORTS,
+        links=links,
+    )
+
+
+def _router(tmp_path, *snapshots, linker=None):
+    linker = linker or FakeLinker()
+    router = Router(
+        graph=FakeGraphSource(*snapshots),
+        linker=linker,
+        unlinker=linker,
+        loopbacks=FakeLoopbackFactory(),
+        journal_path=tmp_path / "j.json",
+    )
+    return router, linker
+
+
+def test_engage_breaks_the_link_the_app_really_has_not_the_default_sink(
+    tmp_path, routing_graph
+):
+    """Zoom set to play on a headset that is not the default output.
+
+    Assuming the default sink left the headset link live - the original under
+    every translation - and restore() then linked Zoom to the speakers, a link
+    that never existed, and cleared the journal.
+    """
+    graph = _with_headset(routing_graph, TO_HEADSET)
+    router, linker = _router(tmp_path, graph)
+    router.engage(app_pattern="zoom")
+
+    assert sorted(linker.unlinks) == [(551, 411), (552, 412)]
+    assert {r.dst_serial for r in Journal.load(tmp_path / "j.json").broken} == {1003}
+
+    linker.links.clear()
+    router.restore()
+    assert (551, 401) not in linker.links and (552, 402) not in linker.links
+    to_headset = sorted(pair for pair in linker.links if pair[1] in (411, 412))
+    assert to_headset == [(551, 411), (552, 412)]
+
+
+def test_a_stream_not_yet_linked_anywhere_journals_nothing_to_restore(
+    tmp_path, routing_graph
+):
+    graph = replace(routing_graph, links=())
+    router, linker = _router(tmp_path, graph)
+    router.engage(app_pattern="zoom")
+
+    assert linker.unlinks == []
+    assert sorted(linker.links) == [(551, 701), (552, 702)]
+    assert Journal.load(tmp_path / "j.json").broken == ()
+    assert router.has_routed is True
+
+
+def test_a_speaker_link_that_appears_after_routing_is_broken_too(tmp_path, routing_graph):
+    """WirePlumber linking the stream once it is already in the duck.
+
+    Skipping routed streams entirely left that link live for the rest of the
+    call.
+    """
+    unlinked = replace(routing_graph, links=())
+    router, linker = _router(tmp_path, unlinked, routing_graph)
+    router.engage(app_pattern="zoom")
+    linker.links.clear()
+
+    assert router.poll_once() == 0, "already routed; nothing newly routed"
+    assert sorted(linker.unlinks) == [(551, 401), (552, 402)]
+    assert linker.links == [], "the duck links were already made"
+    assert {r.dst_serial for r in Journal.load(tmp_path / "j.json").broken} == {1001}
+
+
+def test_a_link_already_broken_is_not_broken_again_from_a_stale_snapshot(
+    tmp_path, routing_graph
+):
+    router, linker = _router(tmp_path, routing_graph)
+    router.engage(app_pattern="zoom")
+    calls = (len(linker.links), len(linker.unlinks))
+
+    router.poll_once()
+    router.poll_once()
+    assert (len(linker.links), len(linker.unlinks)) == calls
+
+
+def test_a_re_created_link_is_broken_again(tmp_path, routing_graph):
+    """Same ports, new link: its serial differs from the one we removed."""
+    recreated = replace(
+        routing_graph,
+        links=tuple(replace(link, id=link.id + 100, serial=link.serial + 100)
+                    for link in routing_graph.links),
+    )
+    router, linker = _router(tmp_path, routing_graph, recreated)
+    router.engage(app_pattern="zoom")
+    linker.unlinks.clear()
+
+    router.poll_once()
+    assert sorted(linker.unlinks) == [(551, 401), (552, 402)]
+    assert len(Journal.load(tmp_path / "j.json").broken) == 2, "same refs, not duplicated"
+
+
+def test_a_routed_stream_moved_to_another_sink_is_restored_there_only(
+    tmp_path, routing_graph
+):
+    """Restoring both the old and the new target would play the call twice."""
+    moved = _with_headset(routing_graph, TO_HEADSET)
+    router, linker = _router(tmp_path, routing_graph, moved)
+    router.engage(app_pattern="zoom")
+    router.poll_once()
+
+    assert {r.dst_serial for r in Journal.load(tmp_path / "j.json").broken} == {1003}
+    linker.links.clear()
+    router.restore()
+    assert sorted(linker.links) == [(551, 411), (552, 412)]
+
+
+def test_a_failed_link_into_the_duck_leaves_the_speaker_link_alone(
+    tmp_path, routing_graph
+):
+    """Audible beats silent: never unlink the old path before the new one works."""
+
+    class DuckRefuses(FakeLinker):
+        def link(self, src, dst):
+            self.links.append((src, dst))
+            return LinkResult.FAILED
+
+    router, linker = _router(tmp_path, routing_graph, linker=DuckRefuses())
+    router.engage(app_pattern="zoom")
+
+    assert linker.links, "it tried"
+    assert linker.unlinks == []
+    assert router.has_routed is False
+
+
+def test_a_stream_without_ports_yet_is_routed_once_they_appear(tmp_path, routing_graph):
+    portless = replace(
+        routing_graph,
+        ports=tuple(p for p in routing_graph.ports if p.node_id != 55),
+        links=(),
+    )
+    router, linker = _router(tmp_path, portless, routing_graph)
+    router.engage(app_pattern="zoom")
+    assert linker.links == [] and router.has_routed is False
+
+    assert router.poll_once() == 1
+    assert sorted(linker.links) == [(551, 701), (552, 702)]
+
+
+def test_sidetaps_own_sinks_are_never_treated_as_the_apps_output(tmp_path, routing_graph):
+    """Links into the TTS sink or a leftover duck are not something to restore."""
+    graph = replace(
+        routing_graph,
+        links=routing_graph.links + (PwLink(97, 1603, 55, 551, 80, 801),),
+    )
+    router, linker = _router(tmp_path, graph)
+    router.engage(app_pattern="zoom")
+
+    assert (551, 801) not in linker.unlinks
+    assert all(r.dst_serial != 1400 for r in Journal.load(tmp_path / "j.json").broken)
+
+
+def test_each_engage_names_its_duck_uniquely(tmp_path, routing_graph, monkeypatch):
+    from sidetap import routing
+
+    monkeypatch.setattr(routing, "_new_duck_name", REAL_NEW_DUCK_NAME)
+    names = []
+    for index in range(2):
+        loopbacks = FakeLoopbackFactory()
+        router = Router(
+            graph=FakeGraphSource(routing_graph),
+            linker=FakeLinker(),
+            unlinker=FakeLinker(),
+            loopbacks=loopbacks,
+            journal_path=tmp_path / f"{index}.json",
+        )
+        router.engage(app_pattern="zoom")
+        assert dict(loopbacks.specs[0].capture_props)["node.name"] == router.duck_name
+        names.append(router.duck_name)
+
+    assert names[0] != names[1]
+    assert all(name.startswith(DUCK_NODE + ".") for name in names)
+
+
+def test_engage_never_routes_into_a_duck_left_by_an_earlier_session(
+    tmp_path, routing_graph, monkeypatch
+):
+    """A session killed without cleanup can leave its duck at 0% volume.
+
+    With a shared name, the next run routed the call into that leftover and,
+    believing its own duck was open, never raised the volume: silence until
+    the first translation happened to cycle the duck.
+    """
+    from sidetap import routing
+
+    monkeypatch.setattr(routing, "_new_duck_name", REAL_NEW_DUCK_NAME)
+    router, linker = _router(tmp_path, routing_graph)  # contains a leftover sidetap_duck
+    router.engage(app_pattern="zoom")
+    assert not any(dst in (701, 702) for _, dst in linker.links)
+    assert router.duck_id is None
+
+    own = PwNode(72, 1302, router.duck_name, "sidetap duck", SINK)
+    own_ports = (
+        PwPort(721, 72, "playback_FL", "in"),
+        PwPort(722, 72, "playback_FR", "in"),
+    )
+    later = replace(
+        routing_graph,
+        nodes=routing_graph.nodes + (own,),
+        ports=routing_graph.ports + own_ports,
+    )
+    router._graph = FakeGraphSource(later)
+    assert router.poll_once() == 1
+    assert sorted(linker.links) == [(551, 721), (552, 722)]
+    assert router.duck_id == 72
+
+
+def test_repair_warns_about_a_leftover_duck_whatever_its_suffix(
+    tmp_path, routing_graph, caplog
+):
+    leftover = PwNode(73, 1303, DUCK_NODE + ".1a2b3c4d", "sidetap duck", SINK)
+    graph = replace(routing_graph, nodes=routing_graph.nodes + (leftover,))
+    router, _ = _router(tmp_path, graph)
+    with caplog.at_level(logging.WARNING):
+        router.repair()
+    assert any(DUCK_NODE + ".1a2b3c4d" in r.message for r in caplog.records)

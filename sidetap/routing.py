@@ -16,10 +16,12 @@ import json
 import logging
 import os
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
-from .graph import PLAYBACK_STREAM, PwGraph
+from .graph import PLAYBACK_STREAM, SINK, PwGraph, PwLink, PwNode, PwPort
 from .ports import GraphSource, Linker, LinkResult, LoopbackFactory, LoopbackSpec, Unlinker
 
 log = logging.getLogger(__name__)
@@ -27,6 +29,7 @@ log = logging.getLogger(__name__)
 # Matches AppTap's cadence - the two watchers exist for the same reason.
 POLL_INTERVAL_S = 2.0
 
+# The prefix of every duck's node.name; each session appends its own suffix.
 DUCK_NODE = "sidetap_duck"
 VIRTMIC_SINK = "sidetap_tts_sink"
 VIRTMIC_SOURCE = "sidetap_virtmic"
@@ -194,21 +197,45 @@ def resolve(graph: PwGraph, ref: LinkRef) -> tuple[int, int] | None:
     return (src.id, dst.id)
 
 
-def duck_loopback_spec(target_sink: str) -> LoopbackSpec:
+def _new_duck_name() -> str:
+    """A duck name no earlier session can have used.
+
+    A session killed without cleanup leaves its pw-loopback running, possibly
+    at 0% volume. Sharing its name, the next engage() would route the call
+    into that leftover and never raise its volume.
+    """
+    return f"{DUCK_NODE}.{uuid.uuid4().hex[:8]}"
+
+
+def _is_duck(node: PwNode) -> bool:
+    return node.media_class == SINK and (
+        node.name == DUCK_NODE or node.name.startswith(DUCK_NODE + ".")
+    )
+
+
+def duck_loopback_spec(target_sink: str, name: str = DUCK_NODE) -> LoopbackSpec:
     """A sink we own, playing into the real speakers at a volume we control."""
     return LoopbackSpec(
         capture_props=(
-            ("node.name", DUCK_NODE),
+            ("node.name", name),
             ("node.description", "sidetap duck"),
             ("media.class", "Audio/Sink"),
             ("audio.position", "[ FL FR ]"),
         ),
         playback_props=(
-            ("node.name", f"{DUCK_NODE}_out"),
+            ("node.name", f"{name}_out"),
             ("target.object", target_sink),
             ("node.passive", "false"),
         ),
     )
+
+
+class _Plan(NamedTuple):
+    """What one stream needs this pass: duck links to make, sink links to break."""
+
+    stream: PwNode
+    make: list[LinkRef]
+    brk: list[tuple[LinkRef, PwLink]]
 
 
 class Router:
@@ -226,9 +253,14 @@ class Router:
         self._loopbacks = loopbacks
         self._journal_path = journal_path
         self._loopback = None
+        # This session's duck. Unique per engage(), so a leftover can't match.
+        self.duck_name: str | None = None
         # Serials already routed through the duck. Serial, not id: a restarted
         # stream can inherit its dead predecessor's id within one poll.
         self._routed: set[int] = set()
+        # Serials of links this session removed. A snapshot may still show one
+        # briefly; a link re-created afterwards gets a new serial.
+        self._broken_links: set[int] = set()
         self._app_pattern: str | None = None
         # Held across whole method bodies: the watcher thread polls while the
         # main thread can restore() at any moment, and without it a poll could
@@ -252,8 +284,7 @@ class Router:
     def engage(self, app_pattern: str) -> None:
         with self._lock:
             if self._loopback is not None:
-                # Otherwise the old loopback leaks and a second node named
-                # sidetap_duck makes node_by_name(DUCK_NODE) ambiguous.
+                # Otherwise the old loopback leaks.
                 raise RuntimeError(
                     "Router.engage() called while already engaged - call "
                     "restore() before engaging again"
@@ -270,7 +301,10 @@ class Router:
             default_sink = snapshot.node_by_name(snapshot.default_sink or "")
             target_sink_name = default_sink.name if default_sink else ""
 
-            self._loopback = self._loopbacks.create(duck_loopback_spec(target_sink_name))
+            self.duck_name = _new_duck_name()
+            self._loopback = self._loopbacks.create(
+                duck_loopback_spec(target_sink_name, self.duck_name)
+            )
 
             self._route_locked(snapshot, app_pattern, initial=True)
 
@@ -278,9 +312,9 @@ class Router:
         """Route any matching stream that is not routed yet. Returns how many.
 
         Applications re-create streams late and often (a meeting starting, a
-        reconnect). Without this, WirePlumber would autoconnect a new stream
-        straight to the speakers - unducked, unjournalled and invisible to
-        restore().
+        reconnect), and WirePlumber may link a routed stream to a sink again.
+        Without this, either would play straight to the speakers - unducked,
+        unjournalled and invisible to restore().
         """
         if self._app_pattern is None:
             return 0
@@ -290,7 +324,7 @@ class Router:
 
     def _route_locked(self, snapshot: PwGraph, app_pattern: str, *, initial: bool) -> int:
         """Caller must hold self._lock."""
-        duck = snapshot.node_by_name(DUCK_NODE)
+        duck = snapshot.node_by_name(self.duck_name) if self.duck_name else None
         # Refreshed on every call, not just engage()'s: engage()'s snapshot can
         # predate the duck registering, and a duck_id stuck at None means the
         # duck can never close.
@@ -303,96 +337,147 @@ class Router:
         if duck is None:
             return 0
         duck_inputs = snapshot.ports_of(duck.id, "in")
+        if not duck_inputs:
+            return 0
 
-        default_sink = snapshot.node_by_name(snapshot.default_sink or "")
-        sink_inputs = snapshot.ports_of(default_sink.id, "in") if default_sink else ()
-
-        broken: list[LinkRef] = []
-        made: list[LinkRef] = []
-        candidates: set[int] = set()
-
+        plans: list[_Plan] = []
+        routed = 0
         for stream in snapshot.by_class(PLAYBACK_STREAM):
             if not stream.matches(app_pattern):
                 continue
-            if stream.serial in self._routed:
+            outputs = snapshot.ports_of(stream.id, "out")
+            if not outputs:
+                # No ports yet: WirePlumber has not configured it. Next poll.
                 continue
-            for index, out_port in enumerate(snapshot.ports_of(stream.id, "out")):
-                # Only the DEFAULT sink, paired by index as WirePlumber links
-                # them (FL->FL, FR->FR). Anything broader would journal links
-                # that never existed, and restore() would then create them.
-                #
-                # LIMIT: index pairing works because ports_of() sorts by name,
-                # which matches channel order only for mono and stereo. 5.1
-                # sorts to FC, FL, FR, LFE, SL, SR and would cross channels;
-                # fixing it means carrying audio.channel through PwPort.
-                if sink_inputs and default_sink is not None:
-                    in_port = sink_inputs[min(index, len(sink_inputs) - 1)]
-                    broken.append(
-                        LinkRef(
-                            stream.serial, out_port.name, default_sink.serial, in_port.name
-                        )
-                    )
-                if duck_inputs:
-                    in_port = duck_inputs[min(index, len(duck_inputs) - 1)]
-                    made.append(
-                        LinkRef(stream.serial, out_port.name, duck.serial, in_port.name)
-                    )
-            candidates.add(stream.serial)
-            log.info("routing %s (serial=%s) through the duck", stream.label, stream.serial)
+            plan = self._plan(snapshot, stream, outputs, duck, duck_inputs)
+            if plan.make or plan.brk:
+                plans.append(plan)
+            elif stream.serial not in self._routed:
+                # Already wired to the duck and to nothing else.
+                self._routed.add(stream.serial)
+                routed += 1
 
-        if not broken and not made:
-            return 0
+        if not plans:
+            return routed
 
         # Durable BEFORE the graph is touched: a crash in between is exactly
         # what the journal is for.
-        journal = Journal.load(self._journal_path)
-        # Append only what is new. A failing stream is retried on every poll
-        # (see below) and recomputes the same refs, and appending blindly would
-        # grow the journal without bound - each a full rewrite under the lock
-        # shutdown needs, and each replayed again by restore().
-        known_broken = set(journal.broken)
-        known_made = set(journal.made)
-        new_broken = tuple(ref for ref in broken if ref not in known_broken)
-        new_made = tuple(ref for ref in made if ref not in known_made)
-        if new_broken or new_made:
-            Journal(
-                broken=journal.broken + new_broken,
-                made=journal.made + new_made,
-            ).save(self._journal_path)
+        self._journal_locked(plans)
 
-        # A FAILED apply is not done, as in AppTap. If the unlink from the
-        # speakers succeeds but the link into the duck fails, the stream is
-        # connected to nothing; leaving its serial out of self._routed makes
-        # the next poll_once() retry it.
         failed: set[int] = set()
-        for ref in broken:
-            if self._apply(snapshot, ref, link=False) is LinkResult.FAILED:
-                failed.add(ref.src_serial)
-        for ref in made:
-            if self._apply(snapshot, ref, link=True) is LinkResult.FAILED:
-                failed.add(ref.src_serial)
+        for plan in plans:
+            if plan.make:
+                log.info(
+                    "routing %s (serial=%s) through the duck",
+                    plan.stream.label,
+                    plan.stream.serial,
+                )
+            # Into the duck first, and away from the speakers only once that
+            # worked: a failure leaves the original audible, never silent.
+            results = [self._apply(snapshot, ref, link=True) for ref in plan.make]
+            if LinkResult.FAILED in results:
+                failed.add(plan.stream.serial)
+                continue
+            for _, link in plan.brk:
+                result = self._unlinker.unlink(link.output_port, link.input_port)
+                if result is LinkResult.FAILED:
+                    failed.add(plan.stream.serial)
+                else:
+                    self._broken_links.add(link.serial)
+            if plan.stream.serial not in self._routed:
+                self._routed.add(plan.stream.serial)
+                routed += 1
 
-        succeeded = candidates - failed
-        self._routed |= succeeded
         if failed:
             log.warning(
                 "could not fully route %r through %s (serials=%s) - will retry "
                 "on the next poll; the original may be briefly audible over "
                 "the translation until then",
                 app_pattern,
-                DUCK_NODE,
+                duck.name,
                 sorted(failed),
             )
-
-        if initial and succeeded:
+        if initial and routed:
             log.info(
                 "routed %r through %s (%d links broken, %d made)",
                 app_pattern,
-                DUCK_NODE,
-                len(broken),
-                len(made),
+                duck.name,
+                sum(len(p.brk) for p in plans),
+                sum(len(p.make) for p in plans),
             )
-        return len(succeeded)
+        return routed
+
+    def _plan(
+        self,
+        snapshot: PwGraph,
+        stream: PwNode,
+        outputs: tuple[PwPort, ...],
+        duck: PwNode,
+        duck_inputs: tuple[PwPort, ...],
+    ) -> _Plan:
+        """Which links this stream needs made and broken, from the live graph.
+
+        Broken: the stream's actual links into real sinks, whichever device it
+        plays to. Guessing the default sink instead misses a device chosen in
+        the app, and restore() would then create links that never existed.
+        sidetap's own sinks are never targets.
+
+        Made: its ports into the duck, paired by index as WirePlumber pairs
+        them (FL->FL, FR->FR). LIMIT: ports_of() sorts by name, which matches
+        channel order only for mono and stereo; 5.1 would cross channels.
+        """
+        make: list[LinkRef] = []
+        if stream.serial not in self._routed:
+            for index, out_port in enumerate(outputs):
+                in_port = duck_inputs[min(index, len(duck_inputs) - 1)]
+                if not snapshot.has_link(out_port.id, in_port.id):
+                    make.append(
+                        LinkRef(stream.serial, out_port.name, duck.serial, in_port.name)
+                    )
+
+        nodes = {n.id: n for n in snapshot.nodes}
+        ports = {p.id: p for p in snapshot.ports}
+        brk: list[tuple[LinkRef, PwLink]] = []
+        for link in snapshot.links_from(stream.id):
+            target = nodes.get(link.input_node)
+            src = ports.get(link.output_port)
+            dst = ports.get(link.input_port)
+            if (
+                link.serial in self._broken_links
+                or target is None
+                or target.media_class != SINK
+                or target.is_sidetap
+                or src is None
+                or dst is None
+            ):
+                continue
+            ref = LinkRef(stream.serial, src.name, target.serial, dst.name)
+            brk.append((ref, link))
+        return _Plan(stream, make, brk)
+
+    def _journal_locked(self, plans: list[_Plan]) -> None:
+        """Add what these plans will change to the journal. Caller holds the lock."""
+        journal = Journal.load(self._journal_path)
+        made = list(journal.made)
+        broken = list(journal.broken)
+        for plan in plans:
+            # Only what is new: a failing stream is retried every poll, and
+            # appending blindly would grow the journal without bound.
+            made.extend(ref for ref in plan.make if ref not in made)
+            new = [ref for ref, _ in plan.brk if ref not in broken]
+            if new and plan.stream.serial in self._routed:
+                # Something re-linked a routed stream to a different sink: that
+                # is now its target. Restoring the old one too would leave it
+                # playing on both after exit.
+                targets = {ref.dst_serial for ref in new}
+                broken = [
+                    ref
+                    for ref in broken
+                    if ref.src_serial != plan.stream.serial or ref.dst_serial in targets
+                ]
+            broken.extend(new)
+        if tuple(made) != journal.made or tuple(broken) != journal.broken:
+            Journal(broken=tuple(broken), made=tuple(made)).save(self._journal_path)
 
     def run(self, stop: threading.Event, interval: float = POLL_INTERVAL_S) -> None:
         """Re-scan until stopped. A transient graph read must not kill this."""
@@ -415,8 +500,7 @@ class Router:
             # Unconditional: engage() creates the duck even when no stream is
             # ever routed and the journal stays empty (start before the call,
             # quit before it begins). Skipping this would orphan pw-loopback,
-            # which runs in its own session, and the next engage() would make
-            # a second node named sidetap_duck.
+            # which runs in its own session.
             if self._loopback is not None:
                 self._loopback.terminate()
                 self._loopback = None
@@ -455,20 +539,20 @@ class Router:
         with self._lock:
             # A kill -9 leaves pw-loopback running in its own session, and
             # neither this new Router nor the journal knows its PID. A duck
-            # node present before this instance ever engaged can only be that
-            # leftover, so the best repair() can do is say so.
+            # present before this instance ever engaged can only be such a
+            # leftover. Its unique name keeps engage() from routing into it,
+            # so the best repair() can do is say how to stop it.
             snapshot = self._graph.snapshot()
-            duck = snapshot.node_by_name(DUCK_NODE)
-            if duck is not None:
+            for duck in (n for n in snapshot.nodes if _is_duck(n)):
                 log.warning(
                     "found an existing %s node (id=%s) from a previous "
                     "session - its pw-loopback process may still be running "
                     "with nothing able to stop it automatically. If call "
                     "audio still sounds wrong after this repair, stop it by "
                     "hand: pkill -f 'pw-loopback.*%s'",
-                    DUCK_NODE,
+                    duck.name,
                     duck.id,
-                    DUCK_NODE,
+                    duck.name,
                 )
 
             journal = Journal.load(self._journal_path)

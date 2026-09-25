@@ -240,3 +240,27 @@ async def test_q_stops_the_session():
     async with app.run_test() as pilot:
         await pilot.press("q")
         assert session.stop.is_set()
+
+
+async def test_the_app_exits_once_the_session_is_stopped():
+    """A signal or both directions dying sets session.stop.
+
+    The TUI never looked at it, so the process lived on with the graph still
+    rewired until someone pressed q - in a terminal that may already be gone.
+    """
+    session = RecordingSession()
+    app = SidetapApp(metrics=session.metrics, session=session)
+    async with app.run_test() as pilot:
+        session.stop.set()
+        await pilot.pause(0.5)
+        assert app._exit, "the app kept running after the session stopped"
+
+
+async def test_a_dead_playback_sink_is_named_and_alarms_the_pane():
+    metrics = Metrics()
+    metrics.set_playback_failed(Direction.OUT, True)
+    app = SidetapApp(metrics=metrics, session=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert "PLAYBACK FAILED" in str(app.query_one("#stats-out", Static).content)
+        assert app.query_one("#pane-out").has_class("alarm")

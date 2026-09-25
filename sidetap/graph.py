@@ -16,6 +16,10 @@ SINK = "Audio/Sink"
 SOURCE = "Audio/Source"
 PLAYBACK_STREAM = "Stream/Output/Audio"  # an application producing sound
 
+# Every node sidetap creates is named with this prefix: the virtual mic, the
+# TTS sink, the duck and the capture streams.
+OWN_NODE_PREFIXES = ("sidetap_", "sidetap.")
+
 log = logging.getLogger(__name__)
 
 
@@ -39,6 +43,11 @@ class PwNode:
         fields = (self.name, self.description, self.app_name, self.app_binary)
         return any(lowered in (value or "").lower() for value in fields)
 
+    @property
+    def is_sidetap(self) -> bool:
+        """One of sidetap's own nodes, never a device or an application."""
+        return self.name.startswith(OWN_NODE_PREFIXES)
+
 
 @dataclass(frozen=True)
 class PwPort:
@@ -49,11 +58,24 @@ class PwPort:
 
 
 @dataclass(frozen=True)
+class PwLink:
+    """One live link. `serial` tells a re-created link from a stale sighting."""
+
+    id: int
+    serial: int
+    output_node: int
+    output_port: int
+    input_node: int
+    input_port: int
+
+
+@dataclass(frozen=True)
 class PwGraph:
     nodes: tuple[PwNode, ...] = ()
     ports: tuple[PwPort, ...] = ()
     default_sink: str | None = None
     default_source: str | None = None
+    links: tuple[PwLink, ...] = ()
 
     def by_class(self, media_class: str) -> tuple[PwNode, ...]:
         return tuple(n for n in self.nodes if n.media_class == media_class)
@@ -72,10 +94,20 @@ class PwGraph:
         )
         return tuple(sorted(matching, key=lambda p: p.name))
 
+    def links_from(self, node_id: int) -> tuple[PwLink, ...]:
+        return tuple(link for link in self.links if link.output_node == node_id)
+
+    def has_link(self, output_port: int, input_port: int) -> bool:
+        return any(
+            link.output_port == output_port and link.input_port == input_port
+            for link in self.links
+        )
+
 
 def parse_graph(dump_text: str) -> PwGraph:
     nodes: list[PwNode] = []
     ports: list[PwPort] = []
+    links: list[PwLink] = []
     default_sink: str | None = None
     default_source: str | None = None
 
@@ -120,6 +152,11 @@ def parse_graph(dump_text: str) -> PwGraph:
                 )
             )
 
+        elif obj_type.endswith("Interface:Link"):
+            link = _parse_link(obj)
+            if link is not None:
+                links.append(link)
+
         elif obj_type.endswith("Interface:Metadata"):
             if (obj.get("props") or {}).get("metadata.name") != "default":
                 continue
@@ -131,4 +168,29 @@ def parse_graph(dump_text: str) -> PwGraph:
                 elif entry.get("key") == "default.audio.source":
                     default_source = name
 
-    return PwGraph(tuple(nodes), tuple(ports), default_sink, default_source)
+    return PwGraph(
+        tuple(nodes), tuple(ports), default_sink, default_source, tuple(links)
+    )
+
+
+def _parse_link(obj: dict) -> PwLink | None:
+    """A link's endpoints, from its info, or from its props as a fallback."""
+    info = obj.get("info") or {}
+    props = info.get("props") or {}
+    ends = (
+        info.get("output-node-id", props.get("link.output.node")),
+        info.get("output-port-id", props.get("link.output.port")),
+        info.get("input-node-id", props.get("link.input.node")),
+        info.get("input-port-id", props.get("link.input.port")),
+    )
+    if any(end is None for end in ends):
+        return None
+    output_node, output_port, input_node, input_port = (int(end) for end in ends)
+    return PwLink(
+        id=obj["id"],
+        serial=int(props.get("object.serial", obj["id"])),
+        output_node=output_node,
+        output_port=output_port,
+        input_node=input_node,
+        input_port=input_port,
+    )

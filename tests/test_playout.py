@@ -1246,3 +1246,37 @@ def test_a_flush_gives_the_next_run_a_full_hold():
     for _ in range(STARVE_LIMIT_TICKS - 10):
         playout.tick()
     assert duck.is_open is False
+
+
+class _DeadSink(FakeAudioSink):
+    """PwCatSink after pw-cat died: write() silently does nothing."""
+
+    failed = True
+
+    def write(self, pcm):
+        pass
+
+
+def test_a_dead_sink_never_closes_the_duck():
+    """Closing it would silence the original with no translation behind it.
+
+    Every translated utterance used to shut the duck for its full length,
+    far past the starvation bound, while nothing reached the listener.
+    """
+    volume = FakeVolumeControl()
+    playout = Playout(Direction.IN, _DeadSink(), duck=DuckControl(volume, object_id=42))
+    playout.submit(_translated(3.0))
+    for _ in range(200):
+        playout.tick()
+    assert (42, 0.0) not in volume.calls
+    assert playout.duck.is_open
+
+
+def test_a_dead_sink_refuses_new_audio_and_drops_the_utterance():
+    """So the producer stops paying for synthesis nobody can hear."""
+    playout = Playout(Direction.IN, _DeadSink())
+    item = playout.begin(_unit(), "hi")
+    assert playout.append(item, b"\x01\x02" * 480) is False
+    assert item.dropped is True
+    playout.finish(item)
+    assert playout.backlog_s() == 0.0

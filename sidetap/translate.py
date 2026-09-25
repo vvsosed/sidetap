@@ -21,6 +21,12 @@ log = logging.getLogger(__name__)
 TRANSLATION_LLM_MODEL = "general/translation-llm"
 NMT_MODEL = "general/nmt"
 
+# The SDK's own deadline for translate_text is 600 s, so a connection that goes
+# silent mid-call would hold a direction for ten minutes, twice with the NMT
+# retry, while nothing on screen changes. Calls measure 130-370 ms warm
+# (docs/experiments/03-translation-llm.md); 5 s only ever cuts off a stall.
+TRANSLATE_TIMEOUT_S = 5.0
+
 # Only these mean "this model is not available here". Anything else is
 # transient: fall back for this utterance only, so one blip does not silently
 # cost idiom quality for the rest of the session.
@@ -126,7 +132,8 @@ class GoogleTranslator:
 
         try:
             response = self._client.translate_text(
-                request=self._request(text, src, tgt, self._model)
+                request=self._request(text, src, tgt, self._model),
+                timeout=TRANSLATE_TIMEOUT_S,
             )
         except Exception as exc:
             if self._model == NMT_MODEL:
@@ -153,7 +160,8 @@ class GoogleTranslator:
                 )
 
             response = self._client.translate_text(
-                request=self._request(text, src, tgt, NMT_MODEL)
+                request=self._request(text, src, tgt, NMT_MODEL),
+                timeout=TRANSLATE_TIMEOUT_S,
             )
 
         return response.translations[0].translated_text

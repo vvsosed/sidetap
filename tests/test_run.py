@@ -414,7 +414,7 @@ def test_a_deaf_track_is_reported_rather_than_looking_healthy(tmp_path, routing_
     session.setup()
     stop = threading.Event()
     thread = threading.Thread(
-        target=session._poll_capture_health, args=(stop,), daemon=True
+        target=session._poll_health, args=(stop,), daemon=True
     )
     thread.start()
     session._clock.advance(NO_AUDIO_S + 2.0)
@@ -677,3 +677,117 @@ def test_the_two_directions_get_their_own_segmenter(tmp_path, routing_graph):
         )
     finally:
         session.shutdown()
+
+
+def test_closing_the_terminal_stops_the_session_cleanly(tmp_path, monkeypatch):
+    """SIGHUP left at its default killed Python without running any finally.
+
+    The graph was never restored and the duck, in its own session, stayed
+    alive - possibly at 0%, silencing the call. It must be a clean stop, and
+    a stop during setup must not go on to start the pipeline.
+    """
+    import os
+    import signal
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from sidetap import run as run_module
+
+    events = []
+
+    class StubSession:
+        def __init__(self, *args, **kwargs):
+            self.stop = threading.Event()
+            self.transcript = SimpleNamespace(
+                jsonl_path=tmp_path / "s.jsonl", md_path=tmp_path / "s.md"
+            )
+
+        def setup(self):
+            os.kill(os.getpid(), signal.SIGHUP)
+            deadline = time.monotonic() + 2.0
+            while not self.stop.is_set() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            events.append(("stop set in setup", self.stop.is_set()))
+
+        def start(self):
+            events.append(("started", True))
+
+        def shutdown(self):
+            events.append(("shutdown", True))
+
+    # Never leave SIGHUP at its default here: a regression would kill pytest.
+    sentinel = lambda *_: events.append(("sentinel", True))  # noqa: E731
+    previous = signal.signal(signal.SIGHUP, sentinel)
+    try:
+        monkeypatch.setattr(run_module, "Session", StubSession)
+        assert run_module.run_session(
+            _args(out=tmp_path), graph=None, launcher=None, linker=None, clock=None
+        ) == 0
+        assert signal.getsignal(signal.SIGHUP) is sentinel, "handler not put back"
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    assert events == [("stop set in setup", True), ("shutdown", True)]
+
+
+def test_a_dead_playback_sink_is_reported(tmp_path, routing_graph):
+    """PwCatSink only logs, and under the TUI nobody sees the log."""
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session.sinks[Direction.OUT].failed = True
+    stop = threading.Event()
+    thread = threading.Thread(target=session._poll_health, args=(stop,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if session.metrics.snapshot().directions[Direction.OUT].playback_failed:
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=2.0)
+    directions = session.metrics.snapshot().directions
+    assert directions[Direction.OUT].playback_failed is True
+    assert directions[Direction.IN].playback_failed is False
+    session.shutdown()
+
+
+def test_dead_air_is_raised_while_translation_hangs(tmp_path, routing_graph):
+    """consume() only checked dead air between results.
+
+    With the translation call hung inside handle() it never got there, so the
+    alarm built for exactly this stayed off while the other party heard
+    nothing.
+    """
+    session = _session(tmp_path, routing_graph)
+    session.setup()
+    session._dead_air.heard_speech()
+    session._clock.advance(60.0)
+    stop = threading.Event()
+    thread = threading.Thread(target=session._poll_health, args=(stop,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if session.metrics.snapshot().directions[Direction.OUT].dead_air:
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=2.0)
+    assert session.metrics.snapshot().directions[Direction.OUT].dead_air is True
+    session.shutdown()
+
+
+def test_bypass_never_links_the_virtual_mic_into_its_own_sink(tmp_path, routing_graph):
+    """Bypass took the default input, which can be sidetap's own virtual mic.
+
+    Linked into the TTS sink, that loops sidetap's output back into itself
+    while the user's voice goes nowhere. It must use the mic capture uses.
+    """
+    from dataclasses import replace
+
+    graph = replace(routing_graph, default_source="sidetap_virtmic")
+    session = _session(tmp_path, graph, mic="USB")
+    session.setup()
+    session.set_bypass(True)
+    assert session._real_mic_links == [(421, 801)], "USB mic into the TTS sink"
+    session.shutdown()

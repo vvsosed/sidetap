@@ -208,8 +208,14 @@ pausing. Nothing in the test suite can reach any of it.
 
 - [ ] Ctrl-C. Confirm the application's audio returns to your speakers and
       `wpctl status` shows no leftover `sidetap_duck`.
+- [ ] Repeat, but close the terminal window instead of pressing Ctrl-C.
+      Confirm the same: audio back on your speakers, no leftover duck.
 - [ ] Repeat, but `kill -9` the process instead. Confirm call audio is gone,
       then run `sidetap doctor --repair` and confirm it comes back.
+- [ ] Set the call app to play on a device that is **not** the default
+      output, then run a call. Confirm the original is ducked under the
+      translation, and that after Ctrl-C the app plays on that device again
+      and nowhere else.
 - [ ] Start sidetap with **no call running at all**, wait, then Ctrl-C. Confirm
       `wpctl status` shows no leftover `sidetap_duck`. Nothing is ever routed
       in this case so the journal stays empty, which is exactly the path that

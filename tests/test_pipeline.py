@@ -1083,3 +1083,32 @@ def test_a_final_ends_the_duck_hold_even_when_it_commits_nothing():
     pipeline.handle(_final())
     playout.tick()
     assert duck.is_open is True
+
+
+def test_a_dead_out_sink_trips_dead_air_instead_of_counting_as_spoken():
+    """Playout accepted audio for a dead sink, so spoke() cleared the alarm.
+
+    The remote party heard nothing while every marker stayed green.
+    """
+
+    class DeadSink(FakeAudioSink):
+        failed = True
+
+        def write(self, pcm):
+            pass
+
+    clock = FakeClock()
+    watch = DeadAirWatch(clock, threshold_s=6.0)
+    records = []
+    pipeline = _pipeline(
+        config=_config(Direction.OUT),
+        playout=Playout(Direction.OUT, DeadSink()),
+        clock=clock,
+        dead_air=watch,
+        on_record=records.append,
+    )
+    pipeline.handle(_final("can you hear me"))
+    clock.advance(7.0)
+
+    assert watch.alarming() is True
+    assert [r.dropped for r in records] == [True], "recorded as not spoken"

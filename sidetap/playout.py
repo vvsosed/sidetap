@@ -148,6 +148,11 @@ class Playout:
     def duck(self) -> DuckControl | None:
         return self._duck
 
+    @property
+    def sink_failed(self) -> bool:
+        """The sink can no longer play anything: pw-cat has died."""
+        return bool(getattr(self._sink, "failed", False))
+
     def begin(self, unit: Unit, text: str) -> Utterance:
         """Queue an utterance that has not been synthesised yet."""
         item = Utterance(unit=unit, text=text)
@@ -161,12 +166,19 @@ class Playout:
         """Add synthesised audio. False means stop synthesising: the rest of
         this utterance will never be heard.
 
-        Either it was flushed (bypass, mute or the drop-backlog hotkey) or
-        playout already closed it at the starvation bound; callers must not
-        assume the first.
+        It was flushed (bypass, mute or the drop-backlog hotkey), closed by
+        playout at the starvation bound, or the sink has died; callers must
+        not assume the first.
         """
         with self._lock:
             if item.dropped or item.closed:
+                return False
+            if self.sink_failed:
+                # Refused rather than queued for a sink that will never play
+                # it: the producer stops paying for synthesis, and OUT's
+                # dead-air alarm is not told the audio went out.
+                item.dropped = True
+                self._discard_locked(item)
                 return False
             item.pcm.extend(chunk)
             victims = self._trim_locked()
@@ -189,6 +201,13 @@ class Playout:
                     self._queue.remove(item)
                 except ValueError:
                     pass
+
+    def _discard_locked(self, item: Utterance) -> None:
+        if item is self._current:
+            self._current = None
+            self._offset = 0
+        elif item in self._queue:
+            self._queue.remove(item)
 
     def submit(self, item: Translated) -> None:
         """Queue a complete utterance: the degenerate streaming case.
@@ -533,6 +552,15 @@ class Playout:
 
         with self._lock:
             chunk, finished, starved = self._advance_locked()
+
+        if self.sink_failed:
+            # Keep draining, but never close the duck: with a dead sink that
+            # would silence the original with no translation to replace it.
+            if self._duck is not None:
+                self._duck.open()
+            if finished is not None:
+                self._invoke(self._on_spoken, finished)
+            return False
 
         if chunk is None:
             if self._duck is not None:

@@ -43,6 +43,15 @@
   {"id": 811, "type": "PipeWire:Interface:Port",
    "info": {"props": {"node.id": 81, "port.name": "capture_MONO", "port.direction": "out"}}},
 
+  {"id": 90, "type": "PipeWire:Interface:Link",
+   "info": {"output-node-id": 55, "output-port-id": 551,
+            "input-node-id": 40, "input-port-id": 401,
+            "props": {"object.serial": 1501}}},
+  {"id": 91, "type": "PipeWire:Interface:Link",
+   "info": {"output-node-id": 55, "output-port-id": 552,
+            "input-node-id": 40, "input-port-id": 402,
+            "props": {"object.serial": 1502}}},
+
   {"id": 10, "type": "PipeWire:Interface:Metadata",
    "props": {"metadata.name": "default"},
    "metadata": [
