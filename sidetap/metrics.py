@@ -42,13 +42,12 @@ class Snapshot:
     directions: dict[Direction, DirectionState]
     cost_usd: float = 0.0
     bypassed: bool = False
-    # Your translated voice is not being sent. Separate from `bypassed`,
-    # which also suppresses OUT: the two compose, and Session keeps them as
-    # two fields so leaving bypass restores mute rather than clearing it.
+    # Your translated voice is not being sent. Kept separate from `bypassed`,
+    # which also suppresses OUT, so leaving bypass restores mute rather than
+    # clearing it.
     muted_out: bool = False
-    # Which translation model is actually in use. Session-level, not
-    # per-direction: one GoogleTranslator serves both directions, so its
-    # sticky downgrade to NMT applies to the whole call.
+    # The translation model actually in use. Session-level: one translator
+    # serves both directions, so its downgrade applies to the whole call.
     mt_model: str = ""
 
 
@@ -94,11 +93,9 @@ class Metrics:
     def set_no_audio(self, direction: Direction, value: bool) -> None:
         """No audio at all is reaching this direction's capture queue.
 
-        Separate from dead_air, which means an utterance finished and nothing
-        came out the other end. This one is upstream of everything: the track
-        itself has gone silent, and because an unlinked PipeWire capture
-        delivers zero bytes rather than silence, every stage downstream looks
-        healthy while doing nothing.
+        Unlike dead_air (an utterance produced nothing), this is upstream of
+        everything: an unlinked capture delivers zero bytes, not silence, so
+        every stage looks healthy while doing nothing.
         """
         with self._lock:
             self._states[direction].no_audio = value
@@ -106,11 +103,9 @@ class Metrics:
     def set_capture_dropped(self, direction: Direction, count: int) -> None:
         """Blocks the CAPTURE queue discarded, as an absolute count.
 
-        Distinct from `dropped`, which counts utterances the lag cap threw
-        away on the playout side. These two queues overflow for unrelated
-        reasons - this one fills when a network outage stops the recogniser
-        draining it - and meetscribe's documented bug was exactly this one
-        going unreported, so a lost stretch read as nobody talking.
+        Distinct from `dropped`, the utterances the lag cap threw away on the
+        playout side. This queue fills when an outage stops recognition
+        draining it; unreported, the lost stretch would read as silence.
         """
         with self._lock:
             self._states[direction].capture_dropped = count
@@ -147,11 +142,8 @@ class Metrics:
     def set_mt_model(self, model: str) -> None:
         """Record which translation model is in use.
 
-        The point is the sticky downgrade: when the preferred model turns out
-        to be unavailable, GoogleTranslator falls back to NMT for the rest of
-        the session. Nothing else would show that - the next successful NMT
-        call sets mt=Health.OK, so the pane goes green and the user has no way
-        to tell quality dropped.
+        GoogleTranslator's sticky downgrade to NMT is otherwise invisible: the
+        next successful NMT call sets mt=Health.OK and the pane goes green.
         """
         with self._lock:
             self._mt_model = model

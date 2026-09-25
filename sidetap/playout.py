@@ -1,9 +1,8 @@
 """Speak translated audio, duck the original, and bound the lag.
 
 One long-lived pw-cat per direction, fed raw PCM. Between utterances this
-writes silence rather than stopping - the mirror of the ASR keepalive. It
-avoids underrun ambiguity and, more importantly, gives playout exact knowledge
-of when it is emitting speech, which is what drives the duck.
+writes silence rather than stopping, so playout always knows exactly when it
+is emitting speech - which is what drives the duck.
 """
 
 from __future__ import annotations
@@ -23,32 +22,22 @@ CHUNK_MS = 20
 CHUNK_BYTES = TTS_BYTES_PER_S * CHUNK_MS // 1000
 SILENCE_CHUNK = b"\x00" * CHUNK_BYTES
 
-# An utterance does not start playing until it holds this much audio, or is
-# closed. Measured (docs/experiments/04-tts-streaming.md): the first chunk is
-# always 200 ms and the second lands ~30 ms later, so waiting for 400 ms costs
-# ~30 ms and doubles the margin available to absorb a network stall.
+# An utterance starts playing once it holds this much audio, or is closed. The
+# first synthesis chunk is always 200 ms and the second lands ~30 ms later
+# (docs/experiments/04-tts-streaming.md), so 400 ms costs ~30 ms and doubles
+# the margin against a network stall.
 START_BUFFER_S = 0.4
 
-# Consecutive starved ticks before an utterance is given up on.
-# 100 ticks x 20 ms = 2 s. Counted in ticks rather than seconds so playout
-# needs no clock and the test is deterministic.
+# Consecutive starved ticks before giving up: 100 x 20 ms = 2 s. Counted in
+# ticks so playout needs no clock.
 #
-# The 2 s is justified differently for each of the three cases that share it.
-# For an utterance already playing, the yardstick is steady-state throughput -
-# synthesis delivers 4.7-7.1x faster than playback, so 2 s of nothing means
-# the producer is gone rather than slow - and the cost of waiting is a duck
-# held shut. For a queued head that never started, the yardstick is
-# time-to-FIRST-chunk, measured at 182-337 ms warm and 543 ms cold, and the
-# cost of giving up is the whole sentence: a first chunk slower than 2 s
-# loses it outright, where before streaming it would merely have been late.
-# The third consumer is the continuation hold (`_charge_hold_locked`), and its
-# yardstick is neither of those: it is the longest the duck may stay shut with
-# no speech at all, justified empirically against adversarial callers rather
-# than against a latency distribution - see `expect_continuation`.
-# One constant covers all three because 2 s is generous against each
-# distribution, not because the same argument applies three times. Retuning it
-# therefore moves three things, and the third is the one that decides how long
-# a broken pipeline can silence the person you are talking to.
+# Shared by three cases, each with its own yardstick. A playing utterance:
+# synthesis runs 4.7-7.1x faster than playback, so 2 s of nothing means the
+# producer is gone. A queued head that never started: first chunks arrive in
+# 182-543 ms, and giving up loses the whole sentence. The continuation hold
+# (`expect_continuation`): the longest the duck may stay shut with no speech.
+# Retuning this moves all three, and the last decides how long a broken
+# pipeline can silence the other party.
 STARVE_LIMIT_TICKS = 100
 
 
@@ -62,14 +51,9 @@ class DuckControl:
     def __init__(self, volume: VolumeControl, object_id: int | Callable[[], int | None]):
         """`object_id` may be a callable, and for a live session it must be.
 
-        Router.engage() finishes before pw-loopback has registered the duck
-        with the graph - deliberately, because the alternative is journalling
-        links to ports that do not exist yet - so the duck's object id is
-        still None when Session.setup() builds this. Reading it once there
-        meant the duck was never created at all, ducking never happened, and
-        the user heard the original underneath every translation for the whole
-        call, with nothing logged. Resolving it on each transition lets the id
-        arrive a poll later, which is exactly when it does arrive.
+        Router.engage() returns before pw-loopback has registered the duck, so
+        its id is still None when Session.setup() builds this. Resolving it on
+        each transition lets the id arrive a poll later.
         """
         self._volume = volume
         self._object_id = object_id
@@ -81,11 +65,9 @@ class DuckControl:
         return self._object_id
 
     def close(self) -> None:
-        # Only flip on a successful call. set_volume returns False rather
-        # than raising when wpctl fails; flipping anyway would desync the
-        # flag from the real volume and the next transition would think it
-        # is already in the target state and skip retrying. A duck that has
-        # not appeared yet is the same case: not an error, just not yet.
+        # Only flip on success: set_volume returns False when wpctl fails, and
+        # flipping anyway would desync the flag and skip the retry. A duck not
+        # yet registered is the same case.
         if self._closed:
             return
         object_id = self._resolve()
@@ -108,22 +90,16 @@ class DuckControl:
 class Utterance:
     """One sentence, possibly still being synthesised.
 
-    Mutated only under Playout._lock, like every other piece of Playout's
-    state. `Translated` stays the callback currency: by the time on_spoken or
-    on_dropped fires the audio is complete, so the immutable type is still
-    honest there.
+    Mutated only under Playout._lock. Callbacks still receive `Translated`,
+    since the audio is complete by the time they fire.
 
-    The producer holds this as a handle to pass back into append()/finish(),
-    and writes nothing on it. It may READ two fields, and only after finish()
-    has returned:
+    The producer holds this as a handle for append()/finish() and never
+    writes to it. After finish() returns it may read two fields:
 
-    - `truncated`, which is safe because finish() sets closed=True and neither
-      starvation branch can fire on a closed utterance, so no writer remains;
-      finish()'s own lock release is the barrier.
-    - `dropped`, which is NOT synchronised - flush() can set it from the TUI
-      thread at any moment. The race is deliberate and benign: the window is
-      one tick and the audio is gone either way, so a reader that loses it
-      merely reports the utterance as truncated rather than dropped.
+    - `truncated`: safe, because a closed utterance has no other writer.
+    - `dropped`: unsynchronised, since flush() can set it from the TUI thread
+      at any moment. Benign: the window is one tick and the audio is gone
+      either way, so a lost race only reports "truncated" for "dropped".
     """
 
     unit: Unit
@@ -185,11 +161,9 @@ class Playout:
         """Add synthesised audio. False means stop synthesising: the rest of
         this utterance will never be heard.
 
-        Two causes, and a caller that assumes only the first will mis-report
-        the second: it was flushed - by bypass, or by the drop-backlog hotkey,
-        which calls flush() directly and independently of bypass - or it was
-        already closed, which is how playout reports giving up on it at the
-        starvation bound.
+        Either it was flushed (bypass, mute or the drop-backlog hotkey) or
+        playout already closed it at the starvation bound; callers must not
+        assume the first.
         """
         with self._lock:
             if item.dropped or item.closed:
@@ -204,30 +178,23 @@ class Playout:
         """No more audio is coming."""
         with self._lock:
             item.closed = True
-            # Sticky, not overwritten: playout itself may already have set
-            # this True by abandoning a stalled utterance (_advance_locked's
-            # starvation bound) before the producer's own generator exhausts
-            # normally and calls finish(truncated=False). That later call
-            # must not erase the fact that the listener heard a cut-off
-            # sentence.
+            # Sticky: playout may already have set this by abandoning a
+            # stalled utterance, and a later finish(truncated=False) must not
+            # hide that the listener heard a cut-off sentence.
             item.truncated = item.truncated or truncated
             if not item.pcm and item is not self._current:
-                # Nothing ever arrived - whether synthesis failed
-                # (truncated) or simply produced no audio, there is no
-                # reason to leave an empty entry for tick() to step over.
-                # Not in the queue any more (already dropped by the lag cap,
-                # or flushed) is the same case: nothing to unqueue.
+                # No audio ever arrived, so there is nothing for tick() to
+                # play. Already gone from the queue (lag cap or flush) is fine.
                 try:
                     self._queue.remove(item)
                 except ValueError:
                     pass
 
     def submit(self, item: Translated) -> None:
-        """A complete utterance is the degenerate streaming case.
+        """Queue a complete utterance: the degenerate streaming case.
 
-        Built and queued under one lock: trimming between begin() and
-        append() would hand on_dropped an utterance whose pcm had not
-        arrived yet.
+        Built and queued under one lock, so the lag cap can never drop it
+        before its pcm is in place.
         """
         utterance = Utterance(
             unit=item.unit, text=item.text, pcm=bytearray(item.pcm), closed=True
@@ -245,16 +212,10 @@ class Playout:
         """Drop everything not yet handed to the sink. Returns how many
         whole items went.
 
-        The 20 ms chunk already passed to sink.write() cannot be recalled -
-        pw-cat has it, and by the time flush() runs it is no longer part of
-        this object's state at all (self._offset has already moved past it).
-        Everything still inside Playout - the queue, and whatever
-        of the in-progress item has not yet reached the sink - has NOT been
-        handed off and is dropped here. Only whole, not-yet-started items are
-        counted as dropped: the in-progress item is cut short, not "dropped",
-        since part of it was already spoken. Counting the in-flight chunk (or
-        the rest of that same utterance) as dropped would make the
-        drop-backlog hotkey lie about what the listener will hear.
+        Chunks already written to pw-cat cannot be recalled. The in-progress
+        item is cut short but not counted, since part of it was spoken;
+        counting it would make the drop-backlog hotkey misreport what the
+        listener hears.
         """
         with self._lock:
             count = len(self._queue)
@@ -266,10 +227,9 @@ class Playout:
             self._current = None
             self._offset = 0
             self._starved_ticks = 0
-            # The run this belonged to is gone with the queue. Leaving it set
-            # would hold the duck shut waiting for audio that was just thrown
-            # away - and set_suppressed() flushes on both edges, so this is
-            # also what stops a hold surviving a whole bypass.
+            # The run this hold belonged to is gone. Leaving it armed would
+            # hold the duck shut for audio just thrown away, including across
+            # a whole bypass, since set_suppressed() flushes on both edges.
             self._continuation = False
             self._hold_ticks = 0
             return count
@@ -278,22 +238,15 @@ class Playout:
         """Drop the oldest utterances until the backlog fits the cap.
 
         Returns (victim, backlog_at_drop, running_total) for the caller to
-        report once it has released the lock - nothing is reported from here.
-        on_dropped writes the transcript, and a write that blocks would stall
-        tick(), which sets the duck before writing to the sink; the duck would
-        then freeze wherever it was, closed if speech was playing. That is the
-        one unbounded stuck-closed path this module exists to avoid, and
-        Playout.run()'s finally cannot clear it because the thread is blocked
-        rather than dying.
+        report after releasing the lock. on_dropped writes the transcript, and
+        a blocking write under the lock would stall tick() with the duck
+        possibly closed - a stuck-closed path run()'s finally cannot clear,
+        because the thread is blocked rather than dead.
         """
-        # A single item longer than the cap is kept: dropping it would make a
-        # long sentence unsayable at any cap setting. That rule is about the
-        # queue's sole survivor, not about _current - if something is already
-        # playing in _current, every queued item is still droppable, because
-        # dropping them still leaves _current to finish. Looking only at
-        # len(self._queue) misses exactly the ordinary shape of a monologue
-        # (one utterance playing, the next queued), where the cap would
-        # otherwise never act.
+        # A sole queued item longer than the cap is kept, or a long sentence
+        # would be unsayable. With _current playing, every queued item stays
+        # droppable - otherwise the cap would never act on the ordinary
+        # monologue shape of one playing and one queued.
         victims: list[tuple[Utterance, float, int]] = []
         while (
             self._queue
@@ -302,29 +255,16 @@ class Playout:
         ):
             if not self._queue[0].closed:
                 # Still being synthesised: its duration is unknown, so
-                # dropping it cannot be shown to help. popleft() takes the
-                # oldest, so this is only ever reached when the open
-                # utterance is the queue's last entry.
+                # dropping it cannot be shown to help. It is always the
+                # newest entry, because _speak is the only production caller
+                # of begin()/append()/finish() and handles one unit at a time
+                # per direction; submit() never queues an open item.
                 #
-                # That holds because DirectionPipeline._speak is the only
-                # production caller of begin()/append()/finish(), and it runs
-                # them from the one worker thread that serialises a
-                # direction's units - begin(), then one append() per
-                # synthesised chunk, then finish(), for one unit at a time -
-                # so at most one open Utterance exists per direction, and it
-                # is always the most recently queued one. submit() (used by
-                # tests, not by any production path) sidesteps the question
-                # entirely: it builds and closes an Utterance atomically
-                # under one lock, so it never queues an open item either.
-                #
-                # Nothing here enforces it. If it is ever broken, this fails
-                # in the safe direction - the cap under-trims and keeps audio
-                # rather than dropping a sentence or leaving the duck stuck
-                # closed - but the backlog then sits over cap with nothing
-                # saying why. Break rather than spin on an undroppable head.
+                # Nothing enforces that. If broken, the cap under-trims -
+                # keeping audio rather than dropping a sentence or sticking
+                # the duck - so break rather than spin on the head.
                 break
-            # Captured before popleft(): the backlog that made this victim a
-            # victim, not the smaller figure left once it is already gone.
+            # The backlog that made this a victim, not what is left after.
             backlog_at_drop = self._backlog_locked()
             victim = self._queue.popleft()
             self.dropped += 1
@@ -348,21 +288,12 @@ class Playout:
     ) -> None:
         """Run a consumer callback without letting it take down this thread.
 
-        `on_spoken` fires on the playout thread, inside tick(), after the
-        duck has been set for this tick - closed if the tick carried speech,
-        open if it didn't. An utterance can retire on either kind of tick:
-        the ordinary case finishes mid-chunk and is reported from the speech
-        path, but one that is closed exactly on a chunk boundary, or that
-        never produced any audio, retires from the silence path instead.
-        `on_dropped` fires from _report_dropped(), after the lock _trim_locked()
-        ran under has already been released - called from begin(), append()
-        or submit(), not only submit() as before streaming. Either one
-        raising - a transcript write hitting a full
-        disk, say (Task 25) - must not propagate: out of tick() it would
-        kill the playout thread with the duck stuck closed, which is exactly
-        the fail-safe this module exists to provide, inverted into silence;
-        out of begin()/append()/submit() it would silently stop the producer
-        thread from submitting anything further.
+        `on_spoken` runs on the playout thread inside tick(); `on_dropped`
+        runs from begin(), append() or submit() after the lock is released.
+        Either raising - a transcript write on a full disk, say - must not
+        propagate: out of tick() it would kill the playout thread with the
+        duck possibly closed, and out of the producer's calls it would stop
+        that direction submitting anything further.
         """
         if callback is None:
             return
@@ -380,24 +311,17 @@ class Playout:
     def set_suppressed(self, value: bool) -> None:
         """Both edges throw the queue away.
 
-        The conversation while suppressed happens without this direction - the
-        parties talk unmediated under bypass, or the remote party simply does
-        not hear you under mute - so a translation of it is worth nothing by
-        the time it could play. Coming back, it would arrive as a voice
-        recapping a minute everyone has already had.
+        A translation of what was said while suppressed is stale by the time
+        it could play: the parties talked unmediated under bypass, or the
+        remote party simply did not hear you under mute.
 
-        Entering matters for the obvious reason. LEAVING matters because
-        nothing upstream knows this playout is suppressed: pipeline._speak
-        keeps synthesising and keeps calling begin()/append(), so the queue
-        refills the whole time. begin() trims it to LAG_CAP_S, which bounds
-        the damage but does not prevent it - without this flush, un-muting
-        after a long mute replays up to 20 s of stale translation, which is
-        exactly what README says does not happen.
+        Leaving matters as much as entering: nothing upstream knows this
+        playout is suppressed, so pipeline._speak keeps queueing throughout,
+        and without this flush, coming back would replay up to LAG_CAP_S of
+        stale translation.
 
-        The flag is set before the flush so a tick already in flight returns
-        early rather than pulling a fresh item; the 20 ms chunk it may already
-        have written is gone, since the reader position (self._offset) has
-        already moved past it, for the reason flush() documents.
+        The flag is set before the flush so a tick in flight returns early
+        rather than pulling a fresh item.
         """
         self.suppressed = value
         self.flush()
@@ -406,51 +330,28 @@ class Playout:
         """More of the speech run in progress is on its way.
 
         Set while a segmenter commits one utterance clause by clause. The
-        queue drains between clauses, and tick() would otherwise read an empty
-        queue as "the translation is over" and open the duck - letting a burst
-        of the untranslated original through the middle of what the listener
-        hears as one sentence, roughly every five seconds of a monologue
-        (docs/experiments/06-interim-cadence.md).
+        queue drains between clauses, and tick() would otherwise open the duck
+        and let a burst of the untranslated original through the middle of
+        what the listener hears as one sentence.
 
-        This call only arms the hold. It clears no counter, and that is the
-        whole of its safety: `_hold_ticks` counts every tick the duck is shut
-        while a hold is armed and no speech reaches the sink, and ONLY a
-        written chunk (or flush()) clears it. Clearing it here made the
-        deadline a lease the caller renews forever - re-arming every 50 ticks
-        with nothing ever queued, the duck never reopened for the entire
-        100 000-tick (33 minute) run a probe simulated it against.
+        This only arms the hold; it clears no counter, and that is the whole
+        of its safety. `_hold_ticks` counts ticks with the duck shut, a hold
+        armed and no chunk written, and only a written chunk or flush()
+        clears it. If arming cleared it, a caller re-arming periodically
+        could keep the duck shut forever. A queued clause does not count as
+        speech either: the pipeline queues a clause before its audio exists,
+        so a stalled, unstartable head is an ordinary shape.
 
-        What that buys, stated narrowly enough to be checked against the code
-        rather than against intent: once armed, this hold cannot keep the duck
-        shut for STARVE_LIMIT_TICKS ticks without a chunk of translated speech
-        actually being written, no matter what the caller does afterwards -
-        measured at 99 ticks (1.98 s) worst case over 100 000 ticks of every
-        adversarial pattern tried, including re-arming on every single tick. A
-        queued clause does not count as speech - Task 8 calls begin() for a
-        clause before its audio exists, so an unstartable head is the ordinary
-        shape, and counting only the empty-queue case left one arm plus a
-        stalling head holding the duck shut for the entire 30 000-tick (600 s)
-        run that reproduced it, with nothing played and no reopening at all.
+        The guarantee: once armed, the hold cannot keep the duck shut for
+        STARVE_LIMIT_TICKS ticks without translated speech being written,
+        whatever the caller does (worst case measured under adversarial
+        re-arming: 99 ticks, 1.98 s). A starvation arm already part-way to
+        its own limit may fire first; that is harmless, since it closes or
+        abandons its utterance rather than holding the duck. Unarmed, this
+        does nothing.
 
-        While armed it is the tighter of the two deadlines in this module: it
-        charges every shut-and-silent tick, including the ones the other arms
-        are responsible for (a `_current` starving mid-sentence, a queued head
-        under the start threshold), and only a written chunk clears it, where
-        `_starved_ticks` is also cleared by an utterance retiring with nothing
-        played. That does not make it strictly the first to fire: if a
-        starvation arm's own `_starved_ticks` was already part-way to
-        STARVE_LIMIT_TICKS before this hold was armed, that arm can still
-        reach its deadline first, since `_hold_ticks` only starts counting
-        from the tick it is armed. Harmless when it does - the arm force-
-        closes its head or abandons its utterance in place rather than
-        opening the duck, so this hold's own guarantee (no more than
-        STARVE_LIMIT_TICKS shut-and-silent ticks once armed) still holds; only
-        the order the two can fire in is not fixed. Unarmed it does nothing at
-        all, and those arms keep their own `_starved_ticks` deadline exactly
-        as they had it.
-
-        Narrowness is the point. A duck stuck closed silences the person you
-        are talking to, which this module treats as worse than not working.
+        A duck stuck closed silences the person you are talking to, which
+        this module treats as worse than not working.
         """
         with self._lock:
             self._continuation = value
@@ -458,36 +359,29 @@ class Playout:
     def _startable_locked(self, item: Utterance) -> bool:
         """Hold a new utterance until it can absorb a stall.
 
-        `closed` comes first: an utterance shorter than the threshold is
-        complete, so waiting for more audio would wait forever. It must
-        stay `or`, not `and` - swap it and every utterance under 400ms
-        becomes unplayable and is silently lost, closed or not.
+        `closed` must stay `or`, not `and`: an utterance shorter than the
+        threshold is complete, and waiting for more would lose it.
 
-        A head held here, still open, whose producer dies before it clears
-        the threshold would otherwise block itself and everything queued
-        behind it for the rest of the call. `_advance_locked` bounds that
-        wait with the same `_starved_ticks`/`STARVE_LIMIT_TICKS` counter it
-        uses for a stalled `_current`, closing the head where it stands once
-        the limit is reached so the fragment that did arrive gets spoken.
+        A head whose producer dies before it clears the threshold would block
+        the queue for the rest of the call; `_advance_locked` bounds that wait
+        with `_starved_ticks` and then closes the head in place, so the
+        fragment that did arrive is spoken.
         """
         return item.closed or item.audio_s >= START_BUFFER_S
 
     def _advance_locked(self) -> tuple[bytes | None, Translated | None, bool]:
         """Pull, read and retire under the lock.
 
-        Returns (chunk, finished, starved). `starved` means the duck must stay
-        closed although nothing is being played, on one of two grounds: an
-        utterance the listener is demonstrably part-way through (`_offset` has
-        moved), or a continuation the producer has ANNOUNCED via
-        expect_continuation(). The second is a claim, not an observation - it
-        can be armed on a completely idle playout that has never spoken a
-        word, and reading it as if it were the first is what made an unbounded
-        hold look impossible. It is bounded below the branch chain for that
-        reason, on ticks rather than on trust.
+        Returns (chunk, finished, starved). `starved` means the duck stays
+        closed although nothing is playing: either the listener is part-way
+        through an utterance (`_offset` has moved), or the producer announced
+        a continuation via expect_continuation(). The second is a claim, not
+        an observation - it can be armed on an idle playout - so it is bounded
+        on ticks by `_charge_hold_locked`.
 
-        Read as "nothing playable" instead, `starved` would hold the duck shut
-        before the first word of a translation the listener has not started
-        hearing yet, which is the quiet the original belongs in.
+        Starved does not mean "nothing playable": that would shut the duck
+        before the first word of a translation, which is where the original
+        belongs.
         """
         if (
             self._current is None
@@ -502,16 +396,10 @@ class Playout:
         starved = False
         if self._current is not None:
             unread = len(self._current.pcm) - self._offset
-            # A partial remainder under one chunk is only played once the
-            # utterance is closed - that is a genuine tail. While still
-            # open it is a producer that has not delivered a full chunk
-            # yet, and zero-padding it would splice silence into the middle
-            # of a word. Falling through to the starvation branch below is
-            # what bounds this: it increments on every tick with nothing
-            # playable, whether unread is 0 or a sub-chunk remainder, so a
-            # producer trickling fragments forever still gets abandoned
-            # rather than holding the duck closed with no bound - the
-            # "stuck closed" failure CLAUDE.md calls silently cruel.
+            # A remainder under one chunk plays only once the utterance is
+            # closed; while it is open, zero-padding would splice silence into
+            # a word. The starvation branch still counts these ticks, so a
+            # producer trickling fragments cannot hold the duck forever.
             if unread >= CHUNK_BYTES or (unread > 0 and self._current.closed):
                 chunk = bytes(
                     self._current.pcm[self._offset : self._offset + CHUNK_BYTES]
@@ -525,37 +413,29 @@ class Playout:
                     chunk = chunk + b"\x00" * (CHUNK_BYTES - len(chunk))
                 self._starved_ticks = 0
             elif self._current.closed:
-                # Closed after its final byte had already been written, or
-                # it never produced any audio at all. Only the first case
-                # was spoken, so only it gets on_spoken.
+                # Closed after its last byte was written, or it never produced
+                # audio. Only the first was spoken, so only it gets on_spoken.
                 if self._offset > 0:
                     finished = self._current.snapshot()
                 self._current = None
                 self._offset = 0
                 self._starved_ticks = 0
             else:
-                # Case 1 of 2 - started and starved: see the `elif` below
-                # for case 2, a queued head that never started playing.
-                # Both share this one _starved_ticks counter, reset to 0
-                # everywhere else in this method, with different remedies.
+                # Case 1 of 2, started and starved; see the `elif` below for
+                # a queued head that never started. Both share _starved_ticks
+                # with different remedies.
                 #
-                # Started but nothing to read: synthesis has not kept up.
-                # `offset > 0` means the listener is mid-sentence, which is
-                # what the duck follows - an utterance that has begun and
-                # then starved is still in progress. This check is
-                # defensive rather than a live distinction today: an open
-                # _current is only ever pulled in at >= START_BUFFER_S
-                # (400 ms), many chunks, so by the time it can reach this
-                # branch offset is already > 0. It stays a real condition,
-                # not an assumed True, in case START_BUFFER_S is ever tuned
-                # below one CHUNK_MS (20 ms).
+                # Synthesis has not kept up. `offset > 0` means the listener
+                # is mid-sentence, which is what the duck follows. Since an
+                # open _current starts only at START_BUFFER_S, offset is
+                # already > 0 here; the check stays in case that threshold is
+                # ever tuned below one chunk.
                 starved = self._offset > 0
                 self._starved_ticks += 1
                 if self._starved_ticks >= STARVE_LIMIT_TICKS:
-                    # The producer is gone, not slow. Give the utterance
-                    # up rather than hold the duck closed for the rest of
-                    # the call, which would silence the remote party -
-                    # the one failure worse than sidetap not working.
+                    # The producer is gone, not slow. Abandon the utterance
+                    # rather than hold the duck closed for the rest of the
+                    # call.
                     log.warning(
                         "%s playout: utterance stalled %.1fs mid-sentence; "
                         "abandoning as truncated",
@@ -569,36 +449,25 @@ class Playout:
                     self._current = None
                     self._offset = 0
                     self._starved_ticks = 0
-                    # This also mutes `_charge_hold_locked` for this one tick:
-                    # it bills only shut ticks, and this one opens the duck.
-                    # The hold's deadline is delayed by 20 ms, never skipped.
+                    # This tick opens the duck, so `_charge_hold_locked`
+                    # skips it: the hold's deadline slips 20 ms, never more.
                     starved = False
         elif self._queue:
-            # Case 2 of 2 - queued and not startable: the same
-            # _starved_ticks counter as case 1 above, with a different
-            # remedy (the head is closed in place, not retired).
+            # Case 2 of 2, queued but under the start threshold. The same
+            # bound applies so a producer that died mid-fragment cannot block
+            # the queue; nothing has been heard yet, so the duck is open and
+            # the risk is the direction going quiet unexplained.
             #
-            # Nothing is playable because the head is still under the start
-            # threshold. The same bound applies, for the same reason: a
-            # producer that died mid-fragment must not block the queue.
-            # Nothing has been heard yet, so the duck stays open and this is
-            # not the stuck-closed failure - it is the whole direction going
-            # quiet with nothing on screen explaining why.
-            #
-            # A hold means the producer says the listener is mid-run and this
-            # is the gap before the next clause, not the quiet before the
-            # first one, so the duck stays shut across it. Only the duck:
-            # this head keeps its own full `_starved_ticks` budget. A queued
-            # head is not audio, so `_charge_hold_locked` bills this tick to
-            # the hold's deadline all the same.
+            # An armed hold means this is the gap before the next clause, so
+            # the duck stays shut - but the head keeps its own full
+            # `_starved_ticks` budget, and the tick is billed to the hold's
+            # deadline as well.
             starved = self._continuation
             self._starved_ticks += 1
             if self._starved_ticks >= STARVE_LIMIT_TICKS:
-                # Close it where it stands rather than discard it: `closed`
-                # makes it startable, so the next tick speaks the fragment
-                # that did arrive. That is the same rule the spec applies to
-                # a synthesis that fails part way through - play what
-                # arrived - and it unblocks everything queued behind it.
+                # Close it in place rather than discard it: `closed` makes it
+                # startable, so the fragment that did arrive is spoken, and
+                # everything queued behind it is unblocked.
                 log.warning(
                     "%s playout: queued utterance stuck under the start "
                     "threshold for %.1fs; closing what arrived",
@@ -609,38 +478,28 @@ class Playout:
                 self._queue[0].truncated = True
                 self._starved_ticks = 0
         else:
-            # Nothing playing and nothing queued: `_starved_ticks` has no
-            # subject, so it resets here whether or not a hold is running.
-            # Letting a gap carry it forward is the leak `_hold_ticks` exists
-            # to close - the next clause would be force-closed as truncated
-            # after whatever the gap left of its budget.
+            # Nothing playing or queued, so `_starved_ticks` resets even
+            # during a hold; carrying it across the gap would shorten the next
+            # clause's budget and cut it off as truncated.
             self._starved_ticks = 0
             if self._continuation:
-                # Nothing queued at all, but the producer says more of this
-                # run is coming. Hold the duck shut across the gap; the
-                # deadline for it is charged below, with every other tick it
-                # holds the duck shut.
+                # The producer says more of this run is coming: hold the duck
+                # shut across the gap, charged to the hold's deadline below.
                 starved = True
 
         return chunk, finished, self._charge_hold_locked(chunk, starved)
 
     def _charge_hold_locked(self, chunk: bytes | None, starved: bool) -> bool:
-        """Bill this tick to the continuation hold, and expire it if it is due.
+        """Bill this tick to the continuation hold, and expire it if due.
 
-        Takes what _advance_locked decided and returns `starved` unchanged
-        unless the hold has run out, in which case it disarms and returns
-        False. Called from one place, at the end of the branch chain rather
-        than inside any arm of it, because the hold reaches the duck from two
-        of those arms and a deadline watching only one of them is not a
-        deadline - that was how a stalling head held the duck shut, with no
-        reopening at all, for the whole 30 000-tick (600 s) run that found it.
+        Returns `starved` unchanged unless the hold has run out, in which case
+        it disarms and returns False. Called once, after the branch chain,
+        because the hold reaches the duck from two arms and a deadline
+        watching only one would not bound it.
 
-        The invariant: `_hold_ticks` is the number of consecutive ticks the
-        duck has been held shut with a hold armed and NO chunk reaching the
-        sink. Not ticks since the producer last spoke up, and not ticks with
-        an empty queue. Only a written chunk clears it here, and only flush()
-        clears it elsewhere; arming does not, and neither does expiring.
-        `expect_continuation` records the two failures that rule those out.
+        `_hold_ticks` counts consecutive ticks the duck was held shut with a
+        hold armed and no chunk reaching the sink. Only a written chunk (here)
+        or flush() clears it; arming and expiring do not.
         """
         if chunk is not None:
             self._hold_ticks = 0
@@ -654,12 +513,10 @@ class Playout:
                     self.direction.value,
                     STARVE_LIMIT_TICKS * CHUNK_MS / 1000,
                 )
-                # Disarm, and do NOT zero the counter. Left armed, the hold
-                # re-arms itself next tick and the duck sawtooths for the rest
-                # of the call. Zeroed, a producer re-arming after each expiry
-                # buys another full bound every time. Leaving it spent means a
-                # re-arm gets one tick and expires again until real audio
-                # resets it.
+                # Disarm, but do not zero the counter. Left armed, the hold
+                # would re-arm itself and the duck would sawtooth; zeroed, each
+                # re-arm would buy another full bound. Left spent, a re-arm
+                # expires after one tick until real audio resets it.
                 self._continuation = False
                 return False
         return starved
@@ -667,9 +524,8 @@ class Playout:
     def tick(self) -> bool:
         """Write exactly one chunk. True if it carried speech."""
         if self.suppressed:
-            # Bypass: the parties are talking to each other unmediated. Keep
-            # writing silence so pw-cat's buffer stays primed and the duck
-            # stays open, but speak nothing.
+            # Keep writing silence so pw-cat stays primed and the duck stays
+            # open, but speak nothing.
             if self._duck is not None:
                 self._duck.open()
             self._sink.write(SILENCE_CHUNK)
@@ -701,38 +557,21 @@ class Playout:
     def run(self, stop: threading.Event) -> None:
         """Pace comes from the sink.
 
-        pw-cat blocks on write once its buffer is full, so this loop runs at
-        real time without a sleep. A sleep on the healthy path would fight
-        that and drift - see docs/experiments/02-pwcat-playback.md, where a
-        sleep-paced loop under-fed the sink by 0.69% over 30 minutes while a
-        loop that let pw-cat's blocking pace it measured 1.018 over 60s.
+        pw-cat blocks on write once its buffer is full, so this loop runs in
+        real time without a sleep; a sleep-paced loop drifts and under-feeds
+        the sink (docs/experiments/02-pwcat-playback.md).
 
-        But PwCatSink.write() swallows a dead pipe and becomes a no-op, and a
-        no-op never blocks - so a sink that dies mid-call removes the only
-        thing pacing this loop and it would pin a CPU core until hangup. The
-        fallback wait below is not belt-and-braces; it is the whole reason the
-        `failed` flag is readable from here.
+        PwCatSink.write() turns into a non-blocking no-op once the pipe dies,
+        which would leave this loop spinning a CPU core; the `failed` wait
+        below paces it instead.
 
-        A sink that is alive but blocking - something stops draining the
-        deliberately-shrunk pipe pw-cat reads from - is the case the fallback
-        above does not reach: tick() sets the duck closed and then calls
-        self._sink.write(), which blocks with the duck already closed.
-        `_starved_ticks` is only incremented inside _advance_locked(), at the
-        top of the NEXT tick() - which cannot run until this write() call
-        returns - so the counter freezes and the starvation bound cannot
-        expire while this thread is parked here. Not new in kind: a blocking
-        write during ordinary speech already held the duck closed the same
-        way. But starvation adds another way to reach it, and this is the one
-        case the bound exists to close that it cannot. Bypass force-opens the
-        duck on every tick regardless (see tick()'s `suppressed` branch), so
-        there is a manual escape once the blocked write eventually returns.
+        A sink that is alive but blocked is not covered: tick() closes the
+        duck, then blocks in write(), and the starvation bound cannot advance
+        until write() returns. Bypass stays a manual escape, since it opens
+        the duck directly rather than via tick().
 
-        The try/finally is defense in depth: on_spoken/on_dropped are already
-        isolated by _invoke, so in practice tick() should not raise, but if
-        it ever does, cleanup still has to run. Leaving the duck closed would
-        replace the module's one fail-safe - a dead pipeline leaves the user
-        hearing the remote party untranslated - with silence instead, which
-        is the opposite.
+        The finally reopens the duck if tick() ever raises, because a dead
+        pipeline must leave the remote party audible, not silent.
         """
         try:
             while not stop.is_set():
@@ -749,9 +588,8 @@ def earcon(duration_s: float = 0.25, frequency: float = 880.0, level: float = 0.
     """A short tone for the dead-air alarm.
 
     During a call you are looking at the other person, not at a dashboard, so
-    the OUT direction failing silently has to make a sound. Generated rather
-    than shipped as an asset, and with math.sin rather than numpy, because the
-    capture path deliberately has no numpy in it.
+    a silent OUT failure has to make a sound. Generated with math.sin rather
+    than numpy, which the audio path deliberately does without.
     """
     import math
     import struct

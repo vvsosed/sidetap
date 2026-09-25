@@ -1,17 +1,13 @@
 """Link a matching application's audio into our capture node.
 
-The tap itself is additive and never steals the stream: it only ever adds a
-second link from the application's existing output ports into our capture
-node, so PipeWire delivers an identical copy to us no matter what else those
-ports are plugged into. Whether the application's original link to the
-speakers survives is routing.py's call, not this module's - once engaged,
-routing.py unlinks the application from the speakers and re-routes it through
-a duck it controls, and this tap keeps tapping the same ports either way.
+The tap is additive: it adds a second link from the application's existing
+output ports into our capture node, so PipeWire delivers us a copy whatever
+else those ports feed. The application's link to the speakers is routing.py's
+concern; the tap keeps tapping the same ports either way.
 
-The watcher re-scans because applications create their audio streams late:
-Zoom does it when the meeting starts, not when the app launches. Anything
-that resolves nodes once at startup records silence. The same re-scan covers
-reconnects when someone switches headphones mid-call.
+The watcher re-scans because applications create streams late (Zoom when the
+meeting starts, not at launch) and re-create them on a reconnect or a
+headphone switch. Resolving nodes once at startup records silence.
 """
 
 from __future__ import annotations
@@ -74,11 +70,9 @@ class AppTap:
             for index, out_port in enumerate(outputs):
                 # Fan every channel into our mono input; PipeWire sums them.
                 in_port = inputs[min(index, len(inputs) - 1)]
-                # Keyed on the node's serial and the port NAMES, never on port
-                # ids: PipeWire recycles ids, and a restarted stream can be
-                # handed its dead predecessor's ids within one poll interval.
-                # Keying on ids would make us skip linking it and capture
-                # silence for the rest of the meeting.
+                # Keyed on serial and port NAMES, never port ids: PipeWire
+                # recycles ids, and a restarted stream inheriting its
+                # predecessor's ids would be skipped and never captured.
                 pair = (source.serial, out_port.name, in_port.name)
                 if pair in self._linked:
                     continue
@@ -115,11 +109,9 @@ class AppTap:
             except Exception as exc:  # a transient graph read must not kill us
                 consecutive_errors += 1
                 if consecutive_errors == GRAPH_ERROR_WARN_AFTER:
-                    # One blip is unremarkable. Failing repeatedly means we are
-                    # blind to new streams for the rest of the meeting, which
-                    # must not be debug-only. Warn once, not every poll.
-                    # The cause is whatever %s carries - it may be the graph
-                    # read, but a missing pw-link lands here too.
+                    # One blip is unremarkable; repeated failure leaves the tap
+                    # blind to new streams, so warn once. The cause may be the
+                    # graph read or a missing pw-link.
                     log.warning(
                         "tap watcher failing repeatedly (%s) - no longer "
                         "picking up new streams matching %r",
@@ -128,10 +120,7 @@ class AppTap:
                     )
                 else:
                     log.debug("tap watcher: %s", exc)
-            # The tap spends nearly all its time right here, since poll_once()
-            # is near-instant. An uninterruptible sleep would mean shutdown
-            # has to wait out a full poll interval - almost this thread's
-            # entire time budget - before router.restore() can hand the
-            # user's call audio back. Waiting on `stop` instead wakes us the
-            # moment shutdown fires.
+            # Wait on `stop` rather than sleep: this is where the thread spends
+            # its time, and shutdown must not wait out a poll interval before
+            # router.restore() hands the call audio back.
             self._clock.wait(stop, self._interval)

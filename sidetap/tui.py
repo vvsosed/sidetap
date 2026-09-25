@@ -12,11 +12,9 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Footer, Static
 
-# Private on purpose: Textual exports Footer but not the per-key widget it
-# builds, and a footer key is the only place a toggle's state can be shown
-# where the user already looks for it. tests/test_tui.py asserts the import
-# and the resulting colour, so a Textual release that moves this fails the
-# suite rather than silently leaving the key unlit.
+# Private: Textual exports Footer but not its per-key widget, and the footer
+# key is where a toggle's state belongs. tests/test_tui.py fails if a Textual
+# release moves it.
 from textual.widgets._footer import FooterKey
 
 from .metrics import Health, Metrics
@@ -55,17 +53,13 @@ class SidetapApp(App):
     .target { text-style: bold; }
     .stats { color: $text-muted; }
 
-    /* An engaged toggle. $warning, not $error: .pane.alarm owns $error for
-       "something is wrong", and bypass and mute are things the user did on
-       purpose.
+    /* An engaged toggle. $warning, not $error, which .pane.alarm uses for
+       faults; bypass and mute are deliberate.
 
-       Both component classes have to be named, and NOT because of the
-       background - FooterKey's own background does reach them. It is the
-       foreground: $footer-key-foreground is itself amber in the default
-       theme, so a rule that set only the background paints the key letter
-       #ffa62b on a #fea62b fill and the letter vanishes. gruvbox and nord
-       are nearly as bad. $text re-resolves against the new background, which
-       is what keeps the key readable on every built-in theme. */
+       Both component classes need an explicit colour: the default
+       $footer-key-foreground is amber and would vanish on a $warning fill.
+       $text re-resolves against the new background, keeping the key readable
+       on every built-in theme. */
     FooterKey.-engaged {
         background: $warning;
         .footer-key--key { background: $warning; color: $text; text-style: bold; }
@@ -100,21 +94,14 @@ class SidetapApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Deferred rather than called straight away: on_mount can fire before
-        # compose()'s children have finished mounting, and an immediate call
-        # here intermittently raced query_one() against the still-mounting
-        # DOM. call_after_refresh runs once the screen has settled.
+        # Deferred: on_mount can fire before compose()'s children finish
+        # mounting, and query_one() would race the DOM.
         self.call_after_refresh(self.refresh_from_metrics)
         self.set_interval(1 / REFRESH_HZ, self.refresh_from_metrics)
 
     def refresh_from_metrics(self) -> None:
-        # The polling interval keeps ticking until Textual gets around to
-        # cancelling it, which happens slightly after the app stops running
-        # during shutdown - so a tick can still land here mid-teardown, after
-        # screens have started being pruned but before the timer is stopped.
-        # Guarding on is_running (rather than letting query_one raise) is
-        # what makes that race harmless instead of an occasional NoMatches
-        # crashing whatever test happens to be tearing down at that instant.
+        # The interval can still fire mid-teardown, after screens are pruned
+        # but before the timer stops; return rather than raise NoMatches.
         if not self.is_running:
             return
         snapshot = self._metrics.snapshot()
@@ -123,11 +110,9 @@ class SidetapApp(App):
             self.query_one(f"#interim-{suffix}", Static).update(state.interim)
             self.query_one(f"#source-{suffix}", Static).update(state.final)
             self.query_one(f"#target-{suffix}", Static).update(state.translation)
-            # The two alarms are named, not merely coloured. They point at
-            # opposite ends of the pipeline - NO AUDIO means nothing is
-            # arriving to work on, DEAD AIR means an utterance finished and
-            # nothing came out the far end - and a user who cannot tell them
-            # apart cannot act on either.
+            # Named, not just coloured: NO AUDIO means nothing is arriving,
+            # DEAD AIR means an utterance produced nothing, and the user has to
+            # tell them apart to act.
             if state.no_audio:
                 alarm = "  NO AUDIO ARRIVING"
             elif state.dead_air:
@@ -143,8 +128,8 @@ class SidetapApp(App):
             pane = self.query_one(f"#pane-{suffix}")
             pane.set_class(state.dead_air or state.no_audio, "alarm")
 
-        # The model matters because a sticky downgrade to NMT is otherwise
-        # invisible - the health dots stay green, quality just quietly drops.
+        # Shown because a sticky downgrade to NMT is otherwise invisible: the
+        # health dots stay green while quality drops.
         model = snapshot.mt_model.rsplit("/", 1)[-1] or "—"
         state = "BYPASSED  " if snapshot.bypassed else ""
         self.sub_title = f"{state}mt:{model}  est. ${snapshot.cost_usd:.2f}"
@@ -156,15 +141,12 @@ class SidetapApp(App):
     def _paint_toggles(self, engaged: dict[str, bool]) -> None:
         """Light the footer key of a toggle that is currently on.
 
-        Re-applied every tick rather than once per keypress, because Footer
-        rebuilds its FooterKey children from scratch whenever screen bindings
-        change (bindings_changed -> recompose) and would drop a class set
-        once. Polling is also what keeps the key honest: it shows what Metrics
-        says, not what this app believes it asked for.
+        Re-applied every tick, because Footer rebuilds its FooterKey children
+        when bindings change and would drop a class set once. Polling also
+        shows what Metrics says, not what this app asked for.
 
-        Keyed on the binding's action, so keys with no toggle state - flush,
-        quit, Textual's own command palette - are skipped by the lookup
-        rather than by a list here that could fall out of date.
+        Keyed on the binding's action, so keys with no toggle state are
+        skipped by the lookup rather than by a list that could go stale.
         """
         for key in self.query(FooterKey):
             state = engaged.get(key.action)
@@ -172,28 +154,21 @@ class SidetapApp(App):
                 key.set_class(state, "-engaged")
 
     def action_bypass(self) -> None:
-        """Toggle against Metrics, not against a flag kept here.
+        """Toggle against Metrics, not a local flag.
 
-        A local mirror is a second copy of the truth that nothing reconciles:
-        if set_bypass raises partway, or anything else ever changes the
-        session's state, the mirror and the snapshot disagree and the next
-        press does the opposite of what the screen shows.
+        A local mirror would drift if set_bypass raised partway, and the next
+        press would do the opposite of what the screen shows.
         """
         if self._session is not None:
             self._session.set_bypass(not self._metrics.snapshot().bypassed)
 
     def action_mute(self) -> None:
-        """Stop sending your translated voice, without leaving the call.
+        """Stop sending your translated voice without leaving the call.
 
-        Through set_suppressed, never by assigning `suppressed` directly: the
-        setter also throws the backlog away, and a queue built up while muted
-        is a translation of a conversation that has already moved on. On
-        unmute it would arrive as a voice recapping the last minute.
-
-        Through the session rather than the playout directly: bypass
-        suppresses that same playout, so `not playout.suppressed` read the
-        wrong question and un-suppressed OUT mid-bypass. The session holds
-        mute as its own flag and derives suppression from both.
+        Goes through the session, which holds mute as its own flag: bypass
+        suppresses the same playout, so toggling `playout.suppressed` would
+        un-suppress OUT mid-bypass. The session's path also flushes the
+        backlog, which is stale by the time you unmute.
         """
         if self._session is not None:
             self._session.set_mute_out(not self._metrics.snapshot().muted_out)

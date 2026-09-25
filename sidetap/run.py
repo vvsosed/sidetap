@@ -28,23 +28,16 @@ log = logging.getLogger(__name__)
 
 SHUTDOWN_JOIN_S = 3.0
 
-# One male and one female voice for each language this has actually been run
-# against; anything else must be named explicitly rather than guessed at,
-# because an invalid voice is a fatal InvalidArgument at the first utterance.
+# One male and one female voice per language this has been run against. Any
+# other language must name its voice explicitly, because an invalid voice is a
+# fatal InvalidArgument at the first utterance.
 #
-# Charon and Kore are the pair everywhere because they are the pair that
-# exists everywhere. Chirp 3 HD carries 30 voices (16 male, 14 female) in 52
-# of its 53 locales - and ru-RU, this project's own canonical example, is the
-# one exception, with 8: Charon/Fenrir/Orus/Puck and Aoede/Kore/Leda/Zephyr.
-# Widening this table to more personalities has to start there, not from the
-# published 30 (docs/experiments/05-voice-gender.md).
+# Charon and Kore because they exist in every locale: ru-RU has only 8 Chirp 3
+# HD voices where others have 30 (docs/experiments/05-voice-gender.md).
 #
-# "default" is the voice you get with no --voice-*-gender, and it is
-# deliberately not uniform. These are exactly the voices the table produced
-# before gender was selectable, so adding the flag changed nothing for a
-# command line that already worked. In the canonical en-US <-> ru-RU call it
-# means you hear a male voice and they hear a female one, which also happens
-# to make the two directions easy to tell apart.
+# "default" applies with no --voice-*-gender. It is deliberately not uniform:
+# in an en-US <-> ru-RU call you hear a male voice and they hear a female one,
+# which makes the two directions easy to tell apart.
 VOICES = {
     "en-US": {"male": "en-US-Chirp3-HD-Charon",
               "female": "en-US-Chirp3-HD-Kore", "default": "male"},
@@ -68,8 +61,7 @@ VOICES = {
 def default_voice(language_code: str, gender: str | None = None) -> str:
     """The voice for a language, optionally forced to a gender.
 
-    gender=None keeps the one-argument call working and returns whatever that
-    language defaulted to before gender existed.
+    gender=None picks the language's default.
     """
     try:
         entry = VOICES[language_code]
@@ -132,15 +124,12 @@ class Session:
         self._make_recognizer = recognizer_factory or build_recognizer_factory
         self._translator = translator
         self._synthesizer = synthesizer
-        # Injected like every other port, and built here so that a test never
-        # constructs one by accident: WpctlVolumeControl shells out to wpctl
-        # against the developer's own machine.
+        # Injectable, because WpctlVolumeControl runs wpctl against the real
+        # machine.
         self._volume = volume or WpctlVolumeControl()
-        # Overridable for the same reason doctor.py's install_virtmic_config
-        # takes a path: Router's real default lives under the developer's own
-        # home directory, and every test that touches a Router - including
-        # this one - must not write there. Production leaves this at
-        # routing.JOURNAL_PATH so `doctor --repair` still knows where to look.
+        # Injectable so tests never write the real journal under the user's
+        # home. Production keeps routing.JOURNAL_PATH, where `doctor --repair`
+        # looks.
         self._journal_path = journal_path if journal_path is not None else JOURNAL_PATH
         # Shared with the log file so a run's three artifacts sort together.
         self._session_name = session_name
@@ -157,24 +146,19 @@ class Session:
         self.router_restored = False
         self._threads: list[threading.Thread] = []
         self._shutdown_done = False
-        # The signal handler, the TUI and run_session's finally can all reach
-        # shutdown(), and the TUI can call set_bypass while shutdown is tearing
-        # the same links down.
+        # shutdown() is reachable from the signal handler, the TUI and
+        # run_session's finally, and set_bypass can race it over the same
+        # links.
         self._lifecycle_lock = threading.RLock()
         self._bypassed = False
-        # Mute is tracked here, not read back off the OUT playout, because
-        # bypass suppresses that same playout. Derive the user's intent from
-        # the flag it was set on and there is no way to tell "muted" from
-        # "bypassed" when both end in suppressed=True - which is how leaving
-        # bypass used to silently unmute.
+        # Tracked here, not read off the OUT playout, which bypass also
+        # suppresses: read from there, "muted" and "bypassed" look the same and
+        # leaving bypass would unmute.
         self._muted_out = False
         self._real_mic_links: list[tuple[int, int]] = []
-        # None until setup() gets far enough to create them. setup() can
-        # raise before any of these exist - the virtual-mic check runs
-        # BEFORE Router is even constructed, on purpose, so that a fatal
-        # check never has anything to undo - and shutdown() has to survive
-        # being called in that state rather than raising an AttributeError
-        # that would bury the original failure.
+        # None until setup() creates them. setup() can fail before Router
+        # exists - the virtual-mic check runs first so a failure has nothing to
+        # undo - and shutdown() must cope rather than bury the original error.
         self.router = None
         self.transcript = None
         self.capture = None
@@ -185,19 +169,15 @@ class Session:
         configs = build_direction_configs(args)
         self._configs = configs
 
-        # BEFORE the router touches anything. This check is a pure snapshot
-        # read, and engage() is the first irreversible act of the session: it
-        # rewires the app into the duck and spawns a loopback. Checking after
-        # would mean the one machine this fires on - a first run, before
-        # `doctor --install` - gets its call audio rewired and then an
-        # exception, with setup() half-done and nobody left to restore it.
+        # Before the router touches anything: engage() is the first
+        # irreversible step, and failing after it would leave the call rewired
+        # with setup() half done.
         snapshot = self._graph.snapshot()
         virtmic = snapshot.node_by_name(VIRTMIC_SINK)
         if virtmic is None:
-            # NOT a fallback. pw-cat with no --target autoconnects to the
-            # default sink, so the outbound translation would come out of the
-            # user's own speakers while the remote party heard silence - and
-            # nothing would say so. Fail here instead.
+            # Not a fallback: pw-cat with no --target plays to the default
+            # sink, so the outbound translation would come out of the user's
+            # speakers while the remote party heard silence.
             raise CaptureError(
                 f"{VIRTMIC_SINK} does not exist, so the translation sent to "
                 "the other party has nowhere to go. Run: sidetap doctor "
@@ -217,14 +197,12 @@ class Session:
 
         self.transcript = BilingualTranscript(args.out, session=self._session_name)
 
-        # Built once and shared by both pipelines and both recognition
-        # workers: one estimate for the whole call, not four independent
-        # ones.
+        # One cost estimate for the whole call, shared by both pipelines and
+        # both recognition workers.
         self.rates = Rates()
 
-        # on_downgrade has a destination, which is the whole point of it
-        # existing: a sticky fallback to NMT is otherwise invisible, because
-        # the next successful call sets mt=Health.OK and the pane goes green.
+        # The NMT fallback is sticky and otherwise invisible, because the next
+        # successful call turns the mt marker green again.
         self.metrics.set_mt_model(args.mt_model)
         translator = self._translator or build_translator(
             TranslateConfig(
@@ -234,7 +212,7 @@ class Session:
         )
         synthesizer = self._synthesizer or build_synthesizer(
             # No rate here: it is passed per utterance, because the two
-            # directions want different ones.
+            # directions differ.
             TtsConfig(region=args.tts_region)
         )
 
@@ -246,19 +224,13 @@ class Session:
 
         self._dead_air = DeadAirWatch(self._clock)
         lag_cap = args.lag_cap if args.lag_cap is not None else LAG_CAP_S
-        # One origin for both directions. Taken inside the loop below, the two
-        # tracks would be stamped against origins milliseconds apart, and a
-        # bilingual transcript exists so the two columns line up.
+        # One origin for both directions, so the transcript's columns line up.
         session_t0 = self._clock.monotonic()
 
         for direction, config in configs.items():
-            # No `if duck_id is not None` guard, and that is the point.
-            # engage() returns before pw-loopback has registered the duck, so
-            # duck_id is still None right here; the id arrives on the next
-            # poll. Deciding now meant the duck was never built, ducking never
-            # happened, and the original played under every translation for
-            # the whole call with nothing logged to say so. The callable lets
-            # the id turn up late.
+            # No `duck_id is not None` check: engage() returns before
+            # pw-loopback registers the duck, so the id is still None here and
+            # arrives on a later poll. The callable lets it arrive late.
             duck = (
                 DuckControl(self._volume, lambda: self.router.duck_id)
                 if direction is Direction.IN
@@ -276,11 +248,8 @@ class Session:
             self.playouts[direction] = playout
             self.pipelines[direction] = DirectionPipeline(
                 config=config,
-                # Constructed inside the loop, one per direction.
-                # LocalAgreementSegmenter holds per-utterance state, so a
-                # single instance fed by both directions would interleave two
-                # conversations and commit a prefix of neither. segment.py
-                # says so too; this is the line it is talking about.
+                # One per direction: LocalAgreementSegmenter holds
+                # per-utterance state.
                 segmenter=(
                     FinalsOnlySegmenter()
                     if getattr(args, "no_early_commit", False)
@@ -312,11 +281,9 @@ class Session:
             clock=self._clock,
         )
 
-        # Warm the synthesis connection. Measured: the first streaming call of
-        # a session takes ~543 ms against a ~267 ms warm median, so without
-        # this the FIRST utterance of every call pays ~280 ms extra - and that
-        # is the utterance where the user decides whether this works at all.
-        # Failure here is not fatal; it is an optimisation, not a dependency.
+        # Warm the synthesis connection: the first streaming call takes
+        # ~543 ms against a ~267 ms warm median, and the first utterance is
+        # when the user judges whether this works. Best effort only.
         try:
             list(
                 synthesizer.synthesize(
@@ -335,17 +302,14 @@ class Session:
             phrases=tuple(args.phrases or ()),
         )
 
-    # NOTE: build_recognizer_factory's SpeechClient is never explicitly closed.
-    # meetscribe does the same and relies on process teardown, so this is not a
-    # regression - but sidetap is the first of the two to have a long-lived
-    # Session object that could own it. If a future change makes sessions
-    # restartable within one process, close the client here.
+    # NOTE: build_recognizer_factory's SpeechClient is never closed explicitly;
+    # process teardown does it. Close it here if sessions ever become
+    # restartable within one process.
 
     def _make_drop_handler(self, direction: Direction):
         def handler(item) -> None:
-            # Counted AND written. meetscribe's equivalent bug was dropping
-            # audio with no marker anywhere, so a lost stretch just read as if
-            # nobody had been talking.
+            # Counted and written, so a lost stretch is marked rather than
+            # reading as silence.
             self.metrics.add_dropped(direction, 1)
             self.transcript.write(
                 Record(unit=item.unit, target_text=item.text, dropped=True)
@@ -355,8 +319,7 @@ class Session:
 
     def start(self) -> None:
         self.capture.start()
-        # The routing watcher, for the same reason AppTap has one: a stream
-        # that restarts mid-call would otherwise be autoconnected straight to
+        # A stream that restarts mid-call would otherwise be autoconnected to
         # the speakers, unducked and unjournalled.
         self._spawn(self.router.run, (self.stop,), "routing-watch")
         self._spawn(self._poll_capture_health, (self.stop,), "capture-health")
@@ -368,17 +331,16 @@ class Session:
                 project_id=base.project_id,
                 region=base.region,
                 model=base.model,
-                # Each direction listens in the language its own speaker uses,
-                # which is what makes language detection unnecessary.
+                # Each direction listens in its own speaker's language, so
+                # nothing needs language detection.
                 language_code=self._configs[direction].source_lang,
                 phrases=base.phrases,
             )
             worker = RecognitionWorker(
                 direction=direction,
                 recognizer_factory=self._make_recognizer(recognizer_config, direction),
-                # A fresh detector per direction, deliberately: webrtcvad adapts
-                # to the noise floor across calls, so a shared instance would
-                # let one side's loudness skew the other's classification.
+                # A fresh detector per direction: webrtcvad adapts to the noise
+                # floor, and a shared one would let one side skew the other.
                 gate=SilenceGate(webrtc_detector()),
                 clock=self._clock,
                 on_fatal=self._on_direction_fatal,
@@ -405,13 +367,9 @@ class Session:
     def _on_direction_fatal(self, direction: Direction, exc: BaseException) -> None:
         """One direction's recognition died of a configuration error.
 
-        Mark it failed and keep the call up. The existing fail-safes cover
-        the user: a dead IN direction still leaves the remote party audible,
-        because the duck only closes while speech is being written; a dead OUT
-        direction trips DeadAirWatch. So they are told loudly rather than
-        having the call dropped out from under them.
-
-        Only when BOTH directions are gone is there nothing left to do.
+        Mark it failed and keep the call up: a dead IN still leaves the remote
+        party audible, because the duck only closes while speech is written,
+        and a dead OUT trips DeadAirWatch. Stop only once both are dead.
         """
         self.metrics.set_health(direction, asr=Health.FAILED)
         log.error(
@@ -426,19 +384,15 @@ class Session:
             self.stop.set()
 
     def _poll_capture_health(self, stop: threading.Event) -> None:
-        """Two capture failures, both invisible from anywhere else.
+        """Watch for two capture failures nothing else can see.
 
-        Drops: DroppingQueue only logs. meetscribe's known bug was exactly
-        that - a network outage overflowed this queue, the drops were logged,
-        and the output carried no marker, so a lost stretch read as nobody
-        talking. The lag cap's on_dropped covers the PLAYOUT queue, a
-        different queue with a different cause, so it does not help here.
+        Drops: DroppingQueue only logs, so an overflow would leave a gap that
+        reads as nobody talking. The lag cap's on_dropped covers the playout
+        queue, not this one.
 
-        No audio at all: an unlinked PipeWire capture node delivers ZERO BYTES
-        rather than silence. The silence gate has nothing to gate, recognition
-        sits idle waiting, and every pane stays green while that direction is
-        deaf. The arrival counter failing to advance is the only evidence
-        anywhere in the process that this has happened.
+        No audio: an unlinked capture node delivers zero bytes, not silence,
+        so every pane stays green while that direction is deaf. A stalled
+        arrival counter is the only evidence.
         """
         seen = {d: (0, self._clock.monotonic()) for d in Direction}
         while not stop.is_set():
@@ -460,12 +414,10 @@ class Session:
     def _armed(self, direction: Direction) -> bool:
         """Should silence on this track count as a fault yet?
 
-        The microphone is always capturing, so OUT going quiet is always a
-        fault. IN only becomes meaningful once the router has actually rewired
-        a stream: before that the application simply is not playing anything,
-        which is the ordinary state of having started sidetap before the call.
-        Alarming on that would train the user to ignore the one warning that
-        matters.
+        The mic always captures, so OUT going quiet is always a fault. IN
+        counts only once the router has rewired a stream: starting sidetap
+        before the call is normal, and alarming on it would teach the user to
+        ignore the warning.
         """
         return direction is Direction.OUT or self.router.has_routed
 
@@ -475,12 +427,11 @@ class Session:
         self._threads.append(thread)
 
     def set_bypass(self, value: bool) -> None:
-        """Three things at once, or it does not work.
+        """Un-duck, link the real microphone through, and suppress playout.
 
-        Un-duck, link the real microphone through, and suppress playout on both
-        directions. Without the third, translated speech talks over the
-        unmediated conversation bypass exists to step out of. Recognition keeps
-        running so the transcript stays continuous.
+        All three, or it does not work: without suppression, translated speech
+        talks over the unmediated call bypass exists to step out of.
+        Recognition keeps running so the transcript stays continuous.
         """
         with self._lifecycle_lock:
             self._set_bypass_locked(value)
@@ -488,23 +439,16 @@ class Session:
     def _set_bypass_locked(self, value: bool) -> None:
         self._apply_suppression_locked(value)
         if value:
-            # Directly, not by setting a flag for tick() to notice. Bypass is
-            # what the user reaches for when the interpretation is making the
-            # call worse, and a playout thread whose sink has died never ticks
-            # again - which would leave the duck shut and turn the one escape
-            # hatch into permanent silence.
+            # Open the duck directly rather than via tick(): a playout whose
+            # sink has died never ticks again, and bypass - the escape hatch -
+            # would leave the duck shut.
             for playout in self.playouts.values():
                 if playout.duck is not None:
                     playout.duck.open()
         self.metrics.set_bypassed(value)
-        # Set BEFORE the linking, not after. _link_real_mic can raise partway
-        # through - pw-link vanishing from PATH, a snapshot failing - and a
-        # pair already linked then stays live while _bypassed reads False, so
-        # shutdown's "drop bypass first" step skips it and the user's raw
-        # microphone stays wired into the virtual mic forever. Nothing
-        # journals that link, so doctor --repair cannot find it either.
-        # Claiming bypass slightly too early only costs a cleanup pass that
-        # finds nothing; claiming it too late costs the leak.
+        # Set before linking: _link_real_mic can raise partway, and a live link
+        # with _bypassed False would be skipped by shutdown and, unjournalled,
+        # never cleaned up. Claiming bypass early only costs a no-op cleanup.
         if value:
             self._bypassed = True
         try:
@@ -514,35 +458,27 @@ class Session:
                 self._bypassed = False
 
     def set_mute_out(self, value: bool) -> None:
-        """Stop sending your translated voice, without leaving the call.
+        """Stop sending your translated voice without leaving the call.
 
-        Recognition and translation keep running; only the OUT playout is
-        suppressed. Pressed while bypassed this changes what you come back
-        to, not what bypass is doing right now - bypass already suppresses
-        OUT, and un-suppressing it there would put translated speech over the
-        unmediated conversation bypass exists to step out of.
+        Recognition and translation keep running; only OUT playout is
+        suppressed. While bypassed this changes what you return to, not the
+        current state, since bypass already suppresses OUT.
         """
         with self._lifecycle_lock:
-            # Flag and metric written together, before the part that acts on
-            # them, for the reason _set_bypass_locked writes its own metric
-            # early: the two must not be able to disagree about what the user
-            # asked for, or the lit key and the next keypress diverge.
+            # Flag and metric together, before acting, so the lit key and the
+            # next keypress cannot disagree.
             self._muted_out = value
             self.metrics.set_muted_out(value)
             self._apply_suppression_locked(self._bypassed)
 
     def _apply_suppression_locked(self, bypassed: bool) -> None:
-        """OUT is suppressed if EITHER control says so; IN only by bypass.
+        """OUT is suppressed if either control says so; IN only by bypass.
 
-        Takes `bypassed` as an argument rather than reading self._bypassed,
-        because _set_bypass_locked deliberately writes that field AFTER this
-        runs (see its comment on the ordering) - reading it here would apply
-        the previous value on the way into bypass.
+        Takes `bypassed` rather than reading self._bypassed, which
+        _set_bypass_locked writes only after this runs.
 
-        Guarded on an actual change because set_suppressed() flushes, and
-        flush() cuts the utterance in progress short. Re-asserting a state
-        that already holds - pressing `m` twice while bypassed, say - would
-        chop a sentence for no reason.
+        Acts only on a real change, because set_suppressed() flushes and a
+        flush cuts the current utterance short.
         """
         for direction, want in (
             (Direction.IN, bypassed),
@@ -555,13 +491,11 @@ class Session:
     def _link_real_mic(self, connected: bool) -> None:
         """Wire the user's real microphone straight into the virtual mic.
 
-        The unlink path replays what was actually linked rather than
-        recomputing it from a fresh snapshot. The default source can change
-        mid-call - plugging in a headset does it - and recomputing would then
-        unlink a pair that was never linked while leaving the real one in
-        place. That leak outlives the process, because the virtual mic is a
-        permanent node, and nothing records it in the journal, so
-        `doctor --repair` cannot find it either.
+        Unlinking replays what was linked rather than recomputing from a fresh
+        snapshot: the default source can change mid-call (a headset is plugged
+        in), and recomputing would leave the real link in place. That link
+        outlives the process and is not journalled, so `doctor --repair`
+        cannot find it.
         """
         if not connected:
             for out_id, in_id in self._real_mic_links:
@@ -585,25 +519,16 @@ class Session:
         for index, out_port in enumerate(outputs):
             if not inputs:
                 break
-            # Same index-pairing limit as routing.engage(): correct for
-            # stereo and mono only. See that comment for why.
+            # Index pairing, as in routing: correct for mono and stereo only.
             in_port = inputs[min(index, len(inputs) - 1)]
             pair = (out_port.id, in_port.id)
-            # Recorded BEFORE the attempt, and withdrawn only on a definite
-            # failure. _real_mic_links is what shutdown replays to tear these
-            # down, and the two mistakes it can make are not symmetric:
-            # unlinking something that was never linked is a no-op the adapter
-            # already classifies, while failing to unlink something live wires
-            # the user's raw microphone into the virtual mic for good. So if
-            # anything raises between the link landing and this being written
-            # down - a Ctrl-C is enough - the conservative record is the one
-            # that survives.
+            # Recorded before the attempt, withdrawn only on definite failure.
+            # Shutdown replays this list: unlinking a pair never linked is
+            # harmless, missing a live one leaves the raw mic wired for good.
             self._real_mic_links.append(pair)
-            # The result is checked, exactly as routing._route_locked checks
-            # it. A discarded LinkResult matters more here than in the router:
-            # bypass has already suppressed both playouts, so a silently failed
-            # link means the remote party hears absolute silence while the
-            # interface reports bypass as fully engaged.
+            # Checked: bypass has already suppressed both playouts, so a
+            # silent failure means the remote party hears nothing while bypass
+            # looks engaged.
             if self._linker.link(*pair) is LinkResult.FAILED:
                 self._real_mic_links.remove(pair)
                 failed = True
@@ -615,21 +540,17 @@ class Session:
             )
 
     def alarm_dead_air(self) -> None:
-        """Straight to the sink, bypassing the queue.
+        """Write straight to the sink, bypassing the queue.
 
-        An alarm that waited behind the backlog it is warning about would
-        arrive after the moment it mattered.
+        An alarm queued behind the backlog it warns about would arrive late.
         """
         self.sinks[Direction.IN].write(earcon())
 
     def _join_workers(self) -> None:
-        """ONE shared deadline, not one per thread.
+        """Join the workers against ONE shared deadline, not one per thread.
 
-        There are eight of these by the time everything is wired up. A fresh
-        timeout each would let shutdown take eight times as long before
-        `router.restore()` runs - and restore is what gives the user their
-        call audio back. capture.py makes the same argument for its own three
-        threads; this is the same reasoning at a larger scale.
+        Eight separate timeouts would delay `router.restore()`, which is what
+        gives the user their call audio back.
         """
         deadline = time.monotonic() + SHUTDOWN_JOIN_S
         for thread in self._threads:
@@ -651,12 +572,10 @@ class Session:
             event.set()
         with self._lifecycle_lock:
             if self._bypassed or self._real_mic_links:
-                # Quitting while bypassed must not leave the real microphone
-                # wired into the virtual mic. It is not in the journal, the
-                # virtual mic outlives the process, and the next call would
-                # carry the user's raw voice alongside every translation.
-                # _real_mic_links is checked too, because a set_bypass that
-                # raised partway can leave live links behind either flag.
+                # Never leave the real mic wired into the virtual mic: the
+                # link is not journalled and the virtual mic outlives the
+                # process. _real_mic_links is checked too, since a set_bypass
+                # that raised partway can leave links behind either flag.
                 try:
                     self._link_real_mic(False)
                 except Exception:
@@ -670,16 +589,12 @@ class Session:
                 self.capture.shutdown()
             self._join_workers()
         except Exception:
-            # Whatever went wrong, the graph still has to go back. A
-            # half-restored graph leaves the user with no call audio and
-            # nothing on screen explaining why.
+            # Whatever went wrong, the graph still has to go back.
             log.exception("error during shutdown; restoring the graph anyway")
         finally:
             if self.router is not None:
-                # None only when setup() failed before Router was even
-                # constructed - the virtual-mic check, deliberately the first
-                # thing setup() does, fails before anything is mutated, so
-                # there is nothing here to restore.
+                # None only if setup() failed at the virtual-mic check, before
+                # anything was mutated.
                 try:
                     self.router.restore()
                     self.router_restored = True
@@ -687,11 +602,9 @@ class Session:
                     log.exception(
                         "could not restore the audio graph. Run: sidetap doctor --repair"
                     )
-            # Directly, not via the playout threads' own finally: those
-            # threads only exist once start() has succeeded, so a setup() that
-            # failed after spawning a sink leaves pw-cat running. The launcher
-            # uses start_new_session=True, so an orphan survives this process
-            # entirely and accumulates on every failed launch.
+            # Closed here, not in the playout threads' finally: those exist
+            # only after start(), and pw-cat runs in its own session, so an
+            # orphan would outlive this process.
             for sink in self.sinks.values():
                 try:
                     sink.close()
@@ -711,34 +624,23 @@ def run_session(args, *, graph, launcher, linker, clock, recognizer_factory=None
     def handle_signal(*_):
         session.stop.set()
 
-    # Installed BEFORE setup(), because setup() is where the graph is mutated
-    # and it is not instant: it makes a network round-trip to warm TTS. A
-    # Ctrl-C in that window would otherwise raise straight out of run_session
-    # with the app already rewired into the duck.
+    # Installed before setup(), which rewires the graph and then waits on a
+    # network round-trip to warm TTS; a Ctrl-C there should request a stop,
+    # not raise mid-setup.
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         session.setup()
     except BaseException:
-        # setup() is not atomic - engage() lands well before the last sink is
-        # spawned. Anything failing after it (a dead pw-cat, KeyboardInterrupt,
-        # a bad voice name) would otherwise leave the user's call audio routed
-        # into a duck node with the process gone. repair() on the next run
-        # fixes it, but "sidetap broke my audio and exited" is not a first-run
-        # experience worth shipping.
+        # setup() is not atomic: engage() rewires the graph well before the
+        # last sink is spawned, so any later failure must restore it.
         session.shutdown()
         raise
 
-    # start() is inside the SAME guard as setup(), not after it. It runs
-    # strictly after engage() has already rewired the graph, and it does real
-    # fallible work before any thread exists: capture.start() can time out
-    # waiting for a capture node, and _make_recognizer constructs a live
-    # SpeechClient per direction, so the second can fail after the first
-    # succeeded. Every one of those used to raise straight out of run_session
-    # with the call routed into the duck and no process left to undo it -
-    # the same failure setup()'s own guard exists to prevent, stopping one
-    # call too early.
+    # start() shares the guard: it runs after engage() and can fail before any
+    # thread exists (a capture-node timeout, a SpeechClient that fails to
+    # build), which must not leave the call routed into the duck.
     try:
         session.start()
 

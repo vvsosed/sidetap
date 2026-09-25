@@ -1,22 +1,16 @@
 """Google Cloud Speech-to-Text v2 streaming recognition.
 
-The model is `chirp_2` in `europe-west4`, NOT Chirp 3, and not Frankfurt.
-Measured against the live API on 2026-09-18:
+The model is `chirp_2` in `europe-west4`. Measured against the live API on
+2026-09-18:
 
     chirp_3  any region      -> 403 "no longer generally available"
     chirp_2  europe-west3    -> 400 "does not exist in this location"
     chirp_2  europe-west4    -> works, and is the closest region that does
     long     europe-west3    -> works for en-US, but 400 for ru-RU
 
-The design spec named Chirp 3 because it was documented as available when the
-spec was written; Google has since withdrawn it from general availability. The
-combination that still fails silently is the tempting one - Frankfurt is the
-nearest region and `long` works there for English - so anyone "simplifying"
-the region back to europe-west3 breaks every non-English language with a 400
-that only appears once audio is already flowing.
-
-Note TTS is unaffected: Chirp 3 HD voices are still available, and tts.py
-continues to use them.
+Frankfurt (europe-west3) is the tempting mistake: it is nearest and works for
+English, then fails every other language with a 400 once audio is flowing.
+TTS is unaffected; Chirp 3 HD voices remain available (tts.py).
 """
 
 from __future__ import annotations
@@ -41,25 +35,18 @@ BACKOFF_START_S = 2.0
 BACKOFF_CAP_S = 30.0
 ESCALATE_AFTER_FAILURES = 5
 
-# Healthy streams rotate at MAX_STREAM_SECONDS. A stream still open well past
-# that is stalled - gRPC sets no deadline and no keepalive, so a black-holed
-# connection would otherwise leave this direction silently recognising nothing
-# for the rest of the call. DeadlineExceeded is not fatal, so the worker
-# reconnects.
+# Healthy streams rotate at MAX_STREAM_SECONDS, so one open well past that has
+# stalled. gRPC sets no deadline or keepalive of its own, so a black-holed
+# connection would leave this direction deaf for the rest of the call.
+# DeadlineExceeded is not fatal, so the worker reconnects.
 STREAM_TIMEOUT_S = MAX_STREAM_SECONDS + 30
 
-# Google ends a stream it stops receiving requests on, with a 409 "Stream timed
-# out after receiving no more client requests". Two different things stop the
-# requests, and both were seen live in meetscribe:
-#
-#   - the gate drops a quiet stretch, so nothing is worth sending; and
-#   - blocks stop arriving at all, because the tapped application's node went
-#     away. A finished call or a closed tab unlinks the capture node, and
-#     PipeWire does not drive a stream with no input - pw-record then emits
-#     nothing whatsoever, not silence.
-#
-# So the keepalive sits in the worker, where the audio actually stops, rather
-# than in SilenceGate, which only ever sees blocks that did arrive.
+# Google ends a stream that stops receiving requests (409 "Stream timed out").
+# Requests stop either because the gate drops a quiet stretch, or because no
+# blocks arrive at all: when the tapped application's node goes away,
+# pw-record emits nothing, not silence. So the keepalive lives in the worker,
+# where the audio actually stops, not in SilenceGate, which only sees blocks
+# that arrived.
 KEEPALIVE_S = 2.0
 SILENCE_BLOCK = b"\x00" * BLOCK_BYTES
 
@@ -85,24 +72,18 @@ def duration_seconds(value) -> float:
 class SessionTime(Protocol):
     """Maps a stream-relative position onto the session timeline.
 
-    Both StreamClock and AudioTimeline satisfy this, and which one arrives
-    here is NOT interchangeable:
+    StreamClock and AudioTimeline both satisfy this, and are NOT
+    interchangeable:
 
       StreamClock.absolute()   adds a flat offset.
       AudioTimeline.absolute() indexes into the recorded capture time of each
                                block actually sent.
 
-    Chirp's result_end_offset is a position in the audio we SENT, and the
-    silence gate drops blocks before sending - so in any real conversation
-    that position is not elapsed time. Only AudioTimeline compensates for the
-    gap. Passing a StreamClock here would understate every timestamp by
-    however much silence was gated, quietly corrupting the transcript's
-    latency column, which is the stated evidence for the later
-    LocalAgreement-2 decision.
-
-    This Protocol exists so the annotation states that contract rather than
-    naming one concrete class and inviting a "type cleanup" that swaps in the
-    wrong one.
+    Chirp's result_end_offset is a position in the audio SENT, and the
+    silence gate drops blocks before sending, so it is not elapsed time. A
+    StreamClock here would understate every timestamp by however much silence
+    was gated. The Protocol states that contract so the annotation cannot be
+    "cleaned up" to the wrong class.
     """
 
     def absolute(self, seconds: float) -> float: ...
@@ -122,10 +103,9 @@ def result_from_response(response_result, clock: SessionTime, direction: Directi
     if not text:
         return None
 
-    # Direct attribute access, not getattr with a default: on a real protobuf
-    # these fields are always present, so a default could only ever mask an
-    # upstream rename - turning a loud AttributeError into 0.0 timestamps
-    # written straight to the durable JSONL.
+    # Direct attribute access: these fields always exist on a real protobuf,
+    # so a default could only turn an upstream rename into silent 0.0
+    # timestamps.
     end = clock.absolute(duration_seconds(response_result.result_end_offset))
 
     return AsrResult(
@@ -253,11 +233,9 @@ class RecognitionWorker:
                         yield SILENCE_BLOCK
 
             try:
-                # No stop check inside this loop. blocks() already returns when
-                # stop is set, which ends the stream on its own, and breaking
-                # out here would discard finals the engine emitted on the way
-                # out - exactly the ones DirectionPipeline.consume drains for
-                # after Ctrl-C.
+                # No stop check here: blocks() ends the stream when stop is
+                # set, and breaking out would discard the finals the engine
+                # emits on the way out.
                 for result in self._factory(timeline).stream(blocks()):
                     out_q.put(result)
                 consecutive_failures = 0
@@ -267,15 +245,10 @@ class RecognitionWorker:
                 if stop.is_set():
                     break
                 if is_fatal(exc):
-                    # Stops THIS direction only. `stop` is per-direction, not
-                    # the session-wide event: the two directions carry
-                    # different language codes, so a config error in one says
-                    # nothing about the other. meetscribe had a single stream,
-                    # so "fatal ends the run" and "fatal ends the process"
-                    # were the same thing; here they are not, and dropping a
-                    # live call because the OTHER direction was misconfigured
-                    # is worse than interpreting one way. Session decides when
-                    # enough directions are dead to give up.
+                    # Stops THIS direction only: the directions use different
+                    # language codes, so a config error in one says nothing
+                    # about the other, and interpreting one way beats dropping
+                    # the call. Session decides when to give up.
                     log.error(
                         "speech configuration error (%s), not retryable — this "
                         "direction is now dead: %s",
@@ -329,9 +302,7 @@ class GoogleRecognizer:
     def __init__(self, config: AsrConfig, client, timeline: AudioTimeline, direction: Direction):
         self._config = config
         self._client = client
-        # An AudioTimeline, deliberately - NOT a StreamClock. See SessionTime
-        # in this module for why substituting one would silently understate
-        # every timestamp by the amount of silence the gate dropped.
+        # An AudioTimeline, NOT a StreamClock; see SessionTime.
         self._clock = timeline
         self._direction = direction
 
@@ -345,9 +316,9 @@ class GoogleRecognizer:
                     cs.SpeechAdaptation.AdaptationPhraseSet(
                         inline_phrase_set=cs.PhraseSet(
                             phrases=[
-                                # 0-20, where high values start degrading
-                                # general accuracy. 15 is aggressive enough for
-                                # names and jargon without that trade-off.
+                                # Boost is 0-20, and high values degrade
+                                # general accuracy; 15 suits names and jargon
+                                # without that cost.
                                 cs.PhraseSet.Phrase(value=p, boost=15.0)
                                 for p in self._config.phrases
                             ]
@@ -362,14 +333,12 @@ class GoogleRecognizer:
                 sample_rate_hertz=TARGET_RATE,
                 audio_channel_count=1,
             ),
-            # One code per direction, not a list: the channel decides the
-            # source language, so there is nothing to detect and never any
-            # ambiguity about which way to translate.
+            # One code per direction: the channel fixes the source language,
+            # so there is nothing to detect.
             language_codes=[self._config.language_code],
             model=self._config.model,
-            # No enable_word_time_offsets: Chirp rejects it outright in
-            # streaming mode, a fatal InvalidArgument that ends the run before
-            # a single word is transcribed.
+            # No enable_word_time_offsets: Chirp rejects it in streaming mode
+            # with a fatal InvalidArgument.
             features=cs.RecognitionFeatures(enable_automatic_punctuation=True),
             **({"adaptation": adaptation} if adaptation else {}),
         )

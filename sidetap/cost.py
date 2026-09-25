@@ -1,9 +1,8 @@
 """A running spend estimate.
 
-Deliberately an estimate, not an invoice. Google's per-character prices render
-dynamically on its pricing pages and third-party trackers disagree, so these
-are a starting point to be reconfirmed at build time - good enough to notice a
-runaway session, not to reconcile a bill.
+An estimate, not an invoice: Google's prices render dynamically and
+third-party trackers disagree, so this is good enough to notice a runaway
+session, not to reconcile a bill.
 """
 
 from __future__ import annotations

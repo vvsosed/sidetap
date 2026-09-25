@@ -1,7 +1,7 @@
 """Check the environment before a call, not during one.
 
-One of three APIs not being enabled should fail in a second at setup, rather
-than two minutes into a conversation with the other party waiting.
+A disabled API should fail in a second at setup, not two minutes into a
+conversation with the other party waiting.
 """
 
 from __future__ import annotations
@@ -17,10 +17,8 @@ from .adapters import MIN_PW_VERSION, installed_pw_version
 from .graph import PwGraph
 from .routing import VIRTMIC_CONFIG, VIRTMIC_CONFIG_PATH, VIRTMIC_SINK, VIRTMIC_SOURCE
 
-# pw-cli belongs here even though sidetap never uses it at runtime:
-# check_pipewire_version() shells out to it, and without it in this list a
-# machine missing only pw-cli is told PipeWire is version 0.0.0 and to
-# upgrade - sending the user after a problem they do not have.
+# pw-cli is never used at runtime, but check_pipewire_version() needs it;
+# without it here, a machine missing only pw-cli is told to upgrade PipeWire.
 REQUIRED_TOOLS = (
     "pw-dump",
     "pw-record",
@@ -52,10 +50,8 @@ def check_pipewire_version() -> Check:
     rendered = ".".join(str(p) for p in version)
     minimum = ".".join(str(p) for p in MIN_PW_VERSION)
     if version == (0, 0, 0):
-        # Not a real version. installed_pw_version() returns this sentinel
-        # when pw-cli is missing or will not run, and reporting it as though
-        # PipeWire were ancient points the user at an upgrade rather than at
-        # the actual problem.
+        # installed_pw_version()'s sentinel for "pw-cli missing or failed",
+        # not an ancient PipeWire; say so rather than suggest an upgrade.
         return Check(
             "pipewire",
             False,
@@ -72,10 +68,9 @@ def check_pipewire_version() -> Check:
 def check_virtmic(graph: PwGraph, config_path: Path = VIRTMIC_CONFIG_PATH) -> Check:
     """Are both halves of the virtual mic present in the live graph?
 
-    The config file is consulted so this can tell the two failures apart. They
-    need different actions, and conflating them tells a user who has just run
-    `--install` to run `--install` - which is how someone concludes the tool is
-    broken and stops reading its output.
+    The config file is consulted to tell "not installed" from "installed but
+    not loaded": they need different actions, and telling a user who just ran
+    `--install` to run it again makes the tool look broken.
     """
     sink = graph.node_by_name(VIRTMIC_SINK)
     source = graph.node_by_name(VIRTMIC_SOURCE)
@@ -105,12 +100,10 @@ def check_virtmic(graph: PwGraph, config_path: Path = VIRTMIC_CONFIG_PATH) -> Ch
 def check_linking() -> Check:
     """Does pw-link actually reach a running PipeWire session?
 
-    check_tools() only proves the binary is on PATH. A pw-link that exists but
-    cannot talk to a session - no session running, wrong XDG_RUNTIME_DIR, a
-    sandbox - fails at runtime as ONE warning about six seconds in, then
-    debug-level forever, while the IN direction silently never produces a
-    translation for the rest of the call. `pw-link -l` needs a live session, so
-    it is a cheap functional probe.
+    check_tools() only proves the binary is on PATH. A pw-link that cannot
+    talk to a session (none running, wrong XDG_RUNTIME_DIR, a sandbox) fails
+    at runtime almost silently, and the IN direction never translates
+    anything. `pw-link -l` needs a live session, so it is a cheap probe.
     """
     try:
         result = subprocess.run(
@@ -135,11 +128,8 @@ def check_vad() -> Check:
     """Is the silence gate actually going to gate?
 
     webrtcvad-wheels is a hard dependency, so a failed import means a broken
-    environment - and the failure is silent: vad.py degrades to a None
-    detector that allows everything, so BOTH directions stream 100% of their
-    audio to a metered API for the length of the call. That is the cost
-    surprise doctor exists to catch in a second at setup rather than two
-    minutes into a conversation.
+    environment, and a silent one: vad.py falls back to a gate that allows
+    everything, streaming all audio in both directions to a metered API.
     """
     try:
         import webrtcvad  # noqa: F401
@@ -156,16 +146,14 @@ def check_vad() -> Check:
 def check_credentials(project_override: str | None = None) -> Check:
     """Credentials from ANY Application Default Credentials source.
 
-    Requiring GOOGLE_APPLICATION_CREDENTIALS was wrong: `gcloud auth
-    application-default login` is how a desktop user normally authenticates
-    and it sets no such variable, so doctor reported FAIL on a working machine
-    and then skipped the three API checks that actually matter. Asking
-    google.auth for credentials is the same question the SDK will ask.
+    Asking google.auth is the same question the SDK will ask, so
+    `gcloud auth application-default login`, which sets no
+    GOOGLE_APPLICATION_CREDENTIALS, counts too.
 
-    The project is NOT taken from ADC even when ADC offers one. ADC's project
-    is whatever gcloud was last pointed at, which is routinely not the project
-    with these three APIs enabled - silently using it means every call fails
-    with a confusing 403, or succeeds and bills the wrong project.
+    The project is NOT taken from ADC even when ADC offers one: ADC's project
+    is whatever gcloud was last pointed at, which is routinely not the one
+    with these APIs enabled. Using it would fail with a confusing 403, or
+    succeed and bill the wrong project.
     """
     try:
         import google.auth
@@ -191,9 +179,8 @@ def check_credentials(project_override: str | None = None) -> Check:
 
     detail = f"project={project}"
     if adc_project and adc_project != project:
-        # Worth saying out loud: quota and billing attribution follow this,
-        # and a mismatch is the difference between a working call and a 403
-        # that names a project the user never typed.
+        # Worth saying: quota and billing follow this, and a mismatch means a
+        # 403 naming a project the user never typed.
         detail += f" (ADC defaults to {adc_project})"
     return Check("credentials", True, detail)
 
@@ -208,18 +195,13 @@ def check_apis(
 ) -> list[Check]:
     """One real, cheap RPC per API. Imported lazily.
 
-    Constructing a client proves nothing: it resolves credentials and builds a
-    channel without contacting the service, so a project with the API DISABLED
-    constructs a client quite happily and then fails on the first real call -
-    two minutes into a conversation, which is the exact failure this command
-    exists to move to setup. Each probe below is a list/metadata call: free,
-    under ~1.5 s measured, and returns PermissionDenied with SERVICE_DISABLED
-    when the API is off.
+    Constructing a client proves nothing: it builds a channel without
+    contacting the service, so a DISABLED API only fails on the first real
+    call. Each probe is a free list/metadata call (under ~1.5 s measured) that
+    returns PermissionDenied with SERVICE_DISABLED when the API is off.
 
-    Each API gets ITS OWN region. They are genuinely different settings -
-    Cloud Translation rejects europe-west3 outright (see
-    docs/experiments/03-translation-llm.md), and passing one region to all
-    three turned a working setup into a failing check.
+    Each API gets its own region, because they accept different ones (see
+    docs/experiments/03-translation-llm.md).
     """
     checks = []
 
@@ -278,17 +260,11 @@ def check_asr_model(
 ) -> list[Check]:
     """Will this exact model actually recognise these exact languages here?
 
-    Reaching the API is not the same question. `list_recognizers` succeeds on a
-    project whose configured model has been withdrawn, or whose model exists
-    but rejects the language — so doctor reported speech-to-text OK while every
-    call died on its first block with a 403 or a 400. That is the whole failure
-    doctor exists to move from the middle of a conversation to setup, and it
-    was walking straight past it.
-
-    Both were real, both measured: `chirp_3` returns 403 "no longer generally
-    available" everywhere, and `long` in europe-west3 returns 400 for ru-RU
-    while happily accepting en-US - so testing one language proves nothing
-    about the other, and each is checked separately.
+    Reaching the API is a different question: `list_recognizers` succeeds
+    even when the configured model is withdrawn or rejects the language, and
+    then every call dies on its first block. `chirp_3` returns 403 everywhere,
+    and `long` in europe-west3 accepts en-US but returns 400 for ru-RU, so
+    each language is checked separately.
 
     Costs one short stream of silence per language, about two seconds.
     """
@@ -323,26 +299,21 @@ def check_asr_model(
 def _explain(exc: Exception) -> str:
     """Turn a Google error into the sentence that names the fix.
 
-    "403 Cloud Speech-to-Text API has not been used in project 123 before or
-    it is disabled" is already the answer, but it arrives wrapped in a stack
-    of SDK types; and the console URL buried in its metadata is the one thing
-    the user actually needs to click.
+    The 403's message already names the problem, but it arrives wrapped in
+    SDK types, and the console URL in its metadata is what the user needs.
     """
     from google.api_core import exceptions as gexc
 
     if isinstance(exc, gexc.PermissionDenied):
-        # Two very different failures arrive as the same 403, and the message
-        # for one reads like the other. A missing ADC quota project says "the
-        # API requires a quota project", which a reader skims as "the API is
-        # not enabled" and then spends an afternoon re-enabling an API that
-        # was never off. Observed live: re-running `gcloud auth
+        # Two different failures arrive as the same 403. A missing ADC quota
+        # project ("the API requires a quota project") reads like a disabled
+        # API but needs a different fix. Re-running `gcloud auth
         # application-default login` drops the quota project, after which
-        # Translation and Text-to-Speech both 403 while Speech-to-Text keeps
-        # working - because that one is called with an explicit parent.
+        # Translation and Text-to-Speech 403 while Speech-to-Text, called with
+        # an explicit parent, keeps working.
         if "generally available" in exc.message:
-            # Not an enablement problem, and telling the user to enable it
-            # sends them to a console page that will look correct. The model
-            # itself has been withdrawn; nothing about this project can fix it.
+            # The model itself is withdrawn: enabling anything cannot fix it,
+            # and the console page will look correct.
             return (
                 f"{exc.message} - this model has been withdrawn, so enabling "
                 "anything will not help. Use --model chirp_2 with "
@@ -364,8 +335,7 @@ def _explain(exc: Exception) -> str:
 def install_virtmic_config(path: Path = VIRTMIC_CONFIG_PATH) -> bool:
     """Write the config if absent. Returns True if it wrote one.
 
-    Never clobbers: the user may have tuned the rate or the description, and
-    silently reverting that would be worse than doing nothing.
+    Never clobbers: the user may have tuned the rate or the description.
     """
     if path.exists():
         return False

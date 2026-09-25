@@ -1,29 +1,22 @@
-"""Google Cloud Text-to-Speech, Chirp 3: HD streaming synthesis.
+"""Google Cloud Text-to-Speech, Chirp 3 HD streaming synthesis.
 
-One fixed voice per direction - no cloning, which costs roughly 600 ms of
-time-to-first-audio for a v1 that does not need it.
+One fixed voice per direction - no cloning, which would add ~600 ms to
+time-to-first-audio.
 
-`synthesize` is a true incremental generator and the pipeline exploits it:
-DirectionPipeline._speak appends each chunk to a Playout utterance as it
-arrives, so speech starts at time-to-first-chunk rather than at full
-synthesis wall time. Measured (docs/experiments/04-tts-streaming.md), that
-is the difference between 194 ms and 465 ms on a short utterance, and
-between 230 ms and 2339 ms on a long one.
+`synthesize` is a true incremental generator: DirectionPipeline._speak appends
+each chunk to a Playout utterance as it arrives, so speech starts at
+time-to-first-chunk rather than at full synthesis time - 194 vs 465 ms on a
+short utterance, 230 vs 2339 ms on a long one
+(docs/experiments/04-tts-streaming.md).
 
-The shape that makes it safe: the first chunk is always 200 ms of audio,
-every chunk after it is 240 ms arriving every ~30 ms, and production runs
-4.7-7.1x faster than playback - so simulated early playout never dipped
-below a 200 ms buffer margin across nine runs. Playout still waits for
-START_BUFFER_S before starting, which costs ~30 ms and doubles that margin.
+That is safe because the first chunk is always 200 ms of audio, later chunks
+are 240 ms every ~30 ms, and synthesis runs 4.7-7.1x faster than playback, so
+simulated early playout never dropped below a 200 ms margin. The lag cap,
+counting only bytes that have arrived, understates the backlog by at most a
+fraction of an utterance.
 
-An earlier version of this docstring claimed early playout would force the
-lag cap to estimate the backlog rather than measure it. It does not: at
-those ratios, counting only bytes that have arrived understates the backlog
-by a fraction of one utterance and self-corrects within about a second.
-
-The first call after construction costs ~543 ms against a ~267 ms warm
-median, which is why Session.setup() performs a throwaway synthesis while
-the duck's loopback node is still registering.
+The first call costs ~543 ms against a ~267 ms warm median, hence the warm-up
+synthesis in Session.setup().
 """
 
 from __future__ import annotations
@@ -38,7 +31,7 @@ log = logging.getLogger(__name__)
 
 
 def tts_endpoint(region: str) -> str:
-    """Chirp 3 HD has no Frankfurt single-region; the spec pins it to eu."""
+    """Chirp 3 HD has no Frankfurt single-region, so the default is eu."""
     if region == "global":
         return "texttospeech.googleapis.com"
     return f"{region}-texttospeech.googleapis.com"
@@ -54,56 +47,36 @@ def voice_language(voice_name: str) -> str:
     return "-".join(parts[:2]) if len(parts) >= 2 else voice_name
 
 
-# Measured against Chirp 3 HD streaming, not taken from the documentation:
-# 2.1 and 4.0 are both rejected, even though the API's own error message says
-# "ensure that speaking_rate is in the range [0.25, 4.0]". Validate against
-# what the service does, not what it claims.
+# Measured, not documented: 2.1 and 4.0 are both rejected, although the API's
+# own error message claims [0.25, 4.0].
 MIN_SPEAKING_RATE = 0.25
 MAX_SPEAKING_RATE = 2.0
 
-# The genders a voice can be asked for. Lives here rather than beside the
-# voice table in run.py so cli.py can validate against it without importing
-# run - that import is deliberately lazy, to keep `doctor` and `devices` from
-# loading the whole pipeline. Matches how MIN/MAX_SPEAKING_RATE are imported.
+# Here rather than beside run.py's voice table so cli.py can validate without
+# importing run, which stays lazy so `doctor` and `devices` skip the pipeline.
 #
-# Two values, not the four SsmlVoiceGender carries: ListVoices reports every
-# Chirp 3 HD voice as MALE or FEMALE, never NEUTRAL or UNSPECIFIED
-# (docs/experiments/05-voice-gender.md).
+# Two values, not SsmlVoiceGender's four: ListVoices reports every Chirp 3 HD
+# voice as MALE or FEMALE (docs/experiments/05-voice-gender.md).
 GENDERS = ("male", "female")
 
-# gRPC sets no deadline of its own, so a hung streaming_synthesize call parks
-# DirectionPipeline._speak inside `for chunk in chunks` forever: the results
-# queue behind it grows unbounded, and the tts health marker stays green
-# because Health is only set on the loop's exit paths, none of which run
-# while parked. asr.py guards its own streaming call the identical way
-# (STREAM_TIMEOUT_S there); this is that same guard for tts.py.
+# gRPC sets no deadline of its own, so a hung streaming_synthesize would park
+# _speak forever, its results queue growing and the tts marker still green.
+# The same guard as asr.py's STREAM_TIMEOUT_S.
 #
-# 30s, not a tight fit to real synthesis time: the slowest run measured
-# (docs/experiments/04-tts-streaming.md) was 2339 ms for 16.6 s of audio, so
-# 30s is roughly 13x that worst case. It stays generous even at
-# MIN_SPEAKING_RATE (0.25, the setting that produces the *longest* audio):
-# scaling that same 16.6s utterance to a ~4x longer output (~66s of audio)
-# and dividing by the slowest observed synthesis-to-audio ratio (4.7x, not
-# the 7.1x this particular run hit) still lands at ~14s, under half the
-# budget. This is a stuck-RPC backstop, not a latency control - playout's own
-# STARVE_LIMIT_TICKS already gives up on an utterance after 2s of no chunks,
-# so a synthesis still running at 30s has long since stopped being useful to
-# anyone. The timeout exists to free the worker thread and surface the
-# failure, not to salvage the sentence.
+# A stuck-RPC backstop, not a latency control: the slowest measured synthesis
+# took 2339 ms for 16.6 s of audio, and even at MIN_SPEAKING_RATE the worst
+# case stays near 14 s. Playout gives up after 2 s without chunks anyway; this
+# frees the worker thread and surfaces the failure.
 STREAM_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
 class TtsConfig:
     region: str = "eu"
-    # 1.0 is neutral, and the default stays neutral because the useful value
-    # depends on the language pair. Measured on real utterances, Russian takes
-    # 1.23x as long to speak as the English it was translated from - so at 1.0
-    # the output is structurally longer than the input, and a continuous
-    # speaker builds a backlog no amount of waiting will drain. At 1.3 the same
-    # Russian comes out at 0.86x the English and the backlog drains instead.
-    # A pair whose target language is more compact needs no adjustment at all,
-    # which is why guessing a global default would be wrong.
+    # 1.0 is neutral and stays the default, because the useful value depends
+    # on the language pair: Russian runs 1.23x as long as the English it came
+    # from, so at 1.0 a continuous speaker's backlog never drains, while at
+    # 1.3 it does. A more compact target language needs no adjustment.
     speaking_rate: float = 1.0
 
 
